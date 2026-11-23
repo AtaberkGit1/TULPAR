@@ -1,0 +1,13 @@
+[package]
+name = "yolac-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal YOLAÇ diagnostic & verification CLI"
+
+[dependencies]
+tokio.workspace = true
+yolac-blocklist = { path = "../yolac-blocklist" }
+yolac-core = { path = "../yolac-core" }
+yolac-dns = { path = "../yolac-dns" }
+yolac-dpi = { path = "../yolac-dpi" }

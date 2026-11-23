@@ -1,0 +1,310 @@
+//! Unified YOLAÇ engine orchestrator.
+
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{watch, Mutex};
+use tokio::task::JoinHandle;
+use yolac_blocklist::Blocklist;
+use yolac_dns::{default_public_upstreams, DnsConfig, DnsEngine};
+use yolac_dpi::{DpiStrategy, PlatformCapabilities, QuicPolicy};
+use yolac_net::{
+    CaptivePortalMonitor, Ipv6LeakMode, MemoryProfile, NoopProtector, PacketDevice,
+    ProtectedDialer, SocketProtector, TunConfig, TunEngine,
+};
+
+use crate::adaptive::AdaptiveController;
+use crate::health::{HealthMonitor, ModuleHealthReport};
+use crate::state::{EngineState, EphemeralMetrics, ErrorCode};
+use crate::updater::{check_github_release, UpdateCheckResult};
+
+#[derive(Debug, Clone)]
+pub struct YolacConfig {
+    pub profile: MemoryProfile,
+    pub capabilities: PlatformCapabilities,
+    pub initial_strategy: DpiStrategy,
+    pub ipv6_mode: Ipv6LeakMode,
+    pub quic_policy: QuicPolicy,
+    pub mtu: usize,
+}
+
+impl YolacConfig {
+    pub fn mobile_android() -> Self {
+        Self {
+            profile: MemoryProfile::Standard,
+            capabilities: PlatformCapabilities::MOBILE_SANDBOX,
+            initial_strategy: DpiStrategy::TlsAndTcpSplit,
+            ipv6_mode: Ipv6LeakMode::DualStackProtected,
+            quic_policy: QuicPolicy::BlockFallbackToTcp,
+            mtu: 1500,
+        }
+    }
+
+    pub fn mobile_ios() -> Self {
+        Self {
+            profile: MemoryProfile::LowMemoryIos,
+            capabilities: PlatformCapabilities::MOBILE_SANDBOX,
+            initial_strategy: DpiStrategy::TlsAndTcpSplit,
+            ipv6_mode: Ipv6LeakMode::DualStackProtected,
+            quic_policy: QuicPolicy::BlockFallbackToTcp,
+            mtu: 1500,
+        }
+    }
+
+    pub fn windows_desktop() -> Self {
+        Self {
+            profile: MemoryProfile::Standard,
+            capabilities: PlatformCapabilities::WINDOWS_WINDIVERT,
+            initial_strategy: DpiStrategy::TlsAndTcpSplit,
+            ipv6_mode: Ipv6LeakMode::DualStackProtected,
+            quic_policy: QuicPolicy::BlockFallbackToTcp,
+            mtu: 1500,
+        }
+    }
+}
+
+pub struct YolacEngine {
+    config: YolacConfig,
+    blocklist: Arc<Blocklist>,
+    dns: Arc<DnsEngine>,
+    adaptive: Arc<AdaptiveController>,
+    captive_portal: Arc<CaptivePortalMonitor>,
+    protector: Arc<dyn SocketProtector>,
+    metrics: Arc<EphemeralMetrics>,
+    health: Arc<HealthMonitor>,
+    state_tx: watch::Sender<EngineState>,
+    _state_rx: watch::Receiver<EngineState>,
+    shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
+    runner_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl YolacEngine {
+    pub fn new(config: YolacConfig, protector: Option<Arc<dyn SocketProtector>>) -> Self {
+        let protector: Arc<dyn SocketProtector> = protector.unwrap_or_else(|| Arc::new(NoopProtector));
+        let blocklist = Arc::new(Blocklist::embedded_default());
+
+        let cache_max = match config.profile {
+            MemoryProfile::Standard => 4096,
+            MemoryProfile::LowMemoryIos => 1024,
+        };
+        let suppress_aaaa = config.ipv6_mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+        let dns_cfg = DnsConfig {
+            upstreams: default_public_upstreams(),
+            cache_max_entries: cache_max,
+            upstream_timeout: Duration::from_millis(2500),
+            block_with_nxdomain: false,
+            suppress_aaaa,
+        };
+        let dialer = Arc::new(ProtectedDialer::new(Arc::clone(&protector)));
+        let dns = Arc::new(DnsEngine::new(dns_cfg, Arc::clone(&blocklist), Some(dialer)));
+
+        let strategy_cap = match config.profile {
+            MemoryProfile::Standard => 1024,
+            MemoryProfile::LowMemoryIos => 256,
+        };
+        let adaptive = Arc::new(AdaptiveController::new(
+            config.capabilities,
+            config.initial_strategy,
+            strategy_cap,
+        ));
+
+        let (state_tx, state_rx) = watch::channel(EngineState::Inactive);
+
+        Self {
+            config,
+            blocklist,
+            dns,
+            adaptive,
+            captive_portal: Arc::new(CaptivePortalMonitor::new()),
+            protector,
+            metrics: Arc::new(EphemeralMetrics::default()),
+            health: Arc::new(HealthMonitor::new()),
+            state_tx,
+            _state_rx: state_rx,
+            shutdown_tx: Mutex::new(None),
+            runner_task: Mutex::new(None),
+        }
+    }
+
+    pub fn state(&self) -> EngineState {
+        *self.state_tx.borrow()
+    }
+
+    pub fn subscribe_state(&self) -> watch::Receiver<EngineState> {
+        self.state_tx.subscribe()
+    }
+
+    pub fn dns_engine(&self) -> &Arc<DnsEngine> {
+        &self.dns
+    }
+
+    pub fn adaptive(&self) -> &Arc<AdaptiveController> {
+        &self.adaptive
+    }
+
+    pub fn captive_portal(&self) -> &Arc<CaptivePortalMonitor> {
+        &self.captive_portal
+    }
+
+    pub fn blocklist(&self) -> &Arc<Blocklist> {
+        &self.blocklist
+    }
+
+    pub fn metrics(&self) -> &Arc<EphemeralMetrics> {
+        &self.metrics
+    }
+
+    pub fn set_state(&self, new_state: EngineState) {
+        if let EngineState::Error(code) = new_state {
+            self.health.record_platform_error(Some(code));
+        } else if matches!(new_state, EngineState::Active | EngineState::Activating) {
+            self.health.record_platform_error(None);
+        }
+        self.state_tx.send_replace(new_state);
+    }
+
+    pub fn record_platform_error(&self, code: ErrorCode) {
+        self.health.record_platform_error(Some(code));
+        self.state_tx.send_replace(EngineState::Error(code));
+    }
+
+    pub fn clear_platform_error(&self) {
+        self.health.record_platform_error(None);
+    }
+
+    /// Evaluates and returns real health reports for all 7 TULPAR modules.
+    pub fn health_snapshot(&self) -> [ModuleHealthReport; 7] {
+        self.health.evaluate_all(
+            self.state(),
+            self.config.capabilities,
+            &self.blocklist,
+            &self.dns,
+            &self.captive_portal,
+        )
+    }
+
+    /// User-triggered manual GitHub Releases update check (never runs automatically in background).
+    pub async fn check_updates_manual(&self, repo_override: Option<&str>) -> UpdateCheckResult {
+        let res = check_github_release(repo_override).await;
+        self.health.record_update_result(&res);
+        res
+    }
+
+    pub fn notify_network_change(&self) {
+        self.adaptive.on_network_change();
+        self.dns.reset_preferred_upstream();
+        self.captive_portal.reset();
+    }
+
+    /// Starts the userspace TUN packet engine on the given `PacketDevice`.
+    pub async fn start_tun<D: PacketDevice + 'static>(&self, device: Arc<D>) -> io::Result<()> {
+        let mut task_guard = self.runner_task.lock().await;
+        if task_guard.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "YOLAÇ engine is already running",
+            ));
+        }
+
+        self.set_state(EngineState::Activating);
+
+        let tun_cfg = TunConfig {
+            mtu: self.config.mtu,
+            profile: self.config.profile,
+            ipv6_mode: self.config.ipv6_mode,
+            quic_policy: self.config.quic_policy,
+        };
+        let tun = TunEngine::with_captive_portal(
+            tun_cfg,
+            Arc::clone(&self.dns),
+            Arc::clone(&self.protector),
+            Arc::clone(&self.adaptive) as Arc<dyn yolac_net::StrategyAdvisor>,
+            Arc::clone(&self.captive_portal),
+        );
+
+        let (shut_tx, shut_rx) = watch::channel(false);
+        *self.shutdown_tx.lock().await = Some(shut_tx);
+
+        let state_tx = self.state_tx.clone();
+        state_tx.send_replace(EngineState::Active);
+        let handle = tokio::spawn(async move {
+            if let Err(_e) = tun.run(device, shut_rx).await {
+                state_tx.send_replace(EngineState::Error(ErrorCode::InternalError));
+            } else {
+                state_tx.send_replace(EngineState::Inactive);
+            }
+        });
+        *task_guard = Some(handle);
+        Ok(())
+    }
+
+    /// Gracefully stops the engine and wipes all ephemeral DNS/strategy caches from RAM.
+    pub async fn stop(&self) {
+        let current = self.state();
+        if current == EngineState::Inactive {
+            return;
+        }
+        self.set_state(EngineState::Deactivating);
+
+        if let Some(shut_tx) = self.shutdown_tx.lock().await.take() {
+            let _ = shut_tx.send(true);
+        }
+        if let Some(handle) = self.runner_task.lock().await.take() {
+            let _ = handle.await;
+        }
+
+        self.dns.clear_ephemeral_state().await;
+        self.adaptive.clear();
+        self.captive_portal.reset();
+        self.metrics.reset();
+        self.health.record_platform_error(None);
+        self.set_state(EngineState::Inactive);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ios_profile_respects_memory_bounds_and_clean_lifecycle() {
+        let engine = YolacEngine::new(YolacConfig::mobile_ios(), None);
+        assert_eq!(engine.state(), EngineState::Inactive);
+        assert!(engine.blocklist().memory_bytes() < 512 * 1024);
+        engine.stop().await;
+        assert_eq!(engine.state(), EngineState::Inactive);
+    }
+
+    #[test]
+    fn captive_portal_status_reflects_in_connection_security_module_and_brand_strings() {
+        use crate::health::{ModuleHealthStatus, ModuleId};
+        use crate::updater::{APP_VERSION, DEVELOPER_CREDIT_TR, SECURITY_WARNING_TR};
+
+        assert_eq!(APP_VERSION, "0.2.0");
+        assert!(SECURITY_WARNING_TR.contains("TULPAR'ı"));
+        assert_eq!(DEVELOPER_CREDIT_TR, "Ataberk Yıldız tarafından geliştirildi.");
+
+        let engine = YolacEngine::new(YolacConfig::mobile_android(), None);
+        engine.set_state(EngineState::Active);
+
+        // Normal mode -> ConnectionSecurity is Green (Healthy)
+        let normal = engine.health_snapshot();
+        assert_eq!(normal[ModuleId::ConnectionSecurity as usize].status, ModuleHealthStatus::Healthy);
+
+        // Trigger Captive Portal temporary allowance -> ConnectionSecurity reports Turkish portal notice
+        engine.captive_portal().trigger_portal_bypass();
+        let portal = engine.health_snapshot();
+        let cs = &portal[ModuleId::ConnectionSecurity as usize];
+        assert_eq!(cs.status, ModuleHealthStatus::PassiveOrUnchecked);
+        assert!(cs.detail_tr.contains("Captive Portal"));
+
+        // DNS recovery -> immediately back to Green (Healthy)
+        engine.captive_portal().on_dns_upstream_success();
+        let recovered = engine.health_snapshot();
+        assert_eq!(
+            recovered[ModuleId::ConnectionSecurity as usize].status,
+            ModuleHealthStatus::Healthy
+        );
+    }
+}

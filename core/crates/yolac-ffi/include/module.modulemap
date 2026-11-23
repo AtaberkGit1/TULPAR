@@ -1,0 +1,4 @@
+module YolacFfi {
+    header "yolac.h"
+    export *
+}

@@ -1,0 +1,22 @@
+[package]
+name = "yolac-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Panic-safe C-ABI (iOS/C) and Android JNI bindings for YOLAÇ"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+android-jni = ["dep:jni"]
+
+[dependencies]
+tokio.workspace = true
+yolac-core = { path = "../yolac-core" }
+yolac-net = { path = "../yolac-net" }
+jni = { version = "0.21", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,15 @@
+[package]
+name = "yolac-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Userspace smoltcp TUN packet router, protected DPI TCP relay, UDP NAT, and leak guard for YOLAÇ"
+
+[dependencies]
+tokio.workspace = true
+smoltcp.workspace = true
+yolac-dpi = { path = "../yolac-dpi" }
+yolac-dns = { path = "../yolac-dns" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

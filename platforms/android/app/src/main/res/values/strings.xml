@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TULPAR</string>
+    <string name="notif_channel_name">TULPAR Koruma</string>
+    <string name="notif_active_title">TULPAR Aktif</string>
+    <string name="notif_active_body">Cihaz içi koruma çalışıyor</string>
+</resources>

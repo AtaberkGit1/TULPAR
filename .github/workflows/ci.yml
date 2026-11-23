@@ -1,0 +1,100 @@
+name: TULPAR CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  rust-core-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test Rust Core Workspace
+        working-directory: core
+        run: |
+          cargo test --workspace
+          cargo check -p yolac-ffi --features android-jni
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo build --workspace --release
+
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build & Test TULPAR Windows (.exe)
+        working-directory: platforms/windows
+        run: |
+          cargo test
+          cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tulpar-windows-exe
+          path: platforms/windows/target/release/tulpar.exe
+
+  android-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - name: Build Android Rust JNI & Test + Assemble APK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          NDK_BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android26-clang"
+          export CC_x86_64_linux_android="$NDK_BIN/x86_64-linux-android26-clang"
+          export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_BIN/x86_64-linux-android26-clang"
+          cd core
+          cargo build --release --target aarch64-linux-android -p yolac-ffi --features android-jni
+          cargo build --release --target x86_64-linux-android -p yolac-ffi --features android-jni
+          mkdir -p ../platforms/android/app/src/main/jniLibs/arm64-v8a ../platforms/android/app/src/main/jniLibs/x86_64
+          cp target/aarch64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/arm64-v8a/
+          cp target/x86_64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/x86_64/
+          cd ../platforms/android
+          gradle testDebugUnitTest assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yolac-android-apk
+          path: platforms/android/app/build/outputs/apk/debug/*.apk
+
+  ios-ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build XCFramework & Unsigned iOS Archive (.ipa)
+        run: |
+          brew install xcodegen
+          chmod +x platforms/ios/scripts/build-xcframework.sh
+          ./platforms/ios/scripts/build-xcframework.sh
+          cd platforms/ios
+          xcodegen generate
+          xcodebuild -project Yolac.xcodeproj -scheme YolacApp -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+          mkdir -p build/ipa/Payload
+          cp -R build/Build/Products/Release-iphoneos/YolacApp.app build/ipa/Payload/
+          (cd build/ipa && zip -qr ../Yolac-unsigned.ipa Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yolac-ios-ipa-unsigned
+          path: platforms/ios/build/Yolac-unsigned.ipa

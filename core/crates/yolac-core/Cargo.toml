@@ -1,0 +1,20 @@
+[package]
+name = "yolac-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "YOLAÇ core orchestrator, adaptive DPI strategy selector, and zero-logging engine lifecycle"
+
+[dependencies]
+tokio.workspace = true
+rand.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+yolac-dpi = { path = "../yolac-dpi" }
+yolac-blocklist = { path = "../yolac-blocklist" }
+yolac-dns = { path = "../yolac-dns" }
+yolac-net = { path = "../yolac-net" }
+
+[dev-dependencies]
+rcgen = "0.13"

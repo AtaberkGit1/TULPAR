@@ -1,0 +1,131 @@
+name: TULPAR Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build & Test TULPAR Windows (.exe + verified WinDivert 2.2.2 .zip)
+        shell: pwsh
+        env:
+          YOLAC_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          cd platforms/windows
+          cargo test
+          cargo build --release
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/tulpar.exe dist/tulpar.exe
+          Copy-Item target/release/tulpar.exe tulpar.exe
+          Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip" -OutFile "wd.zip"
+          Expand-Archive -Path wd.zip -DestinationPath wd
+          $dllHash = (Get-FileHash "wd/WinDivert-2.2.2-A/x64/WinDivert.dll" -Algorithm SHA256).Hash.ToLower()
+          $sysHash = (Get-FileHash "wd/WinDivert-2.2.2-A/x64/WinDivert64.sys" -Algorithm SHA256).Hash.ToLower()
+          if ($dllHash -ne "c1e060ee19444a259b2162f8af0f3fe8c4428a1c6f694dce20de194ac8d7d9a2") { throw "WinDivert.dll SHA-256 mismatch: $dllHash" }
+          if ($sysHash -ne "8da085332782708d8767bcace5327a6ec7283c17cfb85e40b03cd2323a90ddc2") { throw "WinDivert64.sys SHA-256 mismatch: $sysHash" }
+          Copy-Item "wd/WinDivert-2.2.2-A/x64/WinDivert.dll" dist/WinDivert.dll
+          Copy-Item "wd/WinDivert-2.2.2-A/x64/WinDivert64.sys" dist/WinDivert64.sys
+          Compress-Archive -Path dist/* -DestinationPath tulpar-windows-x64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: |
+            platforms/windows/tulpar.exe
+            platforms/windows/tulpar-windows-x64.zip
+
+  build-android-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - name: Build Android Rust JNI + JUnit Tests + APK (.apk)
+        env:
+          YOLAC_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          NDK_BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android26-clang"
+          export CC_x86_64_linux_android="$NDK_BIN/x86_64-linux-android26-clang"
+          export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+          export CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER="$NDK_BIN/x86_64-linux-android26-clang"
+          cd core
+          cargo build --release --target aarch64-linux-android -p yolac-ffi --features android-jni
+          cargo build --release --target x86_64-linux-android -p yolac-ffi --features android-jni
+          mkdir -p ../platforms/android/app/src/main/jniLibs/arm64-v8a ../platforms/android/app/src/main/jniLibs/x86_64
+          cp target/aarch64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/arm64-v8a/
+          cp target/x86_64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/x86_64/
+          cd ../platforms/android
+          gradle testDebugUnitTest assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk tulpar-android.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: platforms/android/tulpar-android.apk
+
+  build-ios-release:
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - name: Build iOS XCFramework & Unsigned IPA (.ipa)
+        env:
+          YOLAC_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          brew install xcodegen
+          chmod +x platforms/ios/scripts/build-xcframework.sh
+          ./platforms/ios/scripts/build-xcframework.sh
+          cd platforms/ios
+          xcodegen generate
+          xcodebuild -project Yolac.xcodeproj -scheme YolacApp -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+          mkdir -p build/ipa/Payload
+          cp -R build/Build/Products/Release-iphoneos/YolacApp.app build/ipa/Payload/
+          (cd build/ipa && zip -qr ../tulpar-ios-unsigned.ipa Payload)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-ios
+          path: platforms/ios/build/tulpar-ios-unsigned.ipa
+
+  publish-github-release:
+    needs: [build-windows-release, build-android-release, build-ios-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Publish Official GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --title "TULPAR ${GITHUB_REF_NAME}" \
+            --notes "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! İndirdiğiniz dosyaların bütünlüğünü SHA256SUMS.txt ile doğrulayın. Windows'ta WinDivert ile birlikte kullanmak için tulpar-windows-x64.zip dosyasını çıkarın. Android için tulpar-android.apk dosyasını kurun. — Ataberk Yıldız"

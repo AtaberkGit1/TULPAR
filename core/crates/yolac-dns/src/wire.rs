@@ -1,0 +1,473 @@
+//! Cycle-safe RFC 1035 DNS wire parser & response synthesizer.
+
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QType {
+    A,
+    AAAA,
+    CNAME,
+    TXT,
+    HTTPS,
+    Other(u16),
+}
+
+impl From<u16> for QType {
+    fn from(v: u16) -> Self {
+        match v {
+            1 => Self::A,
+            28 => Self::AAAA,
+            5 => Self::CNAME,
+            16 => Self::TXT,
+            65 => Self::HTTPS,
+            other => Self::Other(other),
+        }
+    }
+}
+
+impl From<QType> for u16 {
+    fn from(q: QType) -> Self {
+        match q {
+            QType::A => 1,
+            QType::AAAA => 28,
+            QType::CNAME => 5,
+            QType::TXT => 16,
+            QType::HTTPS => 65,
+            QType::Other(v) => v,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsQuery {
+    pub id: u16,
+    pub flags: u16,
+    pub qname: String,
+    pub qtype: QType,
+    pub qclass: u16,
+    /// Byte offset immediately following the Question section.
+    pub question_end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsRecordData {
+    A(Ipv4Addr),
+    AAAA(Ipv6Addr),
+    CNAME(String),
+    /// RFC 9460 HTTPS (Type 65) service binding record, including ECH (SvcParamKey 5) detection.
+    Https {
+        priority: u16,
+        target: String,
+        has_ech: bool,
+    },
+    Other(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsAnswer {
+    pub rtype: u16,
+    pub ttl: u32,
+    pub data: DnsRecordData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsResponse {
+    pub id: u16,
+    pub rcode: u8,
+    pub qname: String,
+    pub qtype: QType,
+    pub answers: Vec<DnsAnswer>,
+    pub min_ttl: u32,
+}
+
+/// Decodes a DNS domain name starting at `offset` with compression pointer loop protection.
+/// Returns `(decoded_lowercase_name, next_offset_after_field)`.
+pub fn decode_dns_name(packet: &[u8], offset: usize) -> Option<(String, usize)> {
+    let mut pos = offset;
+    let mut next_pos: Option<usize> = None;
+    let mut labels: Vec<String> = Vec::new();
+    let mut jumps = 0usize;
+    let mut total_len = 0usize;
+
+    loop {
+        if pos >= packet.len() {
+            return None;
+        }
+        let len_byte = packet[pos];
+        if (len_byte & 0xC0) == 0xC0 {
+            if pos + 1 >= packet.len() {
+                return None;
+            }
+            let ptr = (((len_byte & 0x3F) as usize) << 8) | (packet[pos + 1] as usize);
+            if ptr >= packet.len() {
+                return None;
+            }
+            if next_pos.is_none() {
+                next_pos = Some(pos + 2);
+            }
+            jumps += 1;
+            if jumps > 32 {
+                // Compression loop detected
+                return None;
+            }
+            pos = ptr;
+        } else if (len_byte & 0xC0) != 0 {
+            return None;
+        } else if len_byte == 0 {
+            if next_pos.is_none() {
+                next_pos = Some(pos + 1);
+            }
+            break;
+        } else {
+            let label_len = len_byte as usize;
+            pos += 1;
+            if pos + label_len > packet.len() {
+                return None;
+            }
+            total_len += label_len + 1;
+            if total_len > 255 {
+                return None;
+            }
+            let label = std::str::from_utf8(&packet[pos..pos + label_len]).ok()?;
+            labels.push(label.to_ascii_lowercase());
+            pos += label_len;
+        }
+    }
+
+    let name = if labels.is_empty() {
+        String::new()
+    } else {
+        labels.join(".")
+    };
+    Some((name, next_pos.unwrap_or(pos)))
+}
+
+/// Parses an RFC 1035 DNS query packet safely.
+pub fn parse_dns_query(packet: &[u8]) -> Option<DnsQuery> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([packet[0], packet[1]]);
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    // Must be a standard query (QR == 0)
+    if (flags & 0x8000) != 0 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    if qdcount == 0 {
+        return None;
+    }
+    let (qname, after_name) = decode_dns_name(packet, 12)?;
+    if after_name + 4 > packet.len() {
+        return None;
+    }
+    let qtype = QType::from(u16::from_be_bytes([packet[after_name], packet[after_name + 1]]));
+    let qclass = u16::from_be_bytes([packet[after_name + 2], packet[after_name + 3]]);
+
+    Some(DnsQuery {
+        id,
+        flags,
+        qname,
+        qtype,
+        qclass,
+        question_end: after_name + 4,
+    })
+}
+
+/// Parses an RFC 1035 DNS response packet, extracting answer RRs and CNAME targets.
+pub fn parse_dns_response(packet: &[u8]) -> Option<DnsResponse> {
+    if packet.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([packet[0], packet[1]]);
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    // Must be a response (QR == 1)
+    if (flags & 0x8000) == 0 {
+        return None;
+    }
+    let rcode = (flags & 0x000F) as u8;
+    let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
+    let ancount = u16::from_be_bytes([packet[6], packet[7]]);
+
+    let mut pos = 12usize;
+    let mut qname = String::new();
+    let mut qtype = QType::Other(0);
+
+    for i in 0..qdcount {
+        let (name, next) = decode_dns_name(packet, pos)?;
+        if next + 4 > packet.len() {
+            return None;
+        }
+        if i == 0 {
+            qname = name;
+            qtype = QType::from(u16::from_be_bytes([packet[next], packet[next + 1]]));
+        }
+        pos = next + 4;
+    }
+
+    let mut answers = Vec::with_capacity(ancount.min(32) as usize);
+    let mut min_ttl = u32::MAX;
+
+    for _ in 0..ancount.min(64) {
+        let (_rr_name, after_name) = decode_dns_name(packet, pos)?;
+        if after_name + 10 > packet.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([packet[after_name], packet[after_name + 1]]);
+        let _rclass = u16::from_be_bytes([packet[after_name + 2], packet[after_name + 3]]);
+        let ttl = u32::from_be_bytes([
+            packet[after_name + 4],
+            packet[after_name + 5],
+            packet[after_name + 6],
+            packet[after_name + 7],
+        ]);
+        let rdlength = u16::from_be_bytes([packet[after_name + 8], packet[after_name + 9]]) as usize;
+        let rdata_start = after_name + 10;
+        let rdata_end = rdata_start + rdlength;
+        if rdata_end > packet.len() {
+            return None;
+        }
+
+        min_ttl = min_ttl.min(ttl);
+        let data = match rtype {
+            1 if rdlength == 4 => DnsRecordData::A(Ipv4Addr::new(
+                packet[rdata_start],
+                packet[rdata_start + 1],
+                packet[rdata_start + 2],
+                packet[rdata_start + 3],
+            )),
+            28 if rdlength == 16 => {
+                let mut octs = [0u8; 16];
+                octs.copy_from_slice(&packet[rdata_start..rdata_end]);
+                DnsRecordData::AAAA(Ipv6Addr::from(octs))
+            }
+            5 => {
+                let (cname, _) = decode_dns_name(packet, rdata_start)?;
+                DnsRecordData::CNAME(cname)
+            }
+            65 => parse_https_rdata(packet, rdata_start, rdata_end)
+                .unwrap_or(DnsRecordData::Other(65)),
+            other => DnsRecordData::Other(other),
+        };
+
+        answers.push(DnsAnswer { rtype, ttl, data });
+        pos = rdata_end;
+    }
+
+    if min_ttl == u32::MAX {
+        min_ttl = 60;
+    }
+
+    Some(DnsResponse {
+        id,
+        rcode,
+        qname,
+        qtype,
+        answers,
+        min_ttl,
+    })
+}
+
+/// Parses RFC 9460 HTTPS (Type 65) RDATA: SvcPriority (2 bytes), TargetName (wire name),
+/// followed by zero or more SvcParams (Key u16, Len u16, Value). Detects ECH (`key == 5`).
+fn parse_https_rdata(packet: &[u8], rdata_start: usize, rdata_end: usize) -> Option<DnsRecordData> {
+    if rdata_end.saturating_sub(rdata_start) < 3 {
+        return None;
+    }
+    let priority = u16::from_be_bytes([packet[rdata_start], packet[rdata_start + 1]]);
+    let (target, mut pos) = decode_dns_name(packet, rdata_start + 2)?;
+    if pos > rdata_end {
+        return None;
+    }
+
+    let mut has_ech = false;
+    while pos + 4 <= rdata_end {
+        let key = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let val_len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
+        pos += 4;
+        if pos + val_len > rdata_end {
+            break;
+        }
+        // RFC 9460 Section 14.3.2: SvcParamKey 5 = ech (Encrypted Client Hello config list)
+        if key == 5 && val_len > 0 {
+            has_ech = true;
+        }
+        pos += val_len;
+    }
+
+    Some(DnsRecordData::Https {
+        priority,
+        target,
+        has_ech,
+    })
+}
+
+/// Rewrites the 2-byte transaction ID of a cached DNS wire packet.
+pub fn patch_transaction_id(packet: &mut [u8], new_id: u16) {
+    if packet.len() >= 2 {
+        packet[0..2].copy_from_slice(&new_id.to_be_bytes());
+    }
+}
+
+/// Synthesizes a local blocked DNS response (`0.0.0.0` for A, `::` for AAAA, or `NXDOMAIN`).
+pub fn build_blocked_response(query_packet: &[u8], nxdomain: bool) -> Option<Vec<u8>> {
+    let query = parse_dns_query(query_packet)?;
+    let question_section = &query_packet[12..query.question_end];
+
+    let mut out = Vec::with_capacity(12 + question_section.len() + 32);
+    out.extend_from_slice(&query.id.to_be_bytes());
+
+    let rd = query.flags & 0x0100;
+    let rcode = if nxdomain { 0x0003 } else { 0x0000 };
+    // QR=1, AA=0, TC=0, RD preserved, RA=1
+    let resp_flags = 0x8080 | rd | rcode;
+    out.extend_from_slice(&resp_flags.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
+
+    if nxdomain {
+        out.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT = 0
+        out.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT = 0
+        out.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT = 0
+        out.extend_from_slice(question_section);
+        return Some(out);
+    }
+
+    let (add_answer, rtype, rdlen): (bool, u16, u16) = match query.qtype {
+        QType::A => (true, 1, 4),
+        QType::AAAA => (true, 28, 16),
+        _ => (false, 0, 0),
+    };
+
+    out.extend_from_slice(&(if add_answer { 1u16 } else { 0u16 }).to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(question_section);
+
+    if add_answer {
+        out.extend_from_slice(&0xC00Cu16.to_be_bytes()); // Pointer to QNAME at offset 12
+        out.extend_from_slice(&rtype.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes()); // IN
+        out.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60s
+        out.extend_from_slice(&rdlen.to_be_bytes());
+        out.resize(out.len() + rdlen as usize, 0);
+    }
+
+    Some(out)
+}
+
+/// Synthesizes an empty `NOERROR` response (used for `AAAA` suppression on IPv6 leak guard).
+pub fn build_empty_noerror_response(query_packet: &[u8]) -> Option<Vec<u8>> {
+    let query = parse_dns_query(query_packet)?;
+    let question_section = &query_packet[12..query.question_end];
+
+    let mut out = Vec::with_capacity(12 + question_section.len());
+    out.extend_from_slice(&query.id.to_be_bytes());
+    let rd = query.flags & 0x0100;
+    out.extend_from_slice(&(0x8080 | rd).to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(question_section);
+    Some(out)
+}
+
+/// Builds a minimal RFC 1035 DNS query packet (helper for tests & probes).
+pub fn build_dns_query(id: u16, domain: &str, qtype: QType) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(32 + domain.len());
+    pkt.extend_from_slice(&id.to_be_bytes());
+    pkt.extend_from_slice(&0x0100u16.to_be_bytes()); // Standard query, RD=1
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes());
+    for label in domain.trim_end_matches('.').split('.') {
+        if !label.is_empty() {
+            pkt.push(label.len() as u8);
+            pkt.extend_from_slice(label.as_bytes());
+        }
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&u16::from(qtype).to_be_bytes());
+    pkt.extend_from_slice(&1u16.to_be_bytes()); // IN
+    pkt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrips_query_and_synthesizes_blocked_answer() {
+        let q = build_dns_query(0x1234, "doubleclick.net", QType::A);
+        let parsed_q = parse_dns_query(&q).unwrap();
+        assert_eq!(parsed_q.id, 0x1234);
+        assert_eq!(parsed_q.qname, "doubleclick.net");
+        assert_eq!(parsed_q.qtype, QType::A);
+
+        let resp_bytes = build_blocked_response(&q, false).unwrap();
+        let resp = parse_dns_response(&resp_bytes).unwrap();
+        assert_eq!(resp.id, 0x1234);
+        assert_eq!(resp.rcode, 0);
+        assert_eq!(resp.answers.len(), 1);
+        assert_eq!(resp.answers[0].data, DnsRecordData::A(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn rejects_compression_pointer_loop() {
+        // Malformed DNS query with self-referential pointer at offset 12 -> 0xC00C
+        let mut pkt = vec![0u8; 18];
+        pkt[0..2].copy_from_slice(&0x1111u16.to_be_bytes());
+        pkt[4..6].copy_from_slice(&1u16.to_be_bytes());
+        pkt[12] = 0xC0;
+        pkt[13] = 0x0C;
+        assert!(parse_dns_query(&pkt).is_none());
+    }
+
+    #[test]
+    fn parses_https_type65_record_with_ech_param() {
+        let q = build_dns_query(0x7777, "crypto.cloudflare.com", QType::HTTPS);
+        let parsed_q = parse_dns_query(&q).unwrap();
+        let q_sec = &q[12..parsed_q.question_end];
+
+        // Build RFC 9460 HTTPS RDATA: priority=1, target="." (0x00), SvcParam alpn(1)="h2", SvcParam ech(5)=[0x01,0x02,0x03,0x04]
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&1u16.to_be_bytes()); // priority
+        rdata.push(0x00); // root target "."
+        // alpn key=1, len=3, "\x02h2"
+        rdata.extend_from_slice(&1u16.to_be_bytes());
+        rdata.extend_from_slice(&3u16.to_be_bytes());
+        rdata.extend_from_slice(&[2, b'h', b'2']);
+        // ech key=5, len=4
+        rdata.extend_from_slice(&5u16.to_be_bytes());
+        rdata.extend_from_slice(&4u16.to_be_bytes());
+        rdata.extend_from_slice(&[0x00, 0x02, 0xFE, 0x0D]);
+
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&0x7777u16.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        resp.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT=1
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(q_sec);
+        resp.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        resp.extend_from_slice(&65u16.to_be_bytes()); // HTTPS
+        resp.extend_from_slice(&1u16.to_be_bytes()); // IN
+        resp.extend_from_slice(&300u32.to_be_bytes()); // TTL
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(&rdata);
+
+        let parsed = parse_dns_response(&resp).expect("valid HTTPS RR response");
+        assert_eq!(parsed.qtype, QType::HTTPS);
+        assert_eq!(parsed.answers.len(), 1);
+        assert_eq!(
+            parsed.answers[0].data,
+            DnsRecordData::Https {
+                priority: 1,
+                target: String::new(),
+                has_ech: true,
+            }
+        );
+    }
+}
