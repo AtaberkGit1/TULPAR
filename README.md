@@ -1,6 +1,6 @@
 > **GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir.**
 >
-> Resmî Depo ve Sürümler: https://github.com/AtaberkGit1/YOLAC/releases
+> Resmî Depo ve Sürümler: https://github.com/AtaberkGit1/TULPAR/releases
 
 # TULPAR
 

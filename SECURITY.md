@@ -15,7 +15,7 @@
 - **Balanced Fail-Closed IPv6 Protection**: `probe_ipv6_leak_mode` checks protected IPv6 reachability; if IPv6 is broken or unguarded, YOLAÇ automatically switches to `BlockUnprotectedIpv6` + `AAAA` suppression so host IPv6 cannot leak.
 - **Windows DLL Hijacking Protection**: Elevated `tulpar.exe` loads `WinDivert.dll` strictly from the executable directory (`LOAD_LIBRARY_SEARCH_APPLICATION_DIR`) ONLY after verifying official WinDivert 2.2.2 SHA-256 digests (`WinDivert.dll` + `WinDivert64.sys`) and Windows Authenticode signature (`WinVerifyTrust`).
 - **Bounded Captive Portal Safety**: Temporary local-LAN portal allowance activates only on consecutive encrypted DNS failures alongside OS portal checks, is strictly capped at 90 seconds, and automatically closes the instant encrypted DNS succeeds again.
-- **Release Checksums**: Tag-triggered releases (`v*`) publish `SHA256SUMS.txt` alongside all artifacts on `https://github.com/AtaberkGit1/YOLAC/releases`.
+- **Release Checksums**: Tag-triggered releases (`v*`) publish `SHA256SUMS.txt` alongside all artifacts on `https://github.com/AtaberkGit1/TULPAR/releases`.
 - **DoS / OOM Caps**: `TunEngine` enforces bounded concurrent DNS semaphores, strict max packet size (`<= 65535`), bounded TCP flow caps, and LRU UDP NAT eviction.
 
 ## 4. Reporting Vulnerabilities

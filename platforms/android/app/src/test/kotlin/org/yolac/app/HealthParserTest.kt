@@ -50,7 +50,7 @@ class HealthParserTest {
     @Test
     fun validatesOfficialGithubReleaseUrlsAndRejectsThirdParty() {
         val official = HealthParser.parseUpdateResult(
-            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://github.com/AtaberkGit1/YOLAC/releases/tag/v0.2.0"}""",
+            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://github.com/AtaberkGit1/TULPAR/releases/tag/v0.2.0"}""",
         )
         assertTrue(official.isTrustedOfficialGithubReleaseUrl())
 

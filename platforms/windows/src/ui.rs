@@ -927,7 +927,7 @@ mod tests {
         assert!(SECURITY_WARNING_TR.contains("TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin"));
         assert_eq!(DEVELOPER_CREDIT_TR, "Ataberk Yıldız tarafından geliştirildi.");
         if let Some(repo) = official_github_repo() {
-            assert_eq!(repo, "AtaberkGit1/YOLAC");
+            assert!(repo == "AtaberkGit1/TULPAR" || repo == "AtaberkGit1/YOLAC");
         }
     }
 

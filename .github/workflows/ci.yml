@@ -54,8 +54,10 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
       - name: Build Android Rust JNI & Test + Assemble APK
         run: |
+          export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          yes | sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" >/dev/null || sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
           NDK_BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
@@ -69,6 +71,10 @@ jobs:
           mkdir -p ../platforms/android/app/src/main/jniLibs/arm64-v8a ../platforms/android/app/src/main/jniLibs/x86_64
           cp target/aarch64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/arm64-v8a/
           cp target/x86_64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/x86_64/
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TULPAR,O=Ataberk Yildiz,C=TR"
+          fi
           cd ../platforms/android
           gradle testDebugUnitTest assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
