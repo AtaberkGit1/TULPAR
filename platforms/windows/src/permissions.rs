@@ -34,7 +34,7 @@ pub fn is_elevated() -> bool {
 }
 
 /// Requests explicit Windows UAC elevation by relaunching the current executable with `--autostart`.
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 pub fn request_uac_elevation() -> bool {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -59,7 +59,7 @@ pub fn request_uac_elevation() -> bool {
     (h as usize) > 32
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 pub fn request_uac_elevation() -> bool {
     false
 }

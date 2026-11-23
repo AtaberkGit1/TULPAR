@@ -59,7 +59,7 @@ Ayrıntılar için:
 |---|---|---|---|
 | **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.2.0`) | Tüm platformlar tarafından paylaşılır |
 | **Windows (`platforms/windows`)** | `tulpar.exe` / `.zip` | Tamamlandı (Win32 `#000000` UI, Sistem Tepsisi, Ayarlar & 7 modül, UAC, WinDivert 2.2.2 **SHA-256 + Authenticode** doğrulama, Otomatik TTL) | Canlı kernel yakalama için imzalı `WinDivert.dll` + `WinDivert64.sys` gerekir; `release.yml` doğrulamalı `.zip` + `SHA256SUMS.txt` üretir |
-| **Android (`platforms/android`)** | `tulpar-android.apk` | Tamamlandı (Kotlin `VpnService`, Hızlı Ayarlar Kutucuğu, Always-On VPN, `#000000` UI, Ayarlar & 7 modül, JNI) | Android 8.0+ (API 26+) |
+| **Android (`platforms/android`)** | `tulpar.apk` | Tamamlandı (Kotlin `VpnService`, Hızlı Ayarlar Kutucuğu, Always-On VPN, `#000000` UI, Ayarlar & 7 modül, JNI) | Android 8.0+ (API 26+) |
 | **iOS (`platforms/ios`)** | `tulpar-ios-unsigned.ipa` | Kaynak & proje tamamlandı (SwiftUI `#000000` UI, Ayarlar, `NEPacketTunnelProvider`, `NEOnDemandRule`, `LowMemoryIos`, `PrivacyInfo.xcprivacy`) | `.ipa` imzalaması Apple kısıtlaması gereği **macOS + Xcode + Apple Developer Program** gerektirir |
 
 ---
@@ -81,7 +81,7 @@ cargo build --workspace --release
 ### Android
 ```bash
 ./platforms/android/scripts/build-rust-android.sh
-cd platforms/android && gradle testDebugUnitTest assembleDebug
+cd platforms/android && gradle testDebugUnitTest assembleRelease
 ```
 
 ### iOS (macOS)

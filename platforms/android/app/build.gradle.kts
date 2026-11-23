@@ -19,10 +19,23 @@ android {
         }
     }
 
+    signingConfigs {
+        val keystorePath = System.getenv("TULPAR_KEYSTORE_PATH")
+        if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("TULPAR_KEYSTORE_PASSWORD") ?: ""
+                keyAlias = System.getenv("TULPAR_KEY_ALIAS") ?: ""
+                keyPassword = System.getenv("TULPAR_KEY_PASSWORD") ?: ""
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

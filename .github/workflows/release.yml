@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.0)"
+        required: true
+        default: "v0.2.0"
 
 permissions:
   contents: write
@@ -76,12 +82,12 @@ jobs:
           cp target/aarch64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/arm64-v8a/
           cp target/x86_64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/x86_64/
           cd ../platforms/android
-          gradle testDebugUnitTest assembleDebug --no-daemon
-          cp app/build/outputs/apk/debug/app-debug.apk tulpar-android.apk
+          gradle testDebugUnitTest assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk tulpar.apk
       - uses: actions/upload-artifact@v4
         with:
           name: release-android
-          path: platforms/android/tulpar-android.apk
+          path: platforms/android/tulpar.apk
 
   build-ios-release:
     runs-on: macos-latest
@@ -111,6 +117,7 @@ jobs:
 
   publish-github-release:
     needs: [build-windows-release, build-android-release, build-ios-release]
+    if: ${{ always() && (needs.build-windows-release.result == 'success' || needs.build-android-release.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -120,12 +127,19 @@ jobs:
       - name: Generate SHA256SUMS.txt
         working-directory: release-assets
         run: |
+          ls -lh
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Publish Official GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" release-assets/* \
-            --title "TULPAR ${GITHUB_REF_NAME}" \
-            --notes "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! İndirdiğiniz dosyaların bütünlüğünü SHA256SUMS.txt ile doğrulayın. Windows'ta WinDivert ile birlikte kullanmak için tulpar-windows-x64.zip dosyasını çıkarın. Android için tulpar-android.apk dosyasını kurun. — Ataberk Yıldız"
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          REPO="${{ github.repository }}"
+          NOTES="GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! İndirdiğiniz dosyaların bütünlüğünü SHA256SUMS.txt ile doğrulayın. Windows'ta WinDivert ile birlikte kullanmak için tulpar-windows-x64.zip dosyasını çıkarın (yalnızca çalıştırılabilir dosya için tulpar.exe). Android için tulpar.apk dosyasını kurun. — Ataberk Yıldız"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --repo "$REPO" --clobber
+            gh release edit "$TAG" --repo "$REPO" --title "TULPAR $TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" release-assets/* --repo "$REPO" --title "TULPAR $TAG" --notes "$NOTES"
+          fi
