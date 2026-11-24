@@ -41,7 +41,6 @@ struct ModuleHealthItem: Identifiable, Decodable, Equatable {
 enum YolacStrings {
     static let securityWarning =
         "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir."
-    static let developerCredit = "Ataberk Yıldız tarafından geliştirildi."
 }
 
 @MainActor

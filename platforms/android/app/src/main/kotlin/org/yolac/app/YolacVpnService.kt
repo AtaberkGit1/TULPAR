@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.IpPrefix
 import android.net.Network
@@ -58,42 +59,72 @@ class YolacVpnService : VpnService() {
         }
     }
 
+    private fun establishTun(includeIpv6: Boolean): ParcelFileDescriptor? {
+        return try {
+            val builder = Builder()
+                .setSession("TULPAR")
+                .setMtu(1500)
+                .addAddress("10.219.0.1", 30)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("10.219.0.2")
+
+            if (includeIpv6) {
+                builder
+                    .addAddress("fd79:6f6c:6163::1", 126)
+                    .addRoute("::", 0)
+                    .addDnsServer("fd79:6f6c:6163::2")
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.setMetered(false)
+            }
+
+            // Exclude RFC1918/link-local LAN subnets on API 33+ for seamless Captive Portal & local router access
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                try {
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("192.168.0.0"), 16))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("169.254.0.0"), 16))
+                } catch (_: Exception) {
+                }
+            }
+
+            try {
+                builder.addDisallowedApplication(packageName)
+            } catch (_: Exception) {
+            }
+
+            builder.establish()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     private fun startProtection() {
         if (tunInterface != null) return
         updateState(YolacNative.STATE_ACTIVATING)
         ensureNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification())
-
-        val builder = Builder()
-            .setSession("TULPAR")
-            .setMtu(1500)
-            .addAddress("10.219.0.1", 30)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("10.219.0.2")
-            .addAddress("fd79:6f6c:6163::1", 126)
-            .addRoute("::", 0)
-            .addDnsServer("fd79:6f6c:6163::2")
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
-        }
-
-        // Exclude RFC1918/link-local LAN subnets on API 33+ for seamless Captive Portal & local router access
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            try {
-                builder.excludeRoute(IpPrefix(InetAddress.getByName("192.168.0.0"), 16))
-                builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
-                builder.excludeRoute(IpPrefix(InetAddress.getByName("169.254.0.0"), 16))
-            } catch (_: Exception) {
-            }
-        }
-
         try {
-            builder.addDisallowedApplication(packageName)
-        } catch (_: Exception) {
+            val notif = buildNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        } catch (_: Throwable) {
+            YolacNative.nativeReportPlatformError(YolacNative.ERROR_PERMISSION_DENIED)
+            updateState(YolacNative.STATE_ERROR)
+            stopSelf()
+            return
         }
 
-        val pfd = builder.establish()
+        // Try dual-stack IPv4+IPv6 first; fall back seamlessly to IPv4-only + IPv6 leak blocking if OEM kernel lacks IPv6 TUN
+        var usedIpv6 = true
+        var pfd = establishTun(includeIpv6 = true)
+        if (pfd == null) {
+            usedIpv6 = false
+            pfd = establishTun(includeIpv6 = false)
+        }
         if (pfd == null) {
             YolacNative.nativeReportPlatformError(YolacNative.ERROR_TUN_SETUP_FAILED)
             updateState(YolacNative.STATE_ERROR)
@@ -105,7 +136,7 @@ class YolacVpnService : VpnService() {
         tunInterface = pfd
         // Hand detached FD ownership cleanly to Rust core
         val detachedFd = pfd.detachFd()
-        val ok = YolacNative.nativeStartTun(this, detachedFd, false)
+        val ok = YolacNative.nativeStartTun(this, detachedFd, !usedIpv6)
         if (!ok) {
             YolacNative.nativeReportPlatformError(YolacNative.ERROR_TUN_SETUP_FAILED)
             updateState(YolacNative.STATE_ERROR)
@@ -199,7 +230,7 @@ class YolacVpnService : VpnService() {
         return builder
             .setContentTitle(getString(R.string.notif_active_title))
             .setContentText(getString(R.string.notif_active_body))
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setSmallIcon(R.drawable.ic_tulpar_status)
             .setOngoing(true)
             .setContentIntent(openIntent)
             .build()

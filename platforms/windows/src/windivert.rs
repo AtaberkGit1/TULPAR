@@ -59,10 +59,11 @@ impl WinDivertAddress {
 #[cfg(windows)]
 mod loader {
     use super::*;
-    use crate::integrity::verify_windivert_next_to_exe;
+    use crate::integrity::ensure_verified_windivert;
     use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::LibraryLoader::{
-        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        LOAD_LIBRARY_SEARCH_SYSTEM32,
     };
 
     pub type WinDivertOpenFn = unsafe extern "C" fn(
@@ -109,18 +110,18 @@ mod loader {
 
     impl WinDivertApi {
         pub fn load() -> Result<Self, ErrorCode> {
-            let verified_dll_path = verify_windivert_next_to_exe()?;
+            let verified_dll_path = ensure_verified_windivert()?;
             unsafe {
                 let mut dll: Vec<u16> = verified_dll_path
                     .to_string_lossy()
                     .encode_utf16()
                     .chain(Some(0))
                     .collect();
-                // Load strictly from the application directory (prevents Windows DLL hijacking)
+                // Load strictly from the verified directory + System32 (prevents Windows DLL hijacking)
                 let module = LoadLibraryExW(
                     dll.as_mut_ptr(),
                     std::ptr::null_mut(),
-                    LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
                 );
                 if module.is_null() {
                     return Err(ErrorCode::DriverMissing);
@@ -167,6 +168,8 @@ mod loader {
 pub struct WindowsPacketEngine {
     stop_flag: Arc<AtomicBool>,
     handle_ptr: Arc<std::sync::Mutex<usize>>,
+    #[cfg(windows)]
+    active_api: std::sync::Mutex<Option<Arc<loader::WinDivertApi>>>,
     worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     calibrator: Arc<TtlCalibrator>,
 }
@@ -176,6 +179,8 @@ impl WindowsPacketEngine {
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle_ptr: Arc::new(std::sync::Mutex::new(0)),
+            #[cfg(windows)]
+            active_api: std::sync::Mutex::new(None),
             worker: std::sync::Mutex::new(None),
             calibrator: Arc::new(TtlCalibrator::default()),
         }
@@ -193,13 +198,20 @@ impl WindowsPacketEngine {
         F: Fn(EngineState) + Send + Sync + 'static,
     {
         let api = Arc::new(loader::WinDivertApi::load()?);
-        let filter = CString::new(
+        let full_filter = CString::new(
             "(outbound and ((tcp.DstPort == 443 or tcp.DstPort == 80) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and tcp.Syn and tcp.Ack and (tcp.SrcPort == 443 or tcp.SrcPort == 80))",
+        )
+        .map_err(|_| ErrorCode::InternalError)?;
+        let fallback_filter = CString::new(
+            "outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)",
         )
         .map_err(|_| ErrorCode::InternalError)?;
 
         // WINDIVERT_LAYER_NETWORK = 0, priority = 0, flags = 0
-        let raw_handle = unsafe { (api.open)(filter.as_ptr(), 0, 0, 0) };
+        let mut raw_handle = unsafe { (api.open)(full_filter.as_ptr(), 0, 0, 0) };
+        if loader::WinDivertApi::is_invalid_handle(raw_handle) {
+            raw_handle = unsafe { (api.open)(fallback_filter.as_ptr(), 0, 0, 0) };
+        }
         if loader::WinDivertApi::is_invalid_handle(raw_handle) {
             let err = std::io::Error::last_os_error();
             return Err(match err.raw_os_error() {
@@ -213,6 +225,9 @@ impl WindowsPacketEngine {
         if let Ok(mut g) = self.handle_ptr.lock() {
             *g = raw_handle as usize;
         }
+        if let Ok(mut g) = self.active_api.lock() {
+            *g = Some(Arc::clone(&api));
+        }
         flush_windows_dns_cache();
         on_state(EngineState::Active);
 
@@ -225,6 +240,8 @@ impl WindowsPacketEngine {
         let jh = std::thread::spawn(move || {
             let raw_handle = raw_handle_addr as *mut c_void;
             let rt = Runtime::new().expect("tokio runtime");
+            let send_handle = Arc::new(std::sync::Mutex::new(raw_handle_addr));
+            let dns_sem = Arc::new(tokio::sync::Semaphore::new(64));
             let mut buf = vec![0u8; 65536];
             let mut addr = WinDivertAddress::default();
             let mut recv_len = 0u32;
@@ -243,6 +260,77 @@ impl WindowsPacketEngine {
                     break;
                 }
                 let pkt = &buf[..recv_len as usize];
+
+                // CRITICAL: Handle outbound UDP/53 DNS asynchronously so the WinDivertRecv thread
+                // NEVER deadlocks waiting for its own DoH/DoT TCP/443 upstream handshake!
+                if addr.is_outbound() {
+                    if let Some(ip) = parse_ip_packet(pkt) {
+                        if ip.protocol == IpProtocol::Udp {
+                            if let Some(udp) = parse_udp(ip.payload) {
+                                if udp.dst_port == 53
+                                    && !(portal.is_bypass_active() && is_local_lan_ip(ip.dst_ip))
+                                {
+                                    if let Ok(permit) = Arc::clone(&dns_sem).try_acquire_owned() {
+                                        let dns_c = Arc::clone(&dns);
+                                        let portal_c = Arc::clone(&portal);
+                                        let api_c = Arc::clone(&thread_api);
+                                        let sh_c = Arc::clone(&send_handle);
+                                        let query_bytes = udp.payload.to_vec();
+                                        let src_ip = ip.src_ip;
+                                        let dst_ip = ip.dst_ip;
+                                        let src_port = udp.src_port;
+                                        let dst_port = udp.dst_port;
+                                        let mut reply_addr = addr;
+                                        reply_addr.set_inbound();
+
+                                        rt.spawn(async move {
+                                            let _permit = permit;
+                                            let qname = parse_dns_query(&query_bytes).map(|q| q.qname);
+                                            let (resp_opt, outcome) = dns_c.resolve(&query_bytes).await;
+                                            match outcome {
+                                                DnsOutcome::UpstreamResolved => {
+                                                    portal_c.on_dns_upstream_success()
+                                                }
+                                                DnsOutcome::Failed => {
+                                                    if let Some(name) = qname.as_deref() {
+                                                        portal_c.on_dns_query_and_failure_state(
+                                                            name,
+                                                            dns_c.consecutive_failures(),
+                                                        );
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                            if let Some(resp_wire) = resp_opt {
+                                                if let Some(mut reply_pkt) = build_dns_reply_l3(
+                                                    src_ip, dst_ip, src_port, dst_port, &resp_wire,
+                                                ) {
+                                                    if let Ok(guard) = sh_c.lock() {
+                                                        if *guard != 0 {
+                                                            let h = *guard as *mut c_void;
+                                                            let mut send_len = 0u32;
+                                                            unsafe {
+                                                                let _ = (api_c.send)(
+                                                                    h,
+                                                                    reply_pkt.as_mut_ptr().cast(),
+                                                                    reply_pkt.len() as u32,
+                                                                    &mut send_len,
+                                                                    &mut reply_addr,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let processed = process_packet(
                     pkt,
                     addr,
@@ -256,18 +344,26 @@ impl WindowsPacketEngine {
                 for (out_pkt, mut out_addr) in processed {
                     let mut send_len = 0u32;
                     let mut mutable = out_pkt;
-                    unsafe {
-                        let _ = (thread_api.send)(
-                            raw_handle,
-                            mutable.as_mut_ptr().cast(),
-                            mutable.len() as u32,
-                            &mut send_len,
-                            &mut out_addr,
-                        );
+                    if let Ok(guard) = send_handle.lock() {
+                        if *guard != 0 {
+                            let h = *guard as *mut c_void;
+                            unsafe {
+                                let _ = (thread_api.send)(
+                                    h,
+                                    mutable.as_mut_ptr().cast(),
+                                    mutable.len() as u32,
+                                    &mut send_len,
+                                    &mut out_addr,
+                                );
+                            }
+                        }
                     }
                 }
             }
 
+            if let Ok(mut g) = send_handle.lock() {
+                *g = 0;
+            }
             if let Ok(mut g) = handle_ptr.lock() {
                 *g = 0;
             }
@@ -303,10 +399,11 @@ impl WindowsPacketEngine {
         self.stop_flag.store(true, Ordering::SeqCst);
         #[cfg(windows)]
         {
+            let api_opt = self.active_api.lock().ok().and_then(|mut g| g.take());
             if let Ok(g) = self.handle_ptr.lock() {
                 let h = *g as *mut c_void;
                 if !h.is_null() {
-                    if let Ok(api) = loader::WinDivertApi::load() {
+                    if let Some(api) = api_opt {
                         // WINDIVERT_SHUTDOWN_BOTH = 3
                         unsafe {
                             let _ = (api.shutdown)(h, 3);
@@ -447,6 +544,11 @@ fn process_outbound_inner(
                 return vec![];
             }
 
+            // Let encrypted DoH/DoT bootstrap upstreams pass straight through without double-fragmentation
+            if is_bootstrap_dns_ip(ip.dst_ip) {
+                return vec![(pkt.to_vec(), addr)];
+            }
+
             // Smart SYN MSS clamping on outbound 443/80 handshakes (disrupts server-response DPI)
             if tcp.is_syn_only() && (tcp.dst_port == 443 || tcp.dst_port == 80) && !is_local_lan_ip(ip.dst_ip) {
                 if let Some(clamped) = clamp_syn_mss(pkt, 536) {
@@ -523,6 +625,27 @@ fn process_outbound_inner(
     }
 
     vec![(pkt.to_vec(), addr)]
+}
+
+fn is_bootstrap_dns_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => matches!(
+            v4.octets(),
+            [1, 1, 1, 1]
+                | [1, 0, 0, 1]
+                | [9, 9, 9, 9]
+                | [149, 112, 112, 112]
+                | [8, 8, 8, 8]
+                | [8, 8, 4, 4]
+        ),
+        IpAddr::V6(v6) => matches!(
+            v6.segments(),
+            [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111]
+                | [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001]
+                | [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe]
+                | [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888]
+        ),
+    }
 }
 
 fn rebuild_tcp_payload_packet(

@@ -73,7 +73,7 @@ jobs:
           cp target/x86_64-linux-android/release/libyolac_ffi.so ../platforms/android/app/src/main/jniLibs/x86_64/
           if [ ! -f "$HOME/.android/debug.keystore" ]; then
             mkdir -p "$HOME/.android"
-            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TULPAR,O=Ataberk Yildiz,C=TR"
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TULPAR,O=TULPAR,C=TR"
           fi
           cd ../platforms/android
           gradle testDebugUnitTest assembleRelease --no-daemon

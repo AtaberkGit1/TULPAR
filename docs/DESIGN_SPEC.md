@@ -38,4 +38,3 @@ TULPAR uses an identical, ultra-minimalist Turkish visual language across Androi
   - Tapping any icon reveals that module's full Turkish name and real current status.
 - **Manual Update Check Button**: `Güncellemeleri Kontrol Et` directly below status icons (runs ONLY on explicit user tap; checks ONLY official GitHub Releases; never runs in background; never uses an invented repo URL).
 - **Security Warning**: Prominent minimalist warning box directly below the update button with the exact Turkish text above.
-- **Footer**: Bottom-centered `Ataberk Yıldız tarafından geliştirildi.` in `#6E6E6E`.

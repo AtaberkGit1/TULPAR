@@ -382,15 +382,68 @@ pub extern "C" fn yolac_report_platform_error(handle: *mut YolacHandle, error_co
 #[cfg(unix)]
 struct UnixTunFdDevice {
     fd: i32,
-    write_lock: tokio::sync::Mutex<()>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+    rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
+    write_lock: std::sync::Mutex<()>,
+    reader_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[cfg(unix)]
 impl UnixTunFdDevice {
     fn new(fd: i32) -> Self {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+        let closed_reader = Arc::clone(&closed);
+
+        // Single dedicated OS reader thread -> 100% cancel-safe for `tokio::select!`,
+        // handles Android O_NONBLOCK TUN FDs cleanly via libc::poll without leaking threads.
+        let jh = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 4096];
+            while !closed_reader.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
+                if pr < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if pr == 0 {
+                    continue;
+                }
+                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                    break;
+                }
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::Interrupted
+                        || err.kind() == io::ErrorKind::WouldBlock
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
+                    break;
+                }
+                if tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+
         Self {
             fd,
-            write_lock: tokio::sync::Mutex::new(()),
+            closed,
+            rx: tokio::sync::Mutex::new(rx),
+            write_lock: std::sync::Mutex::new(()),
+            reader_thread: Mutex::new(Some(jh)),
         }
     }
 }
@@ -398,6 +451,12 @@ impl UnixTunFdDevice {
 #[cfg(unix)]
 impl Drop for UnixTunFdDevice {
     fn drop(&mut self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut g) = self.reader_thread.lock() {
+            if let Some(jh) = g.take() {
+                let _ = jh.join();
+            }
+        }
         if self.fd >= 0 {
             unsafe {
                 libc::close(self.fd);
@@ -409,42 +468,41 @@ impl Drop for UnixTunFdDevice {
 #[cfg(unix)]
 impl PacketDevice for UnixTunFdDevice {
     async fn recv_packet(&self) -> io::Result<Vec<u8>> {
-        let fd = self.fd;
-        tokio::task::spawn_blocking(move || {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    return Err(err);
-                }
-                if n == 0 {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN fd closed"));
-                }
-                buf.truncate(n as usize);
-                return Ok(buf);
-            }
-        })
-        .await
-        .map_err(io::Error::other)?
+        let mut rx = self.rx.lock().await;
+        rx.recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "TUN fd closed"))
     }
 
     async fn send_packet(&self, pkt: Vec<u8>) -> io::Result<()> {
-        let _guard = self.write_lock.lock().await;
-        let fd = self.fd;
-        tokio::task::spawn_blocking(move || {
-            let n = unsafe { libc::write(fd, pkt.as_ptr() as *const c_void, pkt.len()) };
-            if n < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
+        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "TUN fd closed"));
+        }
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| io::Error::other("TUN write lock poisoned"))?;
+        for _ in 0..8 {
+            let n = unsafe { libc::write(self.fd, pkt.as_ptr() as *const c_void, pkt.len()) };
+            if n >= 0 {
+                return Ok(());
             }
-        })
-        .await
-        .map_err(io::Error::other)?
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if err.kind() == io::ErrorKind::WouldBlock {
+                let mut pfd = libc::pollfd {
+                    fd: self.fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let _ = unsafe { libc::poll(&mut pfd, 1, 50) };
+                continue;
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
@@ -506,5 +564,48 @@ mod tests {
         assert_eq!(yolac_stop(handle), 0); // Double stop safe
         assert_eq!(yolac_get_state(handle), 0); // Inactive
         yolac_destroy(handle);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_blocking_unix_tun_fd_stays_active_and_healthy_without_eagain_exit() {
+        // Simulates Android VpnService O_NONBLOCK TUN fd behavior directly via a Unix socketpair
+        let mut fds = [-1i32; 2];
+        assert_eq!(
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) },
+            0
+        );
+        let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let handle = yolac_create(std::ptr::null());
+        assert!(!handle.is_null());
+        let rc = yolac_start_tun_fd(
+            handle,
+            fds[0],
+            None,
+            std::ptr::null_mut(),
+            None,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, 0);
+
+        // Wait > 350ms (multiple 50ms smoltcp select ticks + poll cycle) with zero packets:
+        // Engine MUST stay Active (2) and report 6 Healthy (Green) modules, NOT collapse to Inactive (Gray)!
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert_eq!(yolac_get_state(handle), 2);
+
+        let mut buf = vec![0 as c_char; 4096];
+        let written = yolac_get_health_json(handle, buf.as_mut_ptr(), buf.len());
+        assert!(written > 20);
+        let json = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert_eq!(json.matches("\"status\":1").count(), 6, "Expected 6 Green modules, got: {json}");
+
+        assert_eq!(yolac_stop(handle), 0);
+        yolac_destroy(handle);
+        unsafe { libc::close(fds[1]) };
     }
 }

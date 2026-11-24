@@ -18,7 +18,6 @@ object YolacNative {
 
     const val SECURITY_WARNING_TR =
         "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir."
-    const val DEVELOPER_CREDIT_TR = "Ataberk Yıldız tarafından geliştirildi."
 
     external fun nativeStartTun(
         service: VpnService,

@@ -131,12 +131,6 @@ struct SettingsView: View {
                     .cornerRadius(8)
 
                 Spacer()
-
-                Text(YolacStrings.developerCredit)
-                    .font(.system(size: 12))
-                    .foregroundColor(Color(red: 0x6E / 255.0, green: 0x6E / 255.0, blue: 0x6E / 255.0))
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.bottom, 12)
             }
             .padding(.horizontal, 20)
         }

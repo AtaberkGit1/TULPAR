@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
-use yolac_core::{DEVELOPER_CREDIT_TR, SECURITY_WARNING_TR};
+use yolac_core::SECURITY_WARNING_TR;
 use yolac_core::{
     EngineState, ErrorCode, ModuleHealthReport, ModuleHealthStatus, UpdateCheckResult,
     YolacConfig, YolacEngine,
@@ -252,11 +252,11 @@ pub fn run_win32_ui(autostart: bool) {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-        GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+        GetMessageW, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
         SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-        IDC_ARROW, IDC_HAND, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, WM_APP, WM_CLOSE,
-        WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+        IDC_ARROW, IDC_HAND, IDI_APPLICATION, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+        WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
     };
 
     use crate::tray::{
@@ -637,7 +637,7 @@ pub fn run_win32_ui(autostart: bool) {
                             left: 28,
                             top: after_btn_y + 6,
                             right: w - 28,
-                            bottom: (after_btn_y + 92).min(h - 44),
+                            bottom: (after_btn_y + 98).min(h - 20),
                         };
                         let wbg = CreateSolidBrush(rgb(0x11, 0x07, 0x07));
                         let wpen = CreatePen(PS_SOLID as i32, 1, rgb(0x7A, 0x2B, 0x2B));
@@ -656,10 +656,6 @@ pub fn run_win32_ui(autostart: bool) {
                             bottom: warn_box.bottom - 10,
                         };
                         draw_utf8(hdc, SECURITY_WARNING_TR, &mut wtxt, rgb(0xE6, 0xB0, 0xAA), DT_LEFT | DT_WORDBREAK, 13);
-
-                        // Footer credit
-                        let mut footer_rc = RECT { left: 20, top: h - 34, right: w - 20, bottom: h - 10 };
-                        draw_utf8(hdc, DEVELOPER_CREDIT_TR, &mut footer_rc, rgb(0x6E, 0x6E, 0x6E), DT_CENTER | DT_VCENTER | DT_SINGLELINE, 12);
                     }
                 }
 
@@ -821,13 +817,22 @@ pub fn run_win32_ui(autostart: bool) {
         let class_name: Vec<u16> = "TulparMainWindow\0".encode_utf16().collect();
         let title: Vec<u16> = "TULPAR\0".encode_utf16().collect();
 
+        let app_icon = {
+            let embedded = LoadIconW(hinst, 1usize as *const u16);
+            if !embedded.is_null() {
+                embedded
+            } else {
+                LoadIconW(std::ptr::null_mut(), IDI_APPLICATION)
+            }
+        };
+
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wnd_proc),
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinst,
-            hIcon: std::ptr::null_mut(),
+            hIcon: app_icon,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_HAND.max(IDC_ARROW)),
             hbrBackground: GetStockObject(BLACK_BRUSH as i32).cast(),
             lpszMenuName: std::ptr::null(),
@@ -896,7 +901,7 @@ pub fn run_win32_ui(_autostart: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yolac_core::{official_github_repo, DEVELOPER_CREDIT_TR, SECURITY_WARNING_TR};
+    use yolac_core::{official_github_repo, SECURITY_WARNING_TR};
 
     #[test]
     fn windows_controller_reports_honest_passive_and_error_health() {
@@ -925,7 +930,6 @@ mod tests {
         }
 
         assert!(SECURITY_WARNING_TR.contains("TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin"));
-        assert_eq!(DEVELOPER_CREDIT_TR, "Ataberk Yıldız tarafından geliştirildi.");
         if let Some(repo) = official_github_repo() {
             assert!(repo == "AtaberkGit1/TULPAR" || repo == "AtaberkGit1/YOLAC");
         }

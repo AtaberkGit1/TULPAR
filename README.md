@@ -64,10 +64,6 @@ Ayrıntılar için:
 
 ---
 
-*Ataberk Yıldız tarafından geliştirildi.*
-
----
-
 ## Hızlı Test & Derleme
 
 ### Rust Çekirdeği (Linux / macOS / Windows)

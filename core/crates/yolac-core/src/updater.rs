@@ -15,8 +15,6 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub const SECURITY_WARNING_TR: &str = "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir.";
 
-pub const DEVELOPER_CREDIT_TR: &str = "Ataberk Yıldız tarafından geliştirildi.";
-
 /// Returns the verified official GitHub `owner/repo` slug detected at build time from
 /// `YOLAC_GITHUB_REPO` or `git remote origin`. Returns `None` if unconfigured (never fabricates a URL).
 pub fn official_github_repo() -> Option<&'static str> {
@@ -190,7 +188,7 @@ pub async fn check_github_release_endpoint(
     let status_line = header_str.lines().next().unwrap_or("");
     if status_line.contains(" 404") {
         return UpdateCheckResult::Error(
-            "Resmî depoda yayınlanmış bir sürüm (Release) bulunamadı.".into(),
+            "Resmî depoda herkese açık yayınlanmış bir sürüm bulunamadı (depo gizli olabilir).".into(),
         );
     }
     if !status_line.contains(" 200") {

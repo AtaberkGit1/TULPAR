@@ -177,26 +177,6 @@ class SettingsActivity : ComponentActivity() {
             },
         )
 
-        // Flexible spacer pushing credit footer to bottom
-        root.addView(
-            View(this),
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f),
-        )
-
-        val footer = TextView(this).apply {
-            text = YolacNative.DEVELOPER_CREDIT_TR
-            setTextColor(Color.parseColor("#6E6E6E"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        root.addView(
-            footer,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ),
-        )
-
         setContentView(root)
 
         lifecycleScope.launch {

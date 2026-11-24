@@ -32,6 +32,7 @@ pub fn toggle_menu_label(state: EngineState) -> &'static str {
 mod win_impl {
     use super::*;
     use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
         Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
         NOTIFYICONDATAW,
@@ -50,6 +51,16 @@ mod win_impl {
         }
     }
 
+    unsafe fn load_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+        let hinst = GetModuleHandleW(std::ptr::null());
+        let embedded = LoadIconW(hinst, 1usize as *const u16);
+        if !embedded.is_null() {
+            embedded
+        } else {
+            LoadIconW(std::ptr::null_mut(), IDI_APPLICATION)
+        }
+    }
+
     unsafe fn make_nid(hwnd: HWND, state: EngineState) -> NOTIFYICONDATAW {
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -57,7 +68,7 @@ mod win_impl {
         nid.uID = TRAY_ICON_ID;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAY_ICON;
-        nid.hIcon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        nid.hIcon = load_app_icon();
         write_tip(&mut nid.szTip, tooltip_for_state(state));
         nid
     }

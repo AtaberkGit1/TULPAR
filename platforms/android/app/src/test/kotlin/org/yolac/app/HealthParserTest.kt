@@ -61,11 +61,10 @@ class HealthParserTest {
     }
 
     @Test
-    fun verifiesRequiredTurkishSecurityWarningAndCreditStrings() {
+    fun verifiesRequiredTurkishSecurityWarningString() {
         assertEquals(
             "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir.",
             YolacNative.SECURITY_WARNING_TR,
         )
-        assertEquals("Ataberk Yıldız tarafından geliştirildi.", YolacNative.DEVELOPER_CREDIT_TR)
     }
 }

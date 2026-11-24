@@ -279,11 +279,10 @@ mod tests {
     #[test]
     fn captive_portal_status_reflects_in_connection_security_module_and_brand_strings() {
         use crate::health::{ModuleHealthStatus, ModuleId};
-        use crate::updater::{APP_VERSION, DEVELOPER_CREDIT_TR, SECURITY_WARNING_TR};
+        use crate::updater::{APP_VERSION, SECURITY_WARNING_TR};
 
         assert_eq!(APP_VERSION, "0.2.0");
         assert!(SECURITY_WARNING_TR.contains("TULPAR'ı"));
-        assert_eq!(DEVELOPER_CREDIT_TR, "Ataberk Yıldız tarafından geliştirildi.");
 
         let engine = YolacEngine::new(YolacConfig::mobile_android(), None);
         engine.set_state(EngineState::Active);
