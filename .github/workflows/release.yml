@@ -116,7 +116,7 @@ jobs:
           xcodegen generate
           xcodebuild -project Yolac.xcodeproj -scheme YolacApp -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
           mkdir -p build/ipa/Payload
-          cp -R build/Build/Products/Release-iphoneos/YolacApp.app build/ipa/Payload/
+          cp -R build/Build/Products/Release-iphoneos/TULPAR.app build/ipa/Payload/
           (cd build/ipa && zip -qr ../tulpar-ios-unsigned.ipa Payload)
       - uses: actions/upload-artifact@v4
         with:

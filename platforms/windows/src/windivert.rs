@@ -12,16 +12,16 @@ use yolac_core::{AdaptiveController, EngineState, ErrorCode};
 use yolac_dns::{parse_dns_query, DnsEngine, DnsOutcome};
 use yolac_dpi::{
     build_disorder_and_fake_packets, build_ipv4_tcp_packet, build_ipv6_tcp_packet, clamp_syn_mss,
-    detect_quic_initial, evade_http_request, parse_client_hello, parse_http_host, parse_ip_packet,
-    parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet, DpiStrategy, FakePacketMode,
-    HttpEvasionOptions, IpProtocol, QuicPolicy, TtlCalibrator,
+    detect_quic_initial, evade_http_request, parse_client_hello_prefix, parse_http_host,
+    parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet, DpiStrategy,
+    FakePacketMode, HttpEvasionOptions, IpProtocol, QuicPolicy, TtlCalibrator,
 };
 use yolac_net::{is_local_lan_ip, CaptivePortalMonitor, FlowOutcome, StrategyAdvisor};
 
 use crate::dns_guard::{build_dns_reply_l3, flush_windows_dns_cache};
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct WinDivertAddress {
     pub timestamp: i64,
     pub layer_flags: u32,
@@ -54,6 +54,42 @@ impl WinDivertAddress {
     pub fn is_outbound(&self) -> bool {
         (self.layer_flags & (1 << 17)) != 0
     }
+
+    /// Marks IP/TCP/UDP checksums as already computed so Windows NIC checksum offload
+    /// preserves our software-calculated (or intentionally corrupted BadChecksum decoy) values.
+    /// WinDivert 2.2 bit layout: IPv6=bit 20, IPChecksum=bit 21, TCPChecksum=bit 22, UDPChecksum=bit 23.
+    pub fn mark_checksums_valid(&mut self, is_v6: bool, is_tcp: bool) {
+        if is_v6 {
+            self.layer_flags |= 1 << 20;
+        } else {
+            self.layer_flags &= !(1 << 20);
+            self.layer_flags |= 1 << 21; // IPChecksum valid
+        }
+        if is_tcp {
+            self.layer_flags |= 1 << 22; // TCPChecksum valid
+        } else {
+            self.layer_flags |= 1 << 23; // UDPChecksum valid
+        }
+    }
+}
+
+/// Controls how `WinDivertHelperCalcChecksums` / `WINDIVERT_ADDRESS` offload flags are applied before `WinDivertSend`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChecksumAction {
+    /// Original untouched packet: keep original Windows NIC offload flags as received.
+    Passthrough,
+    /// Modified or newly synthesized packet: recalculate checksums & set valid checksum flags via WinDivert.
+    Recalculate,
+    /// Intentionally corrupted TCP checksum fake packet: do NOT recalculate TCP checksum,
+    /// and mark IPChecksum + TCPChecksum valid so NIC hardware offload does not repair our decoy!
+    PreserveBadTcpChecksum,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutgoingPacket {
+    pub bytes: Vec<u8>,
+    pub addr: WinDivertAddress,
+    pub checksum: ChecksumAction,
 }
 
 #[cfg(windows)]
@@ -193,19 +229,31 @@ impl WindowsPacketEngine {
         adaptive: Arc<AdaptiveController>,
         portal: Arc<CaptivePortalMonitor>,
         on_state: F,
-    ) -> Result<(), ErrorCode>
+    ) -> Result<(), (ErrorCode, String)>
     where
         F: Fn(EngineState) + Send + Sync + 'static,
     {
-        let api = Arc::new(loader::WinDivertApi::load()?);
+        let api = Arc::new(loader::WinDivertApi::load().map_err(|code| {
+            let os_err = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            let detail = match code {
+                ErrorCode::DriverIntegrityFailed => {
+                    "WinDivert sürücüsü (WinDivert.dll / WinDivert64.sys) SHA-256 bütünlük doğrulamasından geçemedi.".to_string()
+                }
+                ErrorCode::DriverMissing if os_err != 0 => {
+                    format!("WinDivert.dll yüklenemedi (Windows hata kodu: {os_err}). Antivirüs engeli veya eksik dosya olabilir.")
+                }
+                _ => "WinDivert sürücüsü (WinDivert.dll / WinDivert64.sys) bulunamadı.".to_string(),
+            };
+            (code, detail)
+        })?);
         let full_filter = CString::new(
-            "(outbound and ((tcp.DstPort == 443 or tcp.DstPort == 80) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and tcp.Syn and tcp.Ack and (tcp.SrcPort == 443 or tcp.SrcPort == 80))",
+            "not loopback and ((outbound and ((tcp.DstPort == 443 or tcp.DstPort == 80) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and tcp.Syn and tcp.Ack and (tcp.SrcPort == 443 or tcp.SrcPort == 80)))",
         )
-        .map_err(|_| ErrorCode::InternalError)?;
+        .map_err(|_| (ErrorCode::InternalError, "WinDivert filtre derleme hatası.".into()))?;
         let fallback_filter = CString::new(
-            "outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)",
+            "not loopback and outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)",
         )
-        .map_err(|_| ErrorCode::InternalError)?;
+        .map_err(|_| (ErrorCode::InternalError, "WinDivert yedek filtre derleme hatası.".into()))?;
 
         // WINDIVERT_LAYER_NETWORK = 0, priority = 0, flags = 0
         let mut raw_handle = unsafe { (api.open)(full_filter.as_ptr(), 0, 0, 0) };
@@ -213,11 +261,24 @@ impl WindowsPacketEngine {
             raw_handle = unsafe { (api.open)(fallback_filter.as_ptr(), 0, 0, 0) };
         }
         if loader::WinDivertApi::is_invalid_handle(raw_handle) {
-            let err = std::io::Error::last_os_error();
-            return Err(match err.raw_os_error() {
-                Some(5) => ErrorCode::PermissionDenied, // ERROR_ACCESS_DENIED
-                Some(2) | Some(577) => ErrorCode::DriverMissing,
-                _ => ErrorCode::TunSetupFailed,
+            let os_code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Err(match os_code {
+                5 => (
+                    ErrorCode::PermissionDenied,
+                    "Yönetici izni veya güvenlik yazılımı WinDivert erişimini engelledi (Windows kod: 5).".into(),
+                ),
+                2 | 3 => (
+                    ErrorCode::DriverMissing,
+                    format!("WinDivert64.sys sürücüsü başlatılamadı (Windows kod: {os_code}). Daha önce farklı klasörden çalıştırılan eski bir WinDivert hizmeti varsa bilgisayarı yeniden başlatın."),
+                ),
+                577 | 1275 => (
+                    ErrorCode::DriverIntegrityFailed,
+                    format!("Windows sürücü imza / Bellek Bütünlüğü (HVCI) veya antivirüs WinDivert64.sys yüklemesini engelledi (Windows kod: {os_code})."),
+                ),
+                _ => (
+                    ErrorCode::InternalError,
+                    format!("WinDivert çekirdek sürücüsü açılamadı (Windows hata kodu: {os_code})."),
+                ),
             });
         }
 
@@ -305,6 +366,18 @@ impl WindowsPacketEngine {
                                                 if let Some(mut reply_pkt) = build_dns_reply_l3(
                                                     src_ip, dst_ip, src_port, dst_port, &resp_wire,
                                                 ) {
+                                                    // CRITICAL: Recalculate & mark IP/UDP checksum flags valid on
+                                                    // synthesized inbound DNS replies so Windows NIC checksum offload
+                                                    // never drops the reply!
+                                                    reply_addr.mark_checksums_valid(dst_ip.is_ipv6(), false);
+                                                    unsafe {
+                                                        let _ = (api_c.calc_checksums)(
+                                                            reply_pkt.as_mut_ptr().cast(),
+                                                            reply_pkt.len() as u32,
+                                                            &mut reply_addr,
+                                                            0,
+                                                        );
+                                                    }
                                                     if let Ok(guard) = sh_c.lock() {
                                                         if *guard != 0 {
                                                             let h = *guard as *mut c_void;
@@ -341,19 +414,35 @@ impl WindowsPacketEngine {
                     &portal,
                 );
 
-                for (out_pkt, mut out_addr) in processed {
+                for mut out in processed {
+                    match out.checksum {
+                        ChecksumAction::Passthrough => {}
+                        ChecksumAction::Recalculate => {
+                            unsafe {
+                                let _ = (thread_api.calc_checksums)(
+                                    out.bytes.as_mut_ptr().cast(),
+                                    out.bytes.len() as u32,
+                                    &mut out.addr,
+                                    0,
+                                );
+                            }
+                        }
+                        ChecksumAction::PreserveBadTcpChecksum => {
+                            let is_v6 = out.bytes.first().map(|b| (b >> 4) == 6).unwrap_or(false);
+                            out.addr.mark_checksums_valid(is_v6, true);
+                        }
+                    }
                     let mut send_len = 0u32;
-                    let mut mutable = out_pkt;
                     if let Ok(guard) = send_handle.lock() {
                         if *guard != 0 {
                             let h = *guard as *mut c_void;
                             unsafe {
                                 let _ = (thread_api.send)(
                                     h,
-                                    mutable.as_mut_ptr().cast(),
-                                    mutable.len() as u32,
+                                    out.bytes.as_mut_ptr().cast(),
+                                    out.bytes.len() as u32,
                                     &mut send_len,
-                                    &mut out_addr,
+                                    &mut out.addr,
                                 );
                             }
                         }
@@ -388,11 +477,14 @@ impl WindowsPacketEngine {
         _adaptive: Arc<AdaptiveController>,
         _portal: Arc<CaptivePortalMonitor>,
         _on_state: F,
-    ) -> Result<(), ErrorCode>
+    ) -> Result<(), (ErrorCode, String)>
     where
         F: Fn(EngineState) + Send + Sync + 'static,
     {
-        Err(ErrorCode::DriverMissing)
+        Err((
+            ErrorCode::DriverMissing,
+            "WinDivert sürücüsü yalnızca Windows üzerinde çalışır.".into(),
+        ))
     }
 
     pub fn stop(&self) {
@@ -438,9 +530,13 @@ pub fn process_packet(
     adaptive: &Arc<AdaptiveController>,
     calibrator: &TtlCalibrator,
     portal: &CaptivePortalMonitor,
-) -> Vec<(Vec<u8>, WinDivertAddress)> {
+) -> Vec<OutgoingPacket> {
     let Some(ip) = parse_ip_packet(pkt) else {
-        return vec![(pkt.to_vec(), addr)];
+        return vec![OutgoingPacket {
+            bytes: pkt.to_vec(),
+            addr,
+            checksum: ChecksumAction::Passthrough,
+        }];
     };
 
     // Observe inbound SYN-ACK TTL/HopLimit to dynamically calibrate per-destination fake TTL
@@ -454,7 +550,11 @@ pub fn process_packet(
                 }
             }
         }
-        return vec![(pkt.to_vec(), addr)];
+        return vec![OutgoingPacket {
+            bytes: pkt.to_vec(),
+            addr,
+            checksum: ChecksumAction::Passthrough,
+        }];
     }
 
     process_outbound_inner(pkt, &ip, addr, rt, dns, adaptive, calibrator, portal)
@@ -467,11 +567,15 @@ pub fn process_outbound_packet(
     rt: &Runtime,
     dns: &Arc<DnsEngine>,
     adaptive: &Arc<AdaptiveController>,
-) -> Vec<(Vec<u8>, WinDivertAddress)> {
+) -> Vec<OutgoingPacket> {
     let calibrator = TtlCalibrator::default();
     let portal = CaptivePortalMonitor::new();
     let Some(ip) = parse_ip_packet(pkt) else {
-        return vec![(pkt.to_vec(), addr)];
+        return vec![OutgoingPacket {
+            bytes: pkt.to_vec(),
+            addr,
+            checksum: ChecksumAction::Passthrough,
+        }];
     };
     process_outbound_inner(pkt, &ip, addr, rt, dns, adaptive, &calibrator, &portal)
 }
@@ -486,18 +590,29 @@ fn process_outbound_inner(
     adaptive: &Arc<AdaptiveController>,
     calibrator: &TtlCalibrator,
     portal: &CaptivePortalMonitor,
-) -> Vec<(Vec<u8>, WinDivertAddress)> {
+) -> Vec<OutgoingPacket> {
+    let passthrough = |bytes: Vec<u8>, a: WinDivertAddress| OutgoingPacket {
+        bytes,
+        addr: a,
+        checksum: ChecksumAction::Passthrough,
+    };
+    let recalc = |bytes: Vec<u8>, a: WinDivertAddress| OutgoingPacket {
+        bytes,
+        addr: a,
+        checksum: ChecksumAction::Recalculate,
+    };
+
     match ip.protocol {
         IpProtocol::Udp => {
             let Some(udp) = parse_udp(ip.payload) else {
-                return vec![(pkt.to_vec(), addr)];
+                return vec![passthrough(pkt.to_vec(), addr)];
             };
 
             // 1. Intercept ALL UDP/53 DNS queries locally via DoH/DoT + blocklist -> zero ISP DNS leak
             //    (except direct local LAN gateway DNS during a bounded Captive Portal login window)
             if udp.dst_port == 53 {
                 if portal.is_bypass_active() && is_local_lan_ip(ip.dst_ip) {
-                    return vec![(pkt.to_vec(), addr)];
+                    return vec![passthrough(pkt.to_vec(), addr)];
                 }
                 let qname = parse_dns_query(udp.payload).map(|q| q.qname);
                 let (resp_opt, outcome) = rt.block_on(dns.resolve(udp.payload));
@@ -520,7 +635,8 @@ fn process_outbound_inner(
                     ) {
                         let mut inbound_addr = addr;
                         inbound_addr.set_inbound();
-                        return vec![(reply_pkt, inbound_addr)];
+                        inbound_addr.mark_checksums_valid(ip.dst_ip.is_ipv6(), false);
+                        return vec![recalc(reply_pkt, inbound_addr)];
                     }
                 }
                 return vec![];
@@ -536,7 +652,7 @@ fn process_outbound_inner(
         }
         IpProtocol::Tcp => {
             let Some(tcp) = parse_tcp(ip.payload) else {
-                return vec![(pkt.to_vec(), addr)];
+                return vec![passthrough(pkt.to_vec(), addr)];
             };
 
             // Prevent plaintext TCP/53 DNS bypass
@@ -546,19 +662,19 @@ fn process_outbound_inner(
 
             // Let encrypted DoH/DoT bootstrap upstreams pass straight through without double-fragmentation
             if is_bootstrap_dns_ip(ip.dst_ip) {
-                return vec![(pkt.to_vec(), addr)];
+                return vec![passthrough(pkt.to_vec(), addr)];
             }
 
             // Smart SYN MSS clamping on outbound 443/80 handshakes (disrupts server-response DPI)
             if tcp.is_syn_only() && (tcp.dst_port == 443 || tcp.dst_port == 80) && !is_local_lan_ip(ip.dst_ip) {
                 if let Some(clamped) = clamp_syn_mss(pkt, 536) {
-                    return vec![(clamped, addr)];
+                    return vec![recalc(clamped, addr)];
                 }
             }
 
             if !tcp.payload.is_empty() {
                 let dst = SocketAddr::new(ip.dst_ip, tcp.dst_port);
-                if let Some(ch) = parse_client_hello(tcp.payload) {
+                if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
                     let strategy = adaptive.select_strategy(dst, ch.sni.as_deref());
                     adaptive.report_outcome(dst, ch.sni.as_deref(), strategy, FlowOutcome::Success);
 
@@ -569,14 +685,14 @@ fn process_outbound_inner(
                         DpiStrategy::TlsRecordSplit | DpiStrategy::TcpSniSplit | DpiStrategy::TlsAndTcpSplit => {
                             if let Some(split) = plan_tcp_splits(tcp.payload) {
                                 if let Some((p1, p2)) = segment_tcp_packet(pkt, split.split_at) {
-                                    return vec![(p1, addr), (p2, addr)];
+                                    return vec![recalc(p1, addr), recalc(p2, addr)];
                                 }
                             }
                         }
                         DpiStrategy::RawDisorder => {
                             if let Some(split) = plan_tcp_splits(tcp.payload) {
                                 if let Some(plan) = build_disorder_and_fake_packets(pkt, split.split_at, None) {
-                                    return plan.packets.into_iter().map(|p| (p, addr)).collect();
+                                    return plan.packets.into_iter().map(|p| recalc(p, addr)).collect();
                                 }
                             }
                         }
@@ -588,7 +704,25 @@ fn process_outbound_inner(
                                     split.split_at,
                                     Some(mode),
                                 ) {
-                                    return plan.packets.into_iter().map(|p| (p, addr)).collect();
+                                    let is_bad_csum = matches!(mode, FakePacketMode::BadChecksum);
+                                    return plan
+                                        .packets
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(idx, p)| {
+                                            if idx == 0 && is_bad_csum {
+                                                let mut bad_addr = addr;
+                                                bad_addr.mark_checksums_valid(ip.version == 6, true);
+                                                OutgoingPacket {
+                                                    bytes: p,
+                                                    addr: bad_addr,
+                                                    checksum: ChecksumAction::PreserveBadTcpChecksum,
+                                                }
+                                            } else {
+                                                recalc(p, addr)
+                                            }
+                                        })
+                                        .collect();
                                 }
                             }
                         }
@@ -599,7 +733,24 @@ fn process_outbound_inner(
                                     split.split_at,
                                     Some(FakePacketMode::BadChecksum),
                                 ) {
-                                    return plan.packets.into_iter().map(|p| (p, addr)).collect();
+                                    return plan
+                                        .packets
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(idx, p)| {
+                                            if idx == 0 {
+                                                let mut bad_addr = addr;
+                                                bad_addr.mark_checksums_valid(ip.version == 6, true);
+                                                OutgoingPacket {
+                                                    bytes: p,
+                                                    addr: bad_addr,
+                                                    checksum: ChecksumAction::PreserveBadTcpChecksum,
+                                                }
+                                            } else {
+                                                recalc(p, addr)
+                                            }
+                                        })
+                                        .collect();
                                 }
                             }
                         }
@@ -613,10 +764,10 @@ fn process_outbound_inner(
                         };
                         if let Some(split) = plan_tcp_splits(&evaded) {
                             if let Some((p1, p2)) = segment_tcp_packet(&source_pkt, split.split_at) {
-                                return vec![(p1, addr), (p2, addr)];
+                                return vec![recalc(p1, addr), recalc(p2, addr)];
                             }
                         }
-                        return vec![(source_pkt, addr)];
+                        return vec![recalc(source_pkt, addr)];
                     }
                 }
             }
@@ -624,7 +775,7 @@ fn process_outbound_inner(
         _ => {}
     }
 
-    vec![(pkt.to_vec(), addr)]
+    vec![passthrough(pkt.to_vec(), addr)]
 }
 
 fn is_bootstrap_dns_ip(ip: IpAddr) -> bool {
@@ -635,6 +786,7 @@ fn is_bootstrap_dns_ip(ip: IpAddr) -> bool {
                 | [1, 0, 0, 1]
                 | [9, 9, 9, 9]
                 | [149, 112, 112, 112]
+                | [194, 242, 2, 2]
                 | [8, 8, 8, 8]
                 | [8, 8, 4, 4]
         ),
@@ -643,6 +795,7 @@ fn is_bootstrap_dns_ip(ip: IpAddr) -> bool {
             [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111]
                 | [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001]
                 | [0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe]
+                | [0x2a07, 0xe340, 0, 0, 0, 0, 0, 2]
                 | [0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888]
         ),
     }
@@ -766,9 +919,12 @@ mod tests {
 
         let out = process_outbound_packet(&pkt, addr, &rt, &dns, &adaptive);
         assert_eq!(out.len(), 1);
-        let (reply_raw, reply_addr) = &out[0];
-        assert_eq!(reply_addr.layer_flags & (1 << 17), 0); // Inbound
-        let ip = parse_ip_packet(reply_raw).unwrap();
+        let reply = &out[0];
+        assert_eq!(reply.addr.layer_flags & (1 << 17), 0); // Inbound
+        assert_ne!(reply.addr.layer_flags & (1 << 21), 0); // IPChecksum valid
+        assert_ne!(reply.addr.layer_flags & (1 << 23), 0); // UDPChecksum valid
+        assert_eq!(reply.checksum, ChecksumAction::Recalculate);
+        let ip = parse_ip_packet(&reply.bytes).unwrap();
         let udp = parse_udp(ip.payload).unwrap();
         let resp = parse_dns_response(udp.payload).unwrap();
         assert_eq!(resp.id, 0x9001);
@@ -818,9 +974,13 @@ mod tests {
         );
         let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
         assert_eq!(out.len(), 2);
-        for (seg, _) in &out {
-            let ip = parse_ip_packet(seg).unwrap();
-            assert_eq!(ipv4_header_checksum(&seg[0..20]), u16::from_be_bytes([seg[10], seg[11]]));
+        for seg in &out {
+            assert_eq!(seg.checksum, ChecksumAction::Recalculate);
+            let ip = parse_ip_packet(&seg.bytes).unwrap();
+            assert_eq!(
+                ipv4_header_checksum(&seg.bytes[0..20]),
+                u16::from_be_bytes([seg.bytes[10], seg.bytes[11]])
+            );
             assert_eq!(
                 tcp_checksum_ipv4(src, dst, ip.payload),
                 u16::from_be_bytes([ip.payload[16], ip.payload[17]])
@@ -848,10 +1008,56 @@ mod tests {
         );
         let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
         assert_eq!(out.len(), 3);
-        assert_eq!(parse_ip_packet(&out[0].0).unwrap().ttl, 3);
-        let seq1 = parse_tcp(parse_ip_packet(&out[1].0).unwrap().payload).unwrap().seq;
-        let seq2 = parse_tcp(parse_ip_packet(&out[2].0).unwrap().payload).unwrap().seq;
+        assert_eq!(parse_ip_packet(&out[0].bytes).unwrap().ttl, 3);
+        let seq1 = parse_tcp(parse_ip_packet(&out[1].bytes).unwrap().payload).unwrap().seq;
+        let seq2 = parse_tcp(parse_ip_packet(&out[2].bytes).unwrap().payload).unwrap().seq;
         assert!(seq1 > seq2);
+    }
+
+    #[test]
+    fn bad_checksum_fake_packet_preserves_bad_checksum_flag_and_mullvad_dns_passes_through() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::RawBadChecksum);
+        let ch = sample_tls_client_hello("blocked.example.com");
+        let pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(93, 184, 216, 34),
+            55009,
+            443,
+            1000,
+            2000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &ch,
+        );
+        let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].checksum, ChecksumAction::PreserveBadTcpChecksum);
+        assert_ne!(out[0].addr.layer_flags & (1 << 21), 0); // IPChecksum valid
+        assert_ne!(out[0].addr.layer_flags & (1 << 22), 0); // TCPChecksum valid (prevent NIC overwrite!)
+        assert_eq!(out[1].checksum, ChecksumAction::Recalculate);
+        assert_eq!(out[2].checksum, ChecksumAction::Recalculate);
+
+        // Mullvad DoH bootstrap IP 194.242.2.2 passes through without double-fragmentation
+        let mullvad_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(194, 242, 2, 2),
+            55010,
+            443,
+            1000,
+            2000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &ch,
+        );
+        let m_out = process_outbound_packet(&mullvad_pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
+        assert_eq!(m_out.len(), 1);
+        assert_eq!(m_out[0].checksum, ChecksumAction::Passthrough);
     }
 
     #[test]
@@ -923,6 +1129,6 @@ mod tests {
         out_addr.set_outbound();
         let out = process_packet(&ch_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &portal);
         assert_eq!(out.len(), 3);
-        assert_eq!(parse_ip_packet(&out[0].0).unwrap().ttl, 6);
+        assert_eq!(parse_ip_packet(&out[0].bytes).unwrap().ttl, 6);
     }
 }

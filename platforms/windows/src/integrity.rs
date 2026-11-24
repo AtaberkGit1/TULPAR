@@ -100,7 +100,7 @@ pub fn ensure_verified_windivert() -> Result<PathBuf, ErrorCode> {
         // Ignore write error if an active driver already holds the file open; SHA-256 check below validates it.
         let _ = std::fs::write(&dll_path, EMBEDDED_WINDIVERT_DLL);
         let _ = std::fs::write(&sys_path, EMBEDDED_WINDIVERT_SYS);
-        return verify_windivert_in_dir(&dir);
+        verify_windivert_in_dir(&dir)
     }
 
     #[cfg(not(has_embedded_windivert))]

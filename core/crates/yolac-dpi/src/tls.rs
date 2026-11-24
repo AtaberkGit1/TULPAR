@@ -28,11 +28,22 @@ fn is_valid_tls_record_version(v: [u8; 2]) -> bool {
     v[0] == 0x03 && v[1] <= 0x04
 }
 
-/// Parses a TLS ClientHello from the beginning of a TCP payload stream.
-/// Returns `None` if the data is not a TLS Handshake ClientHello or is truncated/malformed.
+/// Parses a complete TLS ClientHello from the beginning of a TCP payload stream.
+/// Returns `None` if the data is not a complete TLS Handshake ClientHello or is truncated/malformed.
 pub fn parse_client_hello(data: &[u8]) -> Option<ClientHelloInfo> {
+    parse_client_hello_inner(data, false)
+}
+
+/// Parses a TLS ClientHello even if only the first TCP segment arrived (e.g. Chrome 131+
+/// post-quantum `X25519MLKEM768` ClientHello > 1460 bytes spanning multiple MSS segments).
+/// Extracts SNI & offsets when present inside the available prefix; never panics on truncation.
+pub fn parse_client_hello_prefix(data: &[u8]) -> Option<ClientHelloInfo> {
+    parse_client_hello_inner(data, true)
+}
+
+fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<ClientHelloInfo> {
     // TLS record header: 1 byte type (0x16 Handshake), 2 bytes version, 2 bytes length
-    if data.len() < 5 || data[0] != 0x16 {
+    if data.len() < 9 || data[0] != 0x16 {
         return None;
     }
     let record_version = [data[1], data[2]];
@@ -40,39 +51,74 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHelloInfo> {
         return None;
     }
     let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    if record_len < 4 || data.len() < 5 + record_len {
+    if record_len < 4 {
         return None;
     }
     let record_total_len = 5 + record_len;
-    let hs = &data[5..record_total_len];
+    if !allow_truncated && data.len() < record_total_len {
+        return None;
+    }
+    let avail_record_end = record_total_len.min(data.len());
+    let hs = &data[5..avail_record_end];
 
     // Handshake header: 1 byte type (0x01 ClientHello), 3 bytes length
     if hs.len() < 4 || hs[0] != 0x01 {
         return None;
     }
     let hs_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
-    if hs.len() < 4 + hs_len {
+    if !allow_truncated && hs.len() < 4 + hs_len {
         return None;
     }
-    let body = &hs[4..4 + hs_len];
+    let avail_body_end = (4 + hs_len).min(hs.len());
+    let body = &hs[4..avail_body_end];
 
     // ClientHello body:
     // 2 bytes client_version + 32 bytes random = 34 bytes
     let mut pos = 34usize;
     if body.len() < pos + 1 {
-        return None;
+        return if allow_truncated {
+            Some(ClientHelloInfo {
+                sni: None,
+                sni_range: None,
+                record_version,
+                record_total_len,
+                has_ech: false,
+            })
+        } else {
+            None
+        };
     }
     let session_id_len = body[pos] as usize;
     pos += 1 + session_id_len;
 
     if body.len() < pos + 2 {
-        return None;
+        return if allow_truncated {
+            Some(ClientHelloInfo {
+                sni: None,
+                sni_range: None,
+                record_version,
+                record_total_len,
+                has_ech: false,
+            })
+        } else {
+            None
+        };
     }
     let cipher_suites_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2 + cipher_suites_len;
 
     if body.len() < pos + 1 {
-        return None;
+        return if allow_truncated {
+            Some(ClientHelloInfo {
+                sni: None,
+                sni_range: None,
+                record_version,
+                record_total_len,
+                has_ech: false,
+            })
+        } else {
+            None
+        };
     }
     let comp_methods_len = body[pos] as usize;
     pos += 1 + comp_methods_len;
@@ -88,14 +134,24 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHelloInfo> {
         });
     }
     if body.len() < pos + 2 {
-        return None;
+        return if allow_truncated {
+            Some(ClientHelloInfo {
+                sni: None,
+                sni_range: None,
+                record_version,
+                record_total_len,
+                has_ech: false,
+            })
+        } else {
+            None
+        };
     }
     let ext_total_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
     pos += 2;
-    if body.len() < pos + ext_total_len {
+    if !allow_truncated && body.len() < pos + ext_total_len {
         return None;
     }
-    let ext_end = pos + ext_total_len;
+    let ext_end = (pos + ext_total_len).min(body.len());
 
     let mut sni: Option<String> = None;
     let mut sni_range: Option<(usize, usize)> = None;
@@ -109,6 +165,9 @@ pub fn parse_client_hello(data: &[u8]) -> Option<ClientHelloInfo> {
         let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
         pos += 4;
         if pos + ext_len > ext_end {
+            if allow_truncated {
+                break;
+            }
             return None;
         }
         let ext_data = &body[pos..pos + ext_len];
@@ -337,5 +396,56 @@ pub(crate) mod tests {
         let info = parse_client_hello(&rec).expect("valid ECH ClientHello");
         assert_eq!(info.sni.as_deref(), Some("cloudflare-ech.com"));
         assert!(info.has_ech);
+    }
+
+    #[test]
+    fn parses_post_quantum_client_hello_sni_from_first_1460_byte_tcp_segment() {
+        // Simulate Chrome 131+ X25519MLKEM768 ClientHello (~1900 bytes total):
+        // SNI extension appears before a 1216-byte post-quantum key_share extension,
+        // so segment #1 (1460 bytes) is truncated relative to record_len.
+        let sni_bytes = b"pq-censored.example.org";
+        let name_entry_len = 1 + 2 + sni_bytes.len();
+        let sni_ext_data_len = 2 + name_entry_len;
+        let pq_key_share_len = 1700usize;
+        let extensions_len = (4 + sni_ext_data_len) + (4 + pq_key_share_len);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0xDD; 32]);
+        body.push(32);
+        body.extend_from_slice(&[0xEE; 32]);
+        body.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+        // SNI extension
+        body.extend_from_slice(&0x0000u16.to_be_bytes());
+        body.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+        body.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        body.extend_from_slice(sni_bytes);
+        // Large post-quantum key_share extension (0x0033)
+        body.extend_from_slice(&0x0033u16.to_be_bytes());
+        body.extend_from_slice(&(pq_key_share_len as u16).to_be_bytes());
+        body.resize(body.len() + pq_key_share_len, 0x42);
+
+        let hs_len = body.len();
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&((4 + hs_len) as u16).to_be_bytes());
+        rec.push(0x01);
+        rec.push(((hs_len >> 16) & 0xFF) as u8);
+        rec.push(((hs_len >> 8) & 0xFF) as u8);
+        rec.push((hs_len & 0xFF) as u8);
+        rec.extend_from_slice(&body);
+        assert!(rec.len() > 1460);
+
+        let first_mss_segment = &rec[..1460];
+        // Strict full-record parser rejects incomplete segment (required for TLS record fragmentation)
+        assert!(parse_client_hello(first_mss_segment).is_none());
+        // Prefix parser extracts exact SNI & range so L3 TCP splitting works on Chrome 131+ PQ!
+        let info = parse_client_hello_prefix(first_mss_segment).expect("prefix parser must find PQ SNI");
+        assert_eq!(info.sni.as_deref(), Some("pq-censored.example.org"));
+        let (s, e) = info.sni_range.unwrap();
+        assert_eq!(&first_mss_segment[s..e], b"pq-censored.example.org");
     }
 }

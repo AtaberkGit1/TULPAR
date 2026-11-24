@@ -67,6 +67,7 @@ pub struct ModuleHealthReport {
 pub struct HealthMonitor {
     last_update_state: Mutex<(ModuleHealthStatus, String)>,
     platform_error: Mutex<Option<ErrorCode>>,
+    platform_error_detail: Mutex<Option<String>>,
 }
 
 impl HealthMonitor {
@@ -77,12 +78,20 @@ impl HealthMonitor {
                 "Henüz kontrol edilmedi.".into(),
             )),
             platform_error: Mutex::new(None),
+            platform_error_detail: Mutex::new(None),
         }
     }
 
     pub fn record_platform_error(&self, code: Option<ErrorCode>) {
+        self.record_platform_error_with_detail(code, None);
+    }
+
+    pub fn record_platform_error_with_detail(&self, code: Option<ErrorCode>, detail: Option<String>) {
         if let Ok(mut g) = self.platform_error.lock() {
             *g = code;
+        }
+        if let Ok(mut d) = self.platform_error_detail.lock() {
+            *d = if code.is_some() { detail } else { None };
         }
     }
 
@@ -130,17 +139,18 @@ impl HealthMonitor {
             });
 
         if let Some(code) = effective_err {
-            let err_text = error_code_description_tr(code);
+            let custom_detail = self.platform_error_detail.lock().ok().and_then(|g| g.clone());
+            let err_text = custom_detail.unwrap_or_else(|| error_code_description_tr(code).to_string());
             return [
                 ModuleHealthReport {
                     id: ModuleId::SmartProtection,
                     status: ModuleHealthStatus::Error,
-                    detail_tr: err_text.into(),
+                    detail_tr: err_text.clone(),
                 },
                 ModuleHealthReport {
                     id: ModuleId::DnsProtection,
                     status: ModuleHealthStatus::Error,
-                    detail_tr: err_text.into(),
+                    detail_tr: err_text.clone(),
                 },
                 ModuleHealthReport {
                     id: ModuleId::AdTrackerBlocking,
@@ -150,7 +160,7 @@ impl HealthMonitor {
                 ModuleHealthReport {
                     id: ModuleId::AdvancedDpiCircumvention,
                     status: ModuleHealthStatus::Error,
-                    detail_tr: err_text.into(),
+                    detail_tr: err_text,
                 },
                 ModuleHealthReport {
                     id: ModuleId::ConnectionSecurity,

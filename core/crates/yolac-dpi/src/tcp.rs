@@ -6,7 +6,7 @@ use crate::http::parse_http_host;
 use crate::packet::{
     build_ipv4_tcp_packet, build_ipv6_tcp_packet, parse_ip_packet, parse_tcp, IpProtocol, ParsedTcp,
 };
-use crate::tls::parse_client_hello;
+use crate::tls::parse_client_hello_prefix;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpSplitPlan {
@@ -34,7 +34,7 @@ pub fn plan_tcp_splits(payload: &[u8]) -> Option<TcpSplitPlan> {
         return None;
     }
 
-    if let Some(ch) = parse_client_hello(payload) {
+    if let Some(ch) = parse_client_hello_prefix(payload) {
         if let Some((start, end)) = ch.sni_range {
             let mid = start + (end.saturating_sub(start)) / 2;
             let split_at = mid.clamp(1, payload.len() - 1);

@@ -398,7 +398,8 @@ async fn test_3_virtual_tun_packet_loop_dns_leak_guard_quic_and_tcp() {
         let _ = tun_run.run(dev, shut_rx).await;
     });
 
-    let client_v4 = Ipv4Addr::new(10, 219, 0, 2);
+    // Real Android VpnService & iOS NEPacketTunnelProvider client TUN address (.1, while smoltcp gateway owns .2)
+    let client_v4 = Ipv4Addr::new(10, 219, 0, 1);
 
     // 1. Send raw IPv4 UDP/53 DNS packet for blocked domain -> expect local 0.0.0.0 reply
     let dns_q = build_dns_query(0x7777, "doubleclick.net", QType::A);
@@ -749,4 +750,251 @@ async fn test_7_github_releases_updater_live_tls_validation() {
     )
     .await;
     assert!(matches!(res_404, UpdateCheckResult::Error(_)));
+}
+
+#[tokio::test]
+async fn test_8_tun_backpressure_streaming_and_post_quantum_client_hello_reassembly() {
+    // Part A: Large 160 KiB streaming download through TunEngine with real Android client IP 10.219.0.1.
+    // Proves ChannelStream::poll_write registers its Tokio waker cleanly under channel saturation (> 32 chunks)
+    // and smoltcp (.2) communicates seamlessly with OS TUN IP (.1) without IP collision.
+    const TOTAL_DOWNLOAD_BYTES: usize = 160 * 1024;
+    let dl_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dl_addr = dl_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = dl_listener.accept().await {
+            let mut req = [0u8; 64];
+            if let Ok(n) = s.read(&mut req).await {
+                if n > 0 {
+                    let payload = vec![0x5Au8; TOTAL_DOWNLOAD_BYTES];
+                    let _ = s.write_all(&payload).await;
+                    let _ = s.shutdown().await;
+                }
+            }
+        }
+    });
+
+    let bl = Arc::new(Blocklist::embedded_default());
+    let dns = Arc::new(DnsEngine::new(
+        DnsConfig {
+            upstreams: vec![],
+            ..DnsConfig::default()
+        },
+        bl,
+        None,
+    ));
+    let tun = Arc::new(TunEngine::new(
+        TunConfig {
+            mtu: 1500,
+            profile: MemoryProfile::Standard,
+            ipv6_mode: Ipv6LeakMode::DualStackProtected,
+            quic_policy: QuicPolicy::BlockFallbackToTcp,
+        },
+        dns,
+        Arc::new(NoopProtector),
+        Arc::new(NoopStrategyAdvisor {
+            default_strategy: DpiStrategy::TlsAndTcpSplit,
+        }),
+    ));
+
+    let (to_tun_tx, to_tun_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (from_tun_tx, mut from_tun_rx) = mpsc::channel::<Vec<u8>>(64);
+    let dev = Arc::new(ChannelPacketDevice::new(to_tun_rx, from_tun_tx));
+    let (shut_tx, shut_rx) = tokio::sync::watch::channel(false);
+
+    let tun_run = Arc::clone(&tun);
+    let task = tokio::spawn(async move {
+        let _ = tun_run.run(dev, shut_rx).await;
+    });
+
+    let client_v4 = Ipv4Addr::new(10, 219, 0, 1);
+    let dst_v4 = match dl_addr.ip() {
+        IpAddr::V4(v4) => v4,
+        _ => unreachable!(),
+    };
+    let syn_pkt = build_ipv4_tcp_packet(
+        client_v4,
+        dst_v4,
+        55200,
+        dl_addr.port(),
+        500,
+        0,
+        ParsedTcp::SYN,
+        65535,
+        64,
+        1,
+        &[],
+        &[],
+    );
+    to_tun_tx.send(syn_pkt).await.unwrap();
+
+    let mut srv_seq = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(pkt)) = tokio::time::timeout(Duration::from_millis(200), from_tun_rx.recv()).await {
+            if let Some(ip) = parse_ip_packet(&pkt) {
+                if ip.protocol == IpProtocol::Tcp {
+                    if let Some(tcp) = parse_tcp(ip.payload) {
+                        if (tcp.flags & (ParsedTcp::SYN | ParsedTcp::ACK)) == (ParsedTcp::SYN | ParsedTcp::ACK) {
+                            srv_seq = Some(tcp.seq.wrapping_add(1));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut expected_srv_seq = srv_seq.expect("must receive SYN-ACK for client 10.219.0.1");
+
+    // Send ACK + download trigger
+    let req_payload = b"DL";
+    let ack_pkt = build_ipv4_tcp_packet(
+        client_v4,
+        dst_v4,
+        55200,
+        dl_addr.port(),
+        501,
+        expected_srv_seq,
+        ParsedTcp::ACK | ParsedTcp::PSH,
+        65535,
+        64,
+        2,
+        &[],
+        req_payload,
+    );
+    to_tun_tx.send(ack_pkt).await.unwrap();
+
+    let mut received_total = 0usize;
+    let mut ip_id = 3u16;
+    let dl_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while received_total < TOTAL_DOWNLOAD_BYTES && tokio::time::Instant::now() < dl_deadline {
+        if let Ok(Some(pkt)) = tokio::time::timeout(Duration::from_millis(300), from_tun_rx.recv()).await {
+            if let Some(ip) = parse_ip_packet(&pkt) {
+                if ip.protocol == IpProtocol::Tcp {
+                    if let Some(tcp) = parse_tcp(ip.payload) {
+                        if !tcp.payload.is_empty() && tcp.seq == expected_srv_seq {
+                            received_total += tcp.payload.len();
+                            expected_srv_seq = expected_srv_seq.wrapping_add(tcp.payload.len() as u32);
+                            // ACK received data to advance smoltcp's send window
+                            let ack = build_ipv4_tcp_packet(
+                                client_v4,
+                                dst_v4,
+                                55200,
+                                dl_addr.port(),
+                                501 + req_payload.len() as u32,
+                                expected_srv_seq,
+                                ParsedTcp::ACK,
+                                65535,
+                                64,
+                                ip_id,
+                                &[],
+                                &[],
+                            );
+                            ip_id = ip_id.wrapping_add(1);
+                            let _ = to_tun_tx.send(ack).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        received_total, TOTAL_DOWNLOAD_BYTES,
+        "160 KiB stream through TunEngine must complete without ChannelStream waker deadlock"
+    );
+
+    let _ = shut_tx.send(true);
+    let _ = task.await;
+
+    // Part B: 1900-byte Post-Quantum Chrome-style ClientHello arriving in 2 TCP chunks into DpiTcpRelay
+    // must be reassembled, TLS-record fragmented across SNI, and accepted by backend!
+    let pq_backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pq_backend_addr = pq_backend.local_addr().unwrap();
+    let saw_fragmented_records = Arc::new(AtomicUsize::new(0));
+    let saw_clone = Arc::clone(&saw_fragmented_records);
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = pq_backend.accept().await {
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while tokio::time::Instant::now() < deadline && got.len() < 1900 {
+                match tokio::time::timeout(Duration::from_millis(200), s.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => got.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            // Count TLS handshake records received (fragmented ClientHello => 2 records)
+            let mut pos = 0;
+            let mut records = 0;
+            while pos + 5 <= got.len() && got[pos] == 0x16 {
+                let rlen = u16::from_be_bytes([got[pos + 3], got[pos + 4]]) as usize;
+                pos += 5 + rlen;
+                records += 1;
+            }
+            saw_clone.store(records, Ordering::SeqCst);
+            let _ = s.write_all(b"PQ_OK").await;
+        }
+    });
+
+    let relay = Arc::new(DpiTcpRelay::new(
+        Arc::new(NoopProtector),
+        Arc::new(NoopStrategyAdvisor {
+            default_strategy: DpiStrategy::TlsAndTcpSplit,
+        }),
+    ));
+    let local_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = local_proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = local_proxy.accept().await {
+            let _ = relay.relay_stream(sock, pq_backend_addr).await;
+        }
+    });
+
+    // Build a 1900+ byte Post-Quantum ClientHello
+    let sni_bytes = b"pq-mobile.example.org";
+    let entry_len = 1 + 2 + sni_bytes.len();
+    let sni_ext_len = 2 + entry_len;
+    let pq_len = 1750usize;
+    let exts_len = (4 + sni_ext_len) + (4 + pq_len);
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0xAA; 32]);
+    body.push(0);
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+    body.extend_from_slice(&[0x01, 0x00]);
+    body.extend_from_slice(&(exts_len as u16).to_be_bytes());
+    body.extend_from_slice(&0x0000u16.to_be_bytes());
+    body.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+    body.extend_from_slice(&(entry_len as u16).to_be_bytes());
+    body.push(0);
+    body.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+    body.extend_from_slice(sni_bytes);
+    body.extend_from_slice(&0x0033u16.to_be_bytes());
+    body.extend_from_slice(&(pq_len as u16).to_be_bytes());
+    body.resize(body.len() + pq_len, 0x77);
+    let hs_len = body.len();
+    let mut pq_ch = vec![0x16, 0x03, 0x01];
+    pq_ch.extend_from_slice(&((4 + hs_len) as u16).to_be_bytes());
+    pq_ch.push(0x01);
+    pq_ch.push(((hs_len >> 16) & 0xFF) as u8);
+    pq_ch.push(((hs_len >> 8) & 0xFF) as u8);
+    pq_ch.push((hs_len & 0xFF) as u8);
+    pq_ch.extend_from_slice(&body);
+
+    let mut cli = TcpStream::connect(proxy_addr).await.unwrap();
+    // Deliver across two separate TCP writes simulating 1460B MSS split
+    cli.write_all(&pq_ch[..1460]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(15)).await;
+    cli.write_all(&pq_ch[1460..]).await.unwrap();
+
+    let mut reply = [0u8; 16];
+    let rn = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply[..rn], b"PQ_OK");
+    assert_eq!(
+        saw_fragmented_records.load(Ordering::SeqCst),
+        2,
+        "DpiTcpRelay must reassemble & TLS-fragment 1900+ byte Post-Quantum ClientHello into 2 records"
+    );
 }

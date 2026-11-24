@@ -187,7 +187,7 @@ struct FlowKey {
 
 struct ActiveTcpFlow {
     handle: SocketHandle,
-    to_relay: mpsc::Sender<Vec<u8>>,
+    to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: mpsc::Receiver<Vec<u8>>,
     relay_closed: bool,
     pending_write: Vec<u8>,
@@ -258,19 +258,21 @@ impl TunEngine {
         iface_cfg.random_seed = 0x796F_6C61_6300_0001;
         let mut iface = Interface::new(iface_cfg, &mut vdev, SmolInstant::now());
         iface.set_any_ip(true);
+        // Virtual gateway addresses (.2) matching Android VpnService & iOS NEPacketTunnelProvider
+        // where the OS TUN interface itself owns .1 (`10.219.0.1/30`, `fd79:6f6c:6163::1/126`).
         iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 219, 0, 1)), 30));
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 219, 0, 2)), 30));
             let _ = addrs.push(IpCidr::new(
-                IpAddress::Ipv6(Ipv6Address::new(0xfd79, 0x6f6c, 0x6163, 0, 0, 0, 0, 1)),
+                IpAddress::Ipv6(Ipv6Address::new(0xfd79, 0x6f6c, 0x6163, 0, 0, 0, 0, 2)),
                 126,
             ));
         });
         let _ = iface
             .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::new(10, 219, 0, 1));
+            .add_default_ipv4_route(Ipv4Address::new(10, 219, 0, 2));
         let _ = iface
             .routes_mut()
-            .add_default_ipv6_route(Ipv6Address::new(0xfd79, 0x6f6c, 0x6163, 0, 0, 0, 0, 1));
+            .add_default_ipv6_route(Ipv6Address::new(0xfd79, 0x6f6c, 0x6163, 0, 0, 0, 0, 2));
 
         let mut sockets = SocketSet::new(Vec::new());
         let mut tcp_flows: HashMap<FlowKey, ActiveTcpFlow> = HashMap::new();
@@ -532,7 +534,7 @@ impl TunEngine {
                         key,
                         ActiveTcpFlow {
                             handle,
-                            to_relay: to_relay_tx,
+                            to_relay: Some(to_relay_tx),
                             from_relay: from_relay_rx,
                             relay_closed: false,
                             pending_write: Vec::new(),
@@ -570,35 +572,69 @@ impl TunEngine {
         for (key, flow) in tcp_flows.iter_mut() {
             let sock = sockets.get_mut::<SmolTcpSocket>(flow.handle);
 
-            // 1. Read from local app (smoltcp rx buffer) -> send to DpiTcpRelay
+            // 1. Read from local app (smoltcp rx buffer) -> send to DpiTcpRelay with lossless backpressure
             if sock.can_recv() {
-                let mut chunk = Vec::new();
-                let _ = sock.recv(|data| {
-                    chunk.extend_from_slice(data);
-                    (data.len(), ())
-                });
-                if !chunk.is_empty() && flow.to_relay.try_send(chunk).is_err() {
+                let mut tx_closed = false;
+                if let Some(ref tx) = flow.to_relay {
+                    match tx.try_reserve() {
+                        Ok(permit) => {
+                            let mut chunk = Vec::new();
+                            let _ = sock.recv(|data| {
+                                chunk.extend_from_slice(data);
+                                (data.len(), ())
+                            });
+                            if !chunk.is_empty() {
+                                permit.send(chunk);
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Full(())) => {
+                            // Leave bytes in smoltcp RX buffer so TCP receive window applies backpressure
+                        }
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            tx_closed = true;
+                        }
+                    }
+                }
+                if tx_closed {
+                    flow.to_relay = None;
                     flow.relay_closed = true;
                 }
+            } else if matches!(
+                sock.state(),
+                SmolTcpState::CloseWait
+                    | SmolTcpState::Closing
+                    | SmolTcpState::LastAck
+                    | SmolTcpState::TimeWait
+                    | SmolTcpState::Closed
+            ) && flow.to_relay.is_some()
+            {
+                // Local app sent FIN (CloseWait / Closed): signal clean EOF to DpiTcpRelay
+                // (Do NOT close during Listen / SynReceived before handshake completes!)
+                flow.to_relay = None;
             }
 
-            // 2. Drain outbound bytes from DpiTcpRelay -> write into smoltcp tx buffer
-            while !flow.relay_closed && flow.pending_write.is_empty() {
-                match flow.from_relay.try_recv() {
-                    Ok(data) => flow.pending_write = data,
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        flow.relay_closed = true;
-                        break;
+            // 2. Drain outbound bytes from DpiTcpRelay -> write into smoltcp tx buffer until full
+            loop {
+                if flow.pending_write.is_empty() && !flow.relay_closed {
+                    match flow.from_relay.try_recv() {
+                        Ok(data) => flow.pending_write = data,
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            flow.relay_closed = true;
+                            break;
+                        }
                     }
                 }
-            }
 
-            if !flow.pending_write.is_empty() && sock.can_send() {
-                if let Ok(sent) = sock.send_slice(&flow.pending_write) {
-                    if sent > 0 {
+                if flow.pending_write.is_empty() || !sock.can_send() {
+                    break;
+                }
+
+                match sock.send_slice(&flow.pending_write) {
+                    Ok(sent) if sent > 0 => {
                         flow.pending_write.drain(..sent);
                     }
+                    _ => break,
                 }
             }
 
@@ -621,6 +657,14 @@ impl TunEngine {
     }
 }
 
+type ReserveFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<Vec<u8>>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
+
 /// Bridges an `mpsc` packet/byte stream pair into a Tokio `AsyncRead + AsyncWrite` stream for `DpiTcpRelay`.
 struct ChannelStream {
     rx: mpsc::Receiver<Vec<u8>>,
@@ -628,6 +672,7 @@ struct ChannelStream {
     wake: mpsc::Sender<()>,
     read_buf: Vec<u8>,
     read_pos: usize,
+    pending_reserve: Option<ReserveFuture>,
 }
 
 impl ChannelStream {
@@ -642,6 +687,7 @@ impl ChannelStream {
             wake,
             read_buf: Vec::new(),
             read_pos: 0,
+            pending_reserve: None,
         }
     }
 }
@@ -683,22 +729,52 @@ impl tokio::io::AsyncRead for ChannelStream {
 
 impl tokio::io::AsyncWrite for ChannelStream {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        match self.tx.try_send(buf.to_vec()) {
-            Ok(()) => {
-                let _ = self.wake.try_send(());
-                std::task::Poll::Ready(Ok(buf.len()))
+        if self.pending_reserve.is_none() {
+            match self.tx.try_send(buf.to_vec()) {
+                Ok(()) => {
+                    let _ = self.wake.try_send(());
+                    return std::task::Poll::Ready(Ok(buf.len()));
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    let _ = self.wake.try_send(());
+                    let fut = self.tx.clone().reserve_owned();
+                    self.pending_reserve = Some(Box::pin(fut));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "TUN closed",
+                    )));
+                }
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                let _ = self.wake.try_send(());
-                std::task::Poll::Pending
+        }
+
+        if let Some(fut) = self.pending_reserve.as_mut() {
+            match fut.as_mut().poll(cx) {
+                std::task::Poll::Ready(Ok(permit)) => {
+                    self.pending_reserve = None;
+                    permit.send(buf.to_vec());
+                    let _ = self.wake.try_send(());
+                    std::task::Poll::Ready(Ok(buf.len()))
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    self.pending_reserve = None;
+                    std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "TUN closed",
+                    )))
+                }
+                std::task::Poll::Pending => {
+                    let _ = self.wake.try_send(());
+                    std::task::Poll::Pending
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                std::task::Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "TUN closed")))
-            }
+        } else {
+            std::task::Poll::Pending
         }
     }
 

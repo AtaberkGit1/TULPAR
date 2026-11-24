@@ -68,15 +68,36 @@ impl DpiTcpRelay {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        // Read initial client payload (e.g., TLS ClientHello or HTTP request)
-        let mut first_buf = vec![0u8; 4096];
-        let n = match timeout(Duration::from_secs(5), client.read(&mut first_buf)).await {
+        // Read initial client payload (e.g., TLS ClientHello or HTTP request).
+        // Modern browsers (Chrome 131+ X25519MLKEM768 post-quantum TLS 1.3) send ClientHellos
+        // larger than a single 1460-byte TCP MSS segment; reassemble the complete first TLS
+        // record (bounded at 8 KiB / 400ms) so TLS record fragmentation always succeeds.
+        let mut initial = Vec::with_capacity(2048);
+        let mut chunk = [0u8; 4096];
+        let n = match timeout(Duration::from_secs(5), client.read(&mut chunk)).await {
             Ok(Ok(0)) => return Ok(()),
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "client initial read timeout")),
         };
-        let initial = &first_buf[..n];
+        initial.extend_from_slice(&chunk[..n]);
+
+        if initial.len() >= 5 && initial[0] == 0x16 && initial[1] == 0x03 && initial[2] <= 0x04 {
+            let expected_len = 5 + u16::from_be_bytes([initial[3], initial[4]]) as usize;
+            if expected_len <= 8192 && initial.len() < expected_len {
+                let deadline = Instant::now() + Duration::from_millis(400);
+                while initial.len() < expected_len {
+                    let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    match timeout(rem, client.read(&mut chunk)).await {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(more)) => initial.extend_from_slice(&chunk[..more]),
+                    }
+                }
+            }
+        }
+        let initial = initial.as_slice();
 
         let sni = parse_client_hello(initial)
             .and_then(|c| c.sni)

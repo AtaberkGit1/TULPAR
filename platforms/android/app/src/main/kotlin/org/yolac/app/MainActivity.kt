@@ -120,6 +120,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        YolacVpnService.syncStateFromNative()
+    }
+
     private fun buildFirstLaunchSecurityOverlay(
         density: Float,
         onAcknowledge: () -> Unit,

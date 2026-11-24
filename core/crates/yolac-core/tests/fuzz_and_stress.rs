@@ -20,8 +20,9 @@ use yolac_dns::wire::{build_dns_query, parse_dns_query, parse_dns_response, QTyp
 use yolac_dns::{DnsConfig, DnsEngine, DnsOutcome, UpstreamConfig, UpstreamProtocol};
 use yolac_dpi::{
     build_ipv4_udp_packet, detect_quic_initial, evade_http_request, fragment_tls_client_hello,
-    parse_client_hello, parse_http_host, parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits,
-    segment_tcp_packet, DpiStrategy, HttpEvasionOptions, QuicPolicy, SplitStrategy,
+    parse_client_hello, parse_client_hello_prefix, parse_http_host, parse_ip_packet, parse_tcp,
+    parse_udp, plan_tcp_splits, segment_tcp_packet, DpiStrategy, HttpEvasionOptions, QuicPolicy,
+    SplitStrategy,
 };
 use yolac_net::{
     ChannelPacketDevice, Ipv6LeakMode, MemoryProfile, NoopProtector, NoopStrategyAdvisor,
@@ -65,6 +66,7 @@ fn fuzz_10000_malformed_and_random_packets_never_panic() {
             let _ = parse_udp(ip.payload);
         }
         let _ = parse_client_hello(&buf);
+        let _ = parse_client_hello_prefix(&buf);
         let _ = fragment_tls_client_hello(&buf, SplitStrategy::SniMid);
         let _ = plan_tcp_splits(&buf);
         let _ = segment_tcp_packet(&buf, 10);
@@ -251,7 +253,7 @@ async fn stress_200_concurrent_dns_and_malformed_packets_under_low_memory_ios() 
     for i in 0..120u16 {
         let q = build_dns_query(1000 + i, "doubleclick.net", QType::A);
         let pkt = build_ipv4_udp_packet(
-            Ipv4Addr::new(10, 219, 0, 2),
+            Ipv4Addr::new(10, 219, 0, 1),
             Ipv4Addr::new(1, 1, 1, 1),
             40000 + i,
             53,

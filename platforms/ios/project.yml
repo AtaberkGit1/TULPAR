@@ -6,7 +6,6 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    PRODUCT_NAME: "TULPAR"
 targets:
   YolacApp:
     type: application
@@ -15,6 +14,7 @@ targets:
       - path: YolacApp
     settings:
       base:
+        PRODUCT_NAME: "TULPAR"
         PRODUCT_BUNDLE_IDENTIFIER: org.yolac.app
         INFOPLIST_FILE: YolacApp/Info.plist
         CODE_SIGN_ENTITLEMENTS: YolacApp/YolacApp.entitlements
@@ -29,6 +29,7 @@ targets:
       - path: YolacTunnel
     settings:
       base:
+        PRODUCT_NAME: "TulparTunnel"
         PRODUCT_BUNDLE_IDENTIFIER: org.yolac.app.tunnel
         INFOPLIST_FILE: YolacTunnel/Info.plist
         CODE_SIGN_ENTITLEMENTS: YolacTunnel/YolacTunnel.entitlements

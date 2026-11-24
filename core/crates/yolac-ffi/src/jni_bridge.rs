@@ -12,32 +12,51 @@ use yolac_net::SocketProtector;
 struct JniVpnProtector {
     jvm: JavaVM,
     vpn_service: GlobalRef,
+    /// When `VpnService.Builder.addDisallowedApplication(packageName)` succeeded, Android's kernel
+    /// already routes all sockets created by TULPAR outside the VPN tunnel. Calling `protect(fd)`
+    /// remains active for defense-in-depth, while avoiding false `PermissionDenied` errors on
+    /// strict OEM ROMs where `protect(fd)` can return false for already-disallowed packages.
+    self_app_excluded: bool,
 }
 
 impl SocketProtector for JniVpnProtector {
     fn protect_fd(&self, fd: i32) -> io::Result<()> {
-        let mut env = self
-            .jvm
-            .attach_current_thread()
-            .map_err(|e| io::Error::other(format!("JNI attach failed: {e}")))?;
-        let res = env
-            .call_method(
-                self.vpn_service.as_obj(),
-                "protect",
-                "(I)Z",
-                &[JValue::Int(fd)],
-            )
-            .map_err(|e| io::Error::other(format!("VpnService.protect call failed: {e}")))?;
-        let ok = res
-            .z()
-            .map_err(|e| io::Error::other(format!("invalid boolean return: {e}")))?;
-        if ok {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "VpnService.protect returned false",
-            ))
+        let mut env = match self.jvm.attach_current_thread() {
+            Ok(e) => e,
+            Err(e) => {
+                if self.self_app_excluded {
+                    return Ok(());
+                }
+                return Err(io::Error::other(format!("JNI attach failed: {e}")));
+            }
+        };
+        let res = env.call_method(
+            self.vpn_service.as_obj(),
+            "protect",
+            "(I)Z",
+            &[JValue::Int(fd)],
+        );
+        match res {
+            Ok(v) => match v.z() {
+                Ok(true) => Ok(()),
+                Ok(false) if self.self_app_excluded => Ok(()),
+                Ok(false) => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "VpnService.protect returned false",
+                )),
+                Err(e) if !self.self_app_excluded => {
+                    Err(io::Error::other(format!("invalid boolean return: {e}")))
+                }
+                Err(_) => Ok(()),
+            },
+            Err(e) => {
+                let _ = env.exception_clear();
+                if self.self_app_excluded {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(format!("VpnService.protect call failed: {e}")))
+                }
+            }
         }
     }
 }
@@ -75,6 +94,7 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
     vpn_service: JObject,
     tun_fd: jint,
     block_unprotected_ipv6: jboolean,
+    self_app_excluded: jboolean,
 ) -> jboolean {
     let Ok(jvm) = env.get_java_vm() else {
         return JNI_FALSE;
@@ -94,6 +114,7 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
     let protector = Arc::new(JniVpnProtector {
         jvm,
         vpn_service: service_ref,
+        self_app_excluded: self_app_excluded == JNI_TRUE,
     });
     let engine = Arc::new(YolacEngine::new(cfg, Some(protector)));
     let dev = Arc::new(crate::UnixTunFdDevice::new(tun_fd));

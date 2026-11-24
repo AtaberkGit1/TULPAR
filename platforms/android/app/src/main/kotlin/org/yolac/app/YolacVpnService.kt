@@ -29,6 +29,18 @@ class YolacVpnService : VpnService() {
 
         private val _stateFlow = MutableStateFlow(YolacNative.STATE_INACTIVE)
         val stateFlow: StateFlow<Int> = _stateFlow
+
+        fun syncStateFromNative() {
+            try {
+                val nativeState = YolacNative.nativeGetState()
+                if (_stateFlow.value != YolacNative.STATE_ACTIVATING &&
+                    _stateFlow.value != YolacNative.STATE_DEACTIVATING
+                ) {
+                    _stateFlow.value = nativeState
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     private var tunInterface: ParcelFileDescriptor? = null
@@ -59,7 +71,12 @@ class YolacVpnService : VpnService() {
         }
     }
 
-    private fun establishTun(includeIpv6: Boolean): ParcelFileDescriptor? {
+    private data class TunEstablishResult(
+        val pfd: ParcelFileDescriptor,
+        val selfAppExcluded: Boolean,
+    )
+
+    private fun establishTun(includeIpv6: Boolean): TunEstablishResult? {
         return try {
             val builder = Builder()
                 .setSession("TULPAR")
@@ -89,19 +106,26 @@ class YolacVpnService : VpnService() {
                 }
             }
 
-            try {
+            val selfExcluded = try {
                 builder.addDisallowedApplication(packageName)
+                true
             } catch (_: Exception) {
+                false
             }
 
-            builder.establish()
+            val pfd = builder.establish() ?: return null
+            TunEstablishResult(pfd = pfd, selfAppExcluded = selfExcluded)
         } catch (_: Throwable) {
             null
         }
     }
 
     private fun startProtection() {
-        if (tunInterface != null) return
+        if (tunInterface != null && YolacNative.nativeGetState() == YolacNative.STATE_ACTIVE) {
+            updateState(YolacNative.STATE_ACTIVE)
+            return
+        }
+        tunInterface = null
         updateState(YolacNative.STATE_ACTIVATING)
         ensureNotificationChannel()
         try {
@@ -120,12 +144,12 @@ class YolacVpnService : VpnService() {
 
         // Try dual-stack IPv4+IPv6 first; fall back seamlessly to IPv4-only + IPv6 leak blocking if OEM kernel lacks IPv6 TUN
         var usedIpv6 = true
-        var pfd = establishTun(includeIpv6 = true)
-        if (pfd == null) {
+        var established = establishTun(includeIpv6 = true)
+        if (established == null) {
             usedIpv6 = false
-            pfd = establishTun(includeIpv6 = false)
+            established = establishTun(includeIpv6 = false)
         }
-        if (pfd == null) {
+        if (established == null) {
             YolacNative.nativeReportPlatformError(YolacNative.ERROR_TUN_SETUP_FAILED)
             updateState(YolacNative.STATE_ERROR)
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -133,10 +157,10 @@ class YolacVpnService : VpnService() {
             return
         }
 
-        tunInterface = pfd
+        tunInterface = established.pfd
         // Hand detached FD ownership cleanly to Rust core
-        val detachedFd = pfd.detachFd()
-        val ok = YolacNative.nativeStartTun(this, detachedFd, !usedIpv6)
+        val detachedFd = established.pfd.detachFd()
+        val ok = YolacNative.nativeStartTun(this, detachedFd, !usedIpv6, established.selfAppExcluded)
         if (!ok) {
             YolacNative.nativeReportPlatformError(YolacNative.ERROR_TUN_SETUP_FAILED)
             updateState(YolacNative.STATE_ERROR)

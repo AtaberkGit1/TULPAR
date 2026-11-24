@@ -23,6 +23,7 @@ object YolacNative {
         service: VpnService,
         tunFd: Int,
         blockUnprotectedIpv6: Boolean,
+        selfAppExcluded: Boolean,
     ): Boolean
 
     external fun nativeStop()

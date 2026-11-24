@@ -169,6 +169,12 @@ impl YolacEngine {
         self.state_tx.send_replace(EngineState::Error(code));
     }
 
+    pub fn record_platform_error_with_detail(&self, code: ErrorCode, detail: impl Into<String>) {
+        self.health
+            .record_platform_error_with_detail(Some(code), Some(detail.into()));
+        self.state_tx.send_replace(EngineState::Error(code));
+    }
+
     pub fn clear_platform_error(&self) {
         self.health.record_platform_error(None);
     }

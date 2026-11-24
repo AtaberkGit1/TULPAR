@@ -5,11 +5,12 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(any(windows, test))]
+use yolac_core::ModuleHealthStatus;
 #[cfg(windows)]
 use yolac_core::SECURITY_WARNING_TR;
 use yolac_core::{
-    EngineState, ErrorCode, ModuleHealthReport, ModuleHealthStatus, UpdateCheckResult,
-    YolacConfig, YolacEngine,
+    EngineState, ErrorCode, ModuleHealthReport, UpdateCheckResult, YolacConfig, YolacEngine,
 };
 
 use crate::permissions::{is_elevated, request_uac_elevation};
@@ -186,8 +187,8 @@ impl AppController {
                         self.engine.set_state(EngineState::Active);
                         ctrl_ref(EngineState::Active);
                     }
-                    Err(code) => {
-                        self.engine.record_platform_error(code);
+                    Err((code, detail)) => {
+                        self.engine.record_platform_error_with_detail(code, detail);
                         ctrl_ref(EngineState::Error(code));
                     }
                 }
@@ -254,7 +255,7 @@ pub fn run_win32_ui(autostart: bool) {
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
         GetMessageW, LoadCursorW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
         SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-        IDC_ARROW, IDC_HAND, IDI_APPLICATION, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+        IDC_ARROW, IDI_APPLICATION, MSG, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
         WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
         WM_LBUTTONUP, WM_PAINT, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
     };
@@ -358,10 +359,10 @@ pub fn run_win32_ui(autostart: bool) {
     fn update_btn_rect(w: i32, has_errors: bool, has_selected: bool) -> RECT {
         let mut y = 148;
         if has_errors {
-            y += 74;
+            y += 96;
         }
         if has_selected {
-            y += 38;
+            y += 46;
         }
         RECT {
             left: 28,
@@ -581,19 +582,23 @@ pub fn run_win32_ui(autostart: bool) {
                             draw_module_glyph(hdc, i, rects[i], status_rgb(rep.status), sel == Some(i));
                         }
 
-                        let errors: Vec<String> = reports
-                            .iter()
-                            .filter(|r| r.status == ModuleHealthStatus::Error)
-                            .map(|r| format!("{}: {}", r.id.display_name_tr(), r.detail_tr))
-                            .collect();
+                        // Deduplicate identical platform-error lines so concise root-cause text never clips
+                        let mut seen_details: Vec<String> = Vec::new();
+                        let mut errors: Vec<String> = Vec::new();
+                        for r in reports.iter().filter(|r| r.status == ModuleHealthStatus::Error) {
+                            if !seen_details.contains(&r.detail_tr) {
+                                seen_details.push(r.detail_tr.clone());
+                                errors.push(format!("{}: {}", r.id.display_name_tr(), r.detail_tr));
+                            }
+                        }
                         let has_errors = !errors.is_empty();
                         let mut cursor_y = 136;
 
                         if has_errors {
                             let err_joined = errors.join("\n");
-                            let mut err_rc = RECT { left: 28, top: cursor_y, right: w - 28, bottom: cursor_y + 72 };
+                            let mut err_rc = RECT { left: 28, top: cursor_y, right: w - 28, bottom: cursor_y + 92 };
                             draw_utf8(hdc, &err_joined, &mut err_rc, rgb(0xE7, 0x4C, 0x3C), DT_LEFT | DT_WORDBREAK, 13);
-                            cursor_y += 74;
+                            cursor_y += 96;
                         }
 
                         if let Some(sidx) = sel {
@@ -604,7 +609,7 @@ pub fn run_win32_ui(autostart: bool) {
                                 ModuleHealthStatus::PassiveOrUnchecked => "Pasif / Kontrol edilmedi",
                             };
                             let text = format!("{} ({}): {}", rep.id.display_name_tr(), st_label, rep.detail_tr);
-                            let mut sel_rc = RECT { left: 28, top: cursor_y, right: w - 28, bottom: cursor_y + 38 };
+                            let mut sel_rc = RECT { left: 28, top: cursor_y, right: w - 28, bottom: cursor_y + 44 };
                             draw_utf8(hdc, &text, &mut sel_rc, status_rgb(rep.status), DT_LEFT | DT_WORDBREAK, 13);
                         }
 
@@ -833,7 +838,7 @@ pub fn run_win32_ui(autostart: bool) {
             cbWndExtra: 0,
             hInstance: hinst,
             hIcon: app_icon,
-            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_HAND.max(IDC_ARROW)),
+            hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: GetStockObject(BLACK_BRUSH as i32).cast(),
             lpszMenuName: std::ptr::null(),
             lpszClassName: class_name.as_ptr(),

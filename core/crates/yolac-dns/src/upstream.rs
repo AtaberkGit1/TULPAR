@@ -67,7 +67,8 @@ impl UpstreamDialer for DefaultUpstreamDialer {
 }
 
 /// Public, independent, no-log encrypted DNS upstreams using hardcoded bootstrap IPs.
-/// Zero reliance on ISP DNS to resolve DNS endpoints.
+/// Zero reliance on ISP DNS to resolve DNS endpoints; mixes port-443 DoH (firewall-friendly)
+/// and port-853 DoT across independent providers (Cloudflare, Quad9, Mullvad, Google).
 pub fn default_public_upstreams() -> Vec<UpstreamConfig> {
     vec![
         UpstreamConfig {
@@ -81,22 +82,22 @@ pub fn default_public_upstreams() -> Vec<UpstreamConfig> {
             custom_tls_config: None,
         },
         UpstreamConfig {
-            name: "Quad9-DoH",
-            protocol: UpstreamProtocol::DoH,
+            name: "Quad9-DoT",
+            protocol: UpstreamProtocol::DoT,
             bootstrap_ip: IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
-            port: 443,
+            port: 853,
             tls_server_name: "dns.quad9.net".into(),
-            doh_path: "/dns-query".into(),
+            doh_path: String::new(),
             apply_dpi_evasion: true,
             custom_tls_config: None,
         },
         UpstreamConfig {
-            name: "Mullvad-DoH",
-            protocol: UpstreamProtocol::DoH,
+            name: "Mullvad-DoT",
+            protocol: UpstreamProtocol::DoT,
             bootstrap_ip: IpAddr::V4(Ipv4Addr::new(194, 242, 2, 2)),
-            port: 443,
+            port: 853,
             tls_server_name: "dns.mullvad.net".into(),
-            doh_path: "/dns-query".into(),
+            doh_path: String::new(),
             apply_dpi_evasion: true,
             custom_tls_config: None,
         },
@@ -107,6 +108,16 @@ pub fn default_public_upstreams() -> Vec<UpstreamConfig> {
             port: 853,
             tls_server_name: "1dot1dot1dot1.cloudflare-dns.com".into(),
             doh_path: String::new(),
+            apply_dpi_evasion: true,
+            custom_tls_config: None,
+        },
+        UpstreamConfig {
+            name: "Google-DoH",
+            protocol: UpstreamProtocol::DoH,
+            bootstrap_ip: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            port: 443,
+            tls_server_name: "dns.google".into(),
+            doh_path: "/dns-query".into(),
             apply_dpi_evasion: true,
             custom_tls_config: None,
         },
@@ -442,4 +453,35 @@ fn decode_chunked_body(mut body: &[u8]) -> io::Result<Vec<u8>> {
         body = &body[size + 2..];
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{build_dns_query, parse_dns_response, QType};
+
+    #[tokio::test]
+    #[ignore = "requires live internet access to public DoH/DoT resolvers"]
+    async fn live_probe_all_default_public_upstreams_with_dpi_fragmentation() {
+        let tls = default_rustls_config();
+        let dialer = DefaultUpstreamDialer;
+        let query = build_dns_query(0x4242, "example.com", QType::A);
+        let mut successes = 0usize;
+        for up in default_public_upstreams() {
+            let res = query_upstream(&up, &query, &dialer, &tls, Duration::from_secs(4)).await;
+            match res {
+                Ok(resp) => {
+                    let parsed = parse_dns_response(&resp).expect("valid DNS wire reply");
+                    assert_eq!(parsed.id, 0x4242);
+                    assert!(!parsed.answers.is_empty(), "{} returned 0 answers", up.name);
+                    println!("[LIVE OK] {} ({}:{}) -> {} answers", up.name, up.bootstrap_ip, up.port, parsed.answers.len());
+                    successes += 1;
+                }
+                Err(e) => {
+                    println!("[LIVE WARN] {} ({}:{}) -> {}", up.name, up.bootstrap_ip, up.port, e);
+                }
+            }
+        }
+        assert!(successes >= 3, "At least 3 IPv4 public encrypted DNS upstreams must succeed live, got {successes}");
+    }
 }

@@ -31,6 +31,7 @@ pub use tcp::{
     segment_tcp_packet, FakePacketMode, RawPacketPlan, TcpSplitPlan,
 };
 pub use tls::{
-    fragment_tls_client_hello, parse_client_hello, ClientHelloInfo, SplitStrategy,
+    fragment_tls_client_hello, parse_client_hello, parse_client_hello_prefix, ClientHelloInfo,
+    SplitStrategy,
 };
 pub use ttl::{estimate_hop_count, recommend_fake_mode, TtlCalibrator};

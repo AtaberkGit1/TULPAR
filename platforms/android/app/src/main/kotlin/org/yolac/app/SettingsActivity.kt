@@ -188,6 +188,7 @@ class SettingsActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        YolacVpnService.syncStateFromNative()
         refreshHealth()
     }
 
