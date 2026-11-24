@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use crate::wire::{DnsQuery, DnsRecordData, DnsResponse};
+use crate::wire::{is_local_lan_hostname, DnsQuery, DnsRecordData, DnsResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PoisonReason {
@@ -13,30 +13,30 @@ pub enum PoisonReason {
     KnownCensorshipSinkhole(IpAddr),
 }
 
-fn is_local_or_special_domain(domain: &str) -> bool {
-    domain == "localhost"
-        || domain.ends_with(".localhost")
-        || domain.ends_with(".local")
-        || domain.ends_with(".lan")
-        || domain.ends_with(".internal")
-        || domain.ends_with(".arpa")
+fn is_known_sinkhole_v4(ip: Ipv4Addr) -> bool {
+    // Known public Turkish ISP / BTK censorship sinkhole IPs
+    matches!(ip.octets(), [195, 175, 254, 2] | [195, 175, 254, 3])
 }
 
 fn is_bogon_v4(ip: Ipv4Addr) -> Option<PoisonReason> {
+    if is_known_sinkhole_v4(ip) {
+        return Some(PoisonReason::KnownCensorshipSinkhole(IpAddr::V4(ip)));
+    }
     if ip.is_loopback() || ip.is_unspecified() {
         return Some(PoisonReason::LoopbackOrUnspecifiedHijack(IpAddr::V4(ip)));
     }
     if ip.is_private() || ip.is_link_local() {
         return Some(PoisonReason::PrivateRangeHijack(IpAddr::V4(ip)));
     }
-    // Known public ISP censorship sinkhole / BTK block page IPs
-    if matches!(ip.octets(), [195, 175, 254, 2] | [195, 175, 254, 3]) {
-        return Some(PoisonReason::KnownCensorshipSinkhole(IpAddr::V4(ip)));
-    }
     None
 }
 
 fn is_bogon_v6(ip: Ipv6Addr) -> Option<PoisonReason> {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        if let Some(reason) = is_bogon_v4(v4) {
+            return Some(reason);
+        }
+    }
     if ip.is_loopback() || ip.is_unspecified() {
         return Some(PoisonReason::LoopbackOrUnspecifiedHijack(IpAddr::V6(ip)));
     }
@@ -49,14 +49,15 @@ fn is_bogon_v6(ip: Ipv6Addr) -> Option<PoisonReason> {
 }
 
 /// Checks whether a DNS response shows signs of spoofing or ISP sinkhole hijacking.
+/// Suitable for untrusted/plaintext paths (rejects private, loopback, and known sinkholes).
 pub fn detect_poisoning(query: &DnsQuery, resp: &DnsResponse) -> Option<PoisonReason> {
     if resp.id != query.id {
         return Some(PoisonReason::TransactionIdMismatch);
     }
-    if !resp.qname.is_empty() && resp.qname != query.qname {
+    if resp.qname.is_empty() || resp.qname != query.qname {
         return Some(PoisonReason::QuestionMismatch);
     }
-    if is_local_or_special_domain(&query.qname) {
+    if is_local_lan_hostname(&query.qname) || query.qname.ends_with(".localhost") {
         return None;
     }
 
@@ -79,6 +80,35 @@ pub fn detect_poisoning(query: &DnsQuery, resp: &DnsResponse) -> Option<PoisonRe
     None
 }
 
+/// Strict integrity & censorship-sinkhole check for TLS-authenticated DoH/DoT responses.
+/// Because TLS verifies the upstream resolver cryptographically, legitimate private/loopback
+/// records (e.g. `*.plex.direct`, `*.nip.io`, `*.sslip.io`, split-horizon corporate domains)
+/// are permitted unless they match a known censorship sinkhole or header mismatch!
+pub fn detect_poisoning_tls(query: &DnsQuery, resp: &DnsResponse) -> Option<PoisonReason> {
+    if resp.id != query.id {
+        return Some(PoisonReason::TransactionIdMismatch);
+    }
+    if resp.qname.is_empty() || resp.qname != query.qname {
+        return Some(PoisonReason::QuestionMismatch);
+    }
+    for ans in &resp.answers {
+        match ans.data {
+            DnsRecordData::A(ip) if is_known_sinkhole_v4(ip) => {
+                return Some(PoisonReason::KnownCensorshipSinkhole(IpAddr::V4(ip)));
+            }
+            DnsRecordData::AAAA(ip) => {
+                if let Some(v4) = ip.to_ipv4_mapped() {
+                    if is_known_sinkhole_v4(v4) {
+                        return Some(PoisonReason::KnownCensorshipSinkhole(IpAddr::V6(ip)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +127,7 @@ mod tests {
         let poisoned = DnsResponse {
             id: 42,
             rcode: 0,
+            truncated: false,
             qname: "example.org".into(),
             qtype: QType::A,
             answers: vec![DnsAnswer {
@@ -116,6 +147,7 @@ mod tests {
         let clean = DnsResponse {
             id: 42,
             rcode: 0,
+            truncated: false,
             qname: "example.org".into(),
             qtype: QType::A,
             answers: vec![DnsAnswer {

@@ -6,7 +6,7 @@
 
 **İnternet özgür olmalı.**
 
-TULPAR; Android, iOS ve Windows üzerinde çalışan, kullanıcıları DPI tabanlı internet sansüründen, DNS/SNI engellerinden, bant daraltmalarından, reklamlardan, takip sistemlerinden ve DNS/IPv6 bağlantı sızıntılarından **tamamen cihaz üzerinde** koruyan, **%100 ücretsiz, açık kaynaklı (MIT) ve sıfır sunucu bağımlılığına sahip** bir ağ koruma uygulamasıdır.
+TULPAR; **Android** ve **Windows (PC)** üzerinde çalışan, kullanıcıları DPI tabanlı internet sansüründen, DNS/SNI engellerinden, bant daraltmalarından, reklamlardan, takip sistemlerinden ve DNS/IPv6 bağlantı sızıntılarından **tamamen cihaz üzerinde** koruyan, aynı zamanda gerçek DNS/bağlantı hızlandırma ve ağ tanılama araçları sunan **%100 ücretsiz, açık kaynaklı (MIT) ve sıfır sunucu bağımlılığına sahip** bir ağ koruma uygulamasıdır.
 
 ---
 
@@ -14,46 +14,43 @@ TULPAR; Android, iOS ve Windows üzerinde çalışan, kullanıcıları DPI taban
 
 1. **Sıfır Sunucu Maliyeti & Sunucu Bağımsızlığı**: Kendi VPS'imize, merkezi sunuculara, ücretli API'lere veya kullanıcı hesaplarına bağımlı değildir. Trafiğiniz hiçbir zaman bize ait bir sunucuya yönlendirilmez.
 2. **Sıfır Telemetri & Sıfır Kayıt**: Bağlantı geçmişi, ziyaret edilen alan adları, IP adresleri veya cihaz kimlikleri diske yazılmaz ve toplanmaz. Önbellekler yalnızca RAM'de tutulur ve koruma kapatıldığında sıfırlanır.
-3. **Aynı Ultra-Minimalist Tasarım**: Üç platformda da tamamen `#000000` siyah arka plan, ortada tek koruma butonu ve sağ üstte küçük ayarlar ikonu bulunur. Gereksiz menü, animasyon veya reklam yoktur.
-4. **Dürüst Teknik Sınırlar**: Cihaz üzerinde mümkün olmayan sansür türleri çalışıyormuş gibi gösterilmez (bkz. [docs/TECHNICAL_LIMITATIONS.md](docs/TECHNICAL_LIMITATIONS.md)).
+3. **Ultra-Minimalist Tasarım + İsviçre Çakısı Ayarlar**: Ana ekran tamamen `#000000` siyah arka plan ve tek koruma butonudur. Tüm gelişmiş hız, tanılama ve istisna araçları sağ üstteki Ayarlar ekranında sade şekilde yer alır.
+4. **Dürüst Teknik Sınırlar**: ISS fiziksel hat limitinin ötesinde bant genişliği vaat edilmez; cihaz üzerinde mümkün olmayan sansür türleri çalışıyormuş gibi gösterilmez (bkz. [docs/TECHNICAL_LIMITATIONS.md](docs/TECHNICAL_LIMITATIONS.md)).
 
 ---
 
-## v0.3.0 Yenilikleri
-- **WhatsApp, Telegram, Banka ve e-Devlet Tam Uyumluluğu**: Android'de gerçek küresel IPv6 erişim algılaması (`LinkProperties` + 600ms canlı IPv6 probu) ile IPv4-only ağlarda IPv6 kara deliği tamamen giderildi; uzun ömürlü/non-TLS protokoller (WhatsApp `WA\x06`, port 5222, sunucu-önce-konuşan soketler) doğrudan tünel moduna alındı ve bağlantı hatalarında anında `TCP RST` (`sock.abort`) gönderiliyor.
-- **Türkiye ISS Çok Katmanlı DPI & UDP Desync Motoru**: Windows ve Android için geçerli zararsız Fake ClientHello + sunucu-güvenli `BadChecksum`/`WrongSeq` + ters sıra çoklu bölme, pasif DPI sahte `RST` ve BTK `302` düşürme, gerçek `FlowTracker` otomatik yükseltme, Discord Ses (STUN/IP-Discovery) ve Roblox RakNet (`UDP 49152–65535`) sunucusuz UDP desync eklendi.
-- **Mobil Pil Tasarrufu & Yerel Ağ Desteği**: Boşta 20 Hz CPU uyanması 30 sn derin uykuya indirildi; `.local`/`.lan`/tek-etiketli yerel LAN DNS sorguları ve Android multicast (`224.0.0.0/4`) doğrudan yerel ağa yönlendiriliyor.
+## v0.4.0 Yenilikleri (Hız, İsviçre Çakısı & Çok Katmanlı Sertleştirme)
 
-## v0.2.0 Yenilikleri
-
-- **Yeni Nesil DPI & Protokol Motoru**:
-  - **Otomatik SYN-ACK Hop/TTL Kalibrasyonu**: Sabit TTL tahmini yerine gelen `SYN-ACK` paketlerinden hedefin gerçek hop mesafesini hesaplayarak sahte paket TTL değerini dinamik belirler (yakın hedeflerde otomatik `BadChecksum` moduna geçer).
-  - **ECH (`DNS HTTPS / Type 65`, RFC 9460) Desteği**: Şifreli DNS üzerinden ECH yapılandırmalarını eksiksiz iletir ve `HTTPS` hedef alan adlarında da reklam/takip engelleyici (Target Uncloaking) çalıştırır.
-  - **Akıllı TCP MSS / Window Daraltma**: El sıkışma sırasında güvenli MSS (`536`) daraltması ile sunucu yanıt denetimini bozar, normal veri aktarımında hız kaybı oluşturmaz.
-- **Günlük Kullanım ve İşletim Sistemi Entegrasyonu**:
-  - **Güvenli Captive Portal Algılama**: Okul/otel/havalimanı Wi-Fi giriş ekranlarını otomatik algılar; yalnızca giriş tamamlanana kadar (en fazla 90 sn) yerel ağ izni verir ve şifreli DNS erişimi döndüğü anda otomatik tam korumaya geçer.
-  - **Windows Sistem Tepsisi (System Tray)**: Koruma açıkken `X` tuşuyla kesintisiz olarak sistem tepsisine küçülür; tepsi menüsünden tek tıkla Göster / Korumayı Aç-Kapat / Çıkış yapılabilir.
-  - **Android Hızlı Ayarlar Kutucuğu & Always-On VPN**: Bildirim çubuğundaki Hızlı Ayarlar'a `TULPAR` kutucuğu eklenebilir; Android Her Zaman Açık VPN ile uyumludur.
-  - **iOS Otomatik Kurtarma & Yerel Ağ Uyumu**: Wi-Fi <-> Hücresel geçişlerinde `NEOnDemandRule` ile kesintisiz toparlanır, yerel LAN/Captive Portal erişimini korur.
+- **Gerçek İnternet Hızlandırma & Gecikme Azaltma (Windows & Android)**:
+  - **Turbo Şifreli DNS Motoru**: Açılışta ve ağ değişiminde tüm şifreli DoH/DoT sunucularını paralel ölçerek en düşük gecikmeli sunucuyu otomatik seçer; 250 ms yedekli yarış (hedged DNS), `O(1)` LRU önbellek, **RFC 8767 Stale-While-Revalidate (SWR)** ile anında (`<0.1 ms`) önbellek yanıtı, negatif önbellekleme ve artımlı (incremental) HTTP/1.1 chunked DoH keep-alive havuzu kullanır.
+  - **Temizlenmiş Türkiye + Küresel Reklam/İzleyici Engelleme**: Yanlış pozitif oluşturan iş/ödeme/CDN alan adları temizlendi (`3.594` yüksek isabetli kural); web sayfası ve uygulama açılışlarında gereksiz üçüncü taraf ağ yükünü keser.
+  - **Windows Çekirdek İçi (In-Kernel) WinDivert 2.2 Bayt Kodu Filtresi**: Oyun, sesli sohbet, video ve büyük dosya indirme paketlerinin **>%99,95'i kullanıcı alanına hiç kopyalanmadan doğrudan Windows çekirdeğinde sıfır gecikmeyle geçer**.
+  - **Android Yüksek Verimli TUN & Spekülatif TCP Bağlantısı**: `256 KB` `smoltcp` TCP penceresi, `64 KB` çift yönlü aktarım, `AsyncFd` sıfır-uyanmalı TUN döngüsü, web portlarında paralel TCP ön-bağlantısı (1 RTT tasarruf) ve `protect()` hızlı yolu.
+- **Ayarlar İçinde İsviçre Çakısı Araçları**:
+  - **Canlı Ağ ve Hız Testi (Windows & Android)**: Tüm şifreli DNS sunucularının gerçek `ms` gecikmelerini, en hızlı seçilen sunucuyu, IPv6 durumunu, engellenen reklam sayısını ve önbellek isabet oranını canlı ölçer.
+  - **Tek Tıkla Windows Ağ ve TCP Hızlandır / Onar (Windows)**: Devre dışı kalmış Windows TCP Auto-Tuning (`normal`) ve RSS ayarlarını güvenli/geri alınabilir biçimde onarır, aktif arayüz MTU değerini gösterir, eski WinDivert SCM servis kalıntılarını ve Windows DNS önbelleğini temizler.
+  - **İsteğe Bağlı UAC'siz Otomatik Başlatma (Windows)**: Görev Zamanlayıcı üzerinden açılışta yönetici onayı sormadan otomatik başlatma anahtarı + Per-Monitor V2 HiDPI ve titreşimsiz çift tamponlu (double-buffered) kaydırılabilir Win32 arayüz.
+  - **Uygulama Hariç Tutma / Split-Tunneling (Android)**: Bankacılık, e-Devlet veya yerel ağ uygulamalarını tek listeden TULPAR tüneli dışında bırakma (`addDisallowedApplication`), Pil Kısıtlaması kısayolu, Android Özel DNS uyarısı ve bildirimden tek dokunuşla **Kapat** düğmesi.
+- **Güvenilirlik & Güvenlik Düzeltmeleri**:
+  - RFC 6864 pasif DPI sahte `RST` doğrulaması (`DF=1, IP.ID=0` gerçek sunucu paketlerini asla düşürmez), HTTP `POST`/`PUT` >4 KB akış düzeltmesi, Chrome 131+ PQ `ClientHello` tam uzunluk takibi, `WinDivert` driver `%ProgramData%\Tulpar\driver` sertleştirme, Android atomik IPv4↔IPv6 TUN geçişi ve tam LAN/multicast dışlaması (Android 8–15).
 
 ---
 
 ## Mimari Özeti
 
-Ortak Rust çekirdeği (`core/`) üç platform tarafından paylaşılır:
+Ortak Rust çekirdeği (`core/`) Windows ve Android tarafından paylaşılır:
 
-- `yolac-dpi`: IPv4/IPv6 + TCP/UDP + TLS 1.2/1.3 ClientHello SNI & ECH (`0xFE0D`) ayrıştırıcı, TLS kayıt parçalama, TCP SNI segmentasyonu, akıllı SYN MSS / Window daraltma, otomatik SYN-ACK Hop/TTL kalibratörü, HTTP `Host` atlatma, QUIC tespiti & TCP geri dönüşü, ham paket Disorder / düşük TTL / hatalı checksum planlayıcı.
-- `yolac-blocklist`: Tek bitişik bayt arenasında sıfır dinamik tahsisli (zero-allocation) reklam, izleyici ve zararlı alan adı engelleyici (5.500 kural, `152 KB` RAM).
-- `yolac-dns`: RFC 1035 & RFC 9460 (`HTTPS` Type 65 ECH) ayrıştırıcı, kalıcı keep-alive havuzlu DoH (RFC 8484) & DoT (RFC 7858) istemcileri, DNS zehirlenme tespiti, CNAME/HTTPS Target Uncloaking ve yalnızca RAM'de tutulan LRU önbellek.
-- `yolac-net`: `smoltcp` tabanlı kullanıcı alanı L3 TUN yönlendiricisi, `SocketProtector`, şeffaf ilk-bağlantı tekrar denemeli `DpiTcpRelay`, `CaptivePortalMonitor` ve `LeakGuard` (DNS + dengeli fail-closed IPv6 koruması).
-- `yolac-core`: `YolacEngine`, tuzlanmış geçici özetlerle çalışan `AdaptiveController`, 7 modüllü gerçek `HealthMonitor` ve yalnızca kullanıcı isteğiyle çalışan resmî GitHub Releases güncelleyici.
-- `yolac-ffi`: Panik-güvenli C-ABI (iOS `NEPacketTunnelProvider`) ve Android JNI köprüsü.
+- `yolac-dpi`: IPv4/IPv6 + TCP/UDP + TLS 1.2/1.3 & PQ `ClientHello` SNI/ECH (`0xFE0D`) ayrıştırıcı, yüksek entropili zararsız sahte ClientHello, sunucu-güvenli `BadChecksum`/`WrongSeq` & otomatik SYN-ACK Hop/TTL kalibratörü, HTTP `Host`/`CONNECT` atlatma, QUIC tespiti ve Discord Ses / Roblox RakNet UDP desync.
+- `yolac-blocklist`: Tek bitişik bayt arenasında sıfır dinamik tahsisli (zero-allocation) reklam, izleyici ve zararlı alan adı engelleyici (`3.594` temizlenmiş kural + ters-sıralı alt alan adı izin listesi).
+- `yolac-dns`: RFC 1035 & RFC 9460 (`HTTPS` Type 65 ECH), artımlı chunked DoH (RFC 8484) & DoT (RFC 7858), en hızlı sunucu otomatik seçimi, 250 ms hedged DNS, RFC 8767 SWR + `O(1)` RAM-only LRU önbellek ve DNS zehirlenme koruması.
+- `yolac-net`: `smoltcp` tabanlı `256 KB` pencereli kullanıcı alanı L3 TUN yönlendiricisi, spekülatif paralel bağlantılı `DpiTcpRelay`, `CaptivePortalMonitor`, paralel IPv6 probu ve `LeakGuard`.
+- `yolac-core`: `YolacEngine`, gerçek zamanlı `AdaptiveController`, canlı `DiagnosticReport`, 7 modüllü gerçek `HealthMonitor` ve resmî GitHub Releases güncelleyici.
+- `yolac-ffi`: Panik-güvenli `AsyncFd` tabanlı Android JNI köprüsü.
 
 Ayrıntılar için:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [docs/DESIGN_SPEC.md](docs/DESIGN_SPEC.md)
 - [docs/TECHNICAL_LIMITATIONS.md](docs/TECHNICAL_LIMITATIONS.md)
-- [docs/IOS_DISTRIBUTION.md](docs/IOS_DISTRIBUTION.md)
 - [SECURITY.md](SECURITY.md)
 
 ---
@@ -62,16 +59,15 @@ Ayrıntılar için:
 
 | Platform / Bileşen | Paket Formatı | Uygulama Durumu | Hedef OS / Dağıtım Notu |
 |---|---|---|---|
-| **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.3.0`) | Tüm platformlar tarafından paylaşılır |
-| **Windows (`platforms/windows`)** | `tulpar.exe` / `.zip` | Tamamlandı (Win32 `#000000` UI, Sistem Tepsisi, Ayarlar & 7 modül, UAC, WinDivert 2.2.2 **SHA-256 + Authenticode** doğrulama, Otomatik TTL) | Canlı kernel yakalama için imzalı `WinDivert.dll` + `WinDivert64.sys` gerekir; `release.yml` doğrulamalı `.zip` + `SHA256SUMS.txt` üretir |
-| **Android (`platforms/android`)** | `tulpar.apk` | Tamamlandı (Kotlin `VpnService`, Hızlı Ayarlar Kutucuğu, Always-On VPN, `#000000` UI, Ayarlar & 7 modül, JNI) | Android 8.0+ (API 26+) |
-| **iOS (`platforms/ios`)** | `tulpar-ios-unsigned.ipa` | Kaynak & proje tamamlandı (SwiftUI `#000000` UI, Ayarlar, `NEPacketTunnelProvider`, `NEOnDemandRule`, `LowMemoryIos`, `PrivacyInfo.xcprivacy`) | `.ipa` imzalaması Apple kısıtlaması gereği **macOS + Xcode + Apple Developer Program** gerektirir |
+| **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.4.0`) | Windows ve Android tarafından paylaşılır |
+| **Windows (`platforms/windows`)** | `tulpar.exe` / `tulpar-windows-x64.zip` | Tamamlandı (PerMonitorV2 HiDPI `#000000` UI, Sistem Tepsisi, İsviçre Çakısı Ayarlar, WinDivert 2.2.2 in-kernel filtre + SHA-256 & Authenticode doğrulama, TCP/MTU Onarıcı) | Tek dosya `tulpar.exe` (imzalı WinDivert gömülü & doğrulamalı) veya `.zip` paketi |
+| **Android (`platforms/android`)** | `tulpar.apk` | Tamamlandı (Kotlin `VpnService`, Split-Tunneling, Canlı Hız Testi, Hızlı Ayarlar Kutucuğu, Always-On VPN, Atomik IPv4↔IPv6 TUN, Android 15 Edge-to-Edge, JNI) | Android 8.0+ (API 26+, `arm64-v8a` & `x86_64`) |
 
 ---
 
 ## Hızlı Test & Derleme
 
-### Rust Çekirdeği (Linux / macOS / Windows)
+### Rust Çekirdeği (Linux / Windows)
 ```bash
 cd core
 cargo test --workspace
@@ -82,19 +78,13 @@ cargo build --workspace --release
 ### Android
 ```bash
 ./platforms/android/scripts/build-rust-android.sh
-cd platforms/android && gradle testDebugUnitTest assembleRelease
-```
-
-### iOS (macOS)
-```bash
-./platforms/ios/scripts/build-xcframework.sh
-cd platforms/ios && xcodegen generate
+cd platforms/android && gradle testDebugUnitTest lintVitalRelease assembleRelease
 ```
 
 ### Windows
 ```powershell
 cd platforms/windows
 cargo test
+cargo clippy --all-targets -- -D warnings
 cargo build --release
-# İmzalı WinDivert.dll ve WinDivert64.sys dosyalarını target\release\tulpar.exe yanına yerleştirin.
 ```

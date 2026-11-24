@@ -6,6 +6,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_embedded_windivert)");
     println!("cargo:rerun-if-changed=assets/tulpar.ico");
     println!("cargo:rerun-if-changed=assets/tulpar.rc");
+    println!("cargo:rerun-if-changed=app.manifest");
 
     if let Ok(raw_dir) = std::env::var("TULPAR_WINDIVERT_DIR") {
         let dir = PathBuf::from(raw_dir);

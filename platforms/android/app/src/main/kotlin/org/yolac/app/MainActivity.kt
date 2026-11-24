@@ -2,6 +2,7 @@ package org.yolac.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -18,11 +19,15 @@ import android.view.View
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import kotlin.math.cos
@@ -31,6 +36,7 @@ import kotlin.math.sin
 class MainActivity : ComponentActivity() {
 
     private lateinit var buttonView: YolacButtonView
+    private lateinit var settingsIcon: SettingsGearView
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
@@ -39,6 +45,7 @@ class MainActivity : ComponentActivity() {
             startVpnService()
         } else {
             YolacNative.nativeReportPlatformError(YolacNative.ERROR_PERMISSION_DENIED)
+            YolacVpnService.syncStateFromNative()
             buttonView.state = YolacButtonView.UiState.ERROR
         }
     }
@@ -53,8 +60,14 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = Color.BLACK
-        window.navigationBarColor = Color.BLACK
+        @Suppress("DEPRECATION")
+        run {
+            window.statusBarColor = Color.BLACK
+            window.navigationBarColor = Color.BLACK
+        }
+        val insetsCtrl = WindowInsetsControllerCompat(window, window.decorView)
+        insetsCtrl.isAppearanceLightStatusBars = false
+        insetsCtrl.isAppearanceLightNavigationBars = false
 
         val density = resources.displayMetrics.density
         val container = FrameLayout(this).apply {
@@ -72,26 +85,42 @@ class MainActivity : ComponentActivity() {
 
         // Small minimalist settings gear icon in top-right corner
         val gearSize = (44 * density).toInt()
-        val settingsIcon = SettingsGearView(this).apply {
+        val baseTopMargin = (14 * density).toInt()
+        val baseEndMargin = (16 * density).toInt()
+        settingsIcon = SettingsGearView(this).apply {
             contentDescription = "Ayarlar"
             setOnClickListener {
                 startActivity(Intent(this@MainActivity, SettingsActivity::class.java))
             }
         }
-        container.addView(
-            settingsIcon,
-            FrameLayout.LayoutParams(gearSize, gearSize).apply {
-                gravity = Gravity.TOP or Gravity.END
-                topMargin = (42 * density).toInt()
-                marginEnd = (16 * density).toInt()
-            },
-        )
+        val gearLp = FrameLayout.LayoutParams(gearSize, gearSize).apply {
+            gravity = Gravity.TOP or Gravity.END
+            topMargin = (42 * density).toInt()
+            marginEnd = baseEndMargin
+        }
+        container.addView(settingsIcon, gearLp)
 
-        // First-launch security warning overlay (no personal data stored, only local ack boolean)
-        val prefs = getSharedPreferences("yolac_prefs", Context.MODE_PRIVATE)
+        // Respect Android 15 Edge-to-Edge system bars & display cutouts accurately
+        ViewCompat.setOnApplyWindowInsetsListener(container) { _, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout(),
+            )
+            val lp = settingsIcon.layoutParams as FrameLayout.LayoutParams
+            lp.topMargin = bars.top + baseTopMargin
+            lp.marginEnd = bars.right + baseEndMargin
+            settingsIcon.layoutParams = lp
+            insets
+        }
+
+        // First-launch security warning overlay (ScrollView prevents large-font clipping)
+        val prefs = getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
         if (!prefs.getBoolean("security_warning_ack", false)) {
+            buttonView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+            settingsIcon.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
             val overlay = buildFirstLaunchSecurityOverlay(density) {
                 prefs.edit().putBoolean("security_warning_ack", true).apply()
+                buttonView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+                settingsIcon.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
             }
             container.addView(
                 overlay,
@@ -130,12 +159,16 @@ class MainActivity : ComponentActivity() {
         onAcknowledge: () -> Unit,
     ): View {
         val pad = (28 * density).toInt()
+        val scroll = ScrollView(this).apply {
+            isFillViewport = true
+            setBackgroundColor(Color.BLACK)
+            isClickable = true
+        }
         val overlay = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setBackgroundColor(Color.BLACK)
             setPadding(pad, pad, pad, pad)
-            isClickable = true
         }
         val boxBg = GradientDrawable().apply {
             setColor(Color.parseColor("#110707"))
@@ -162,7 +195,7 @@ class MainActivity : ComponentActivity() {
             background = okBg
             setOnClickListener {
                 onAcknowledge()
-                (overlay.parent as? FrameLayout)?.removeView(overlay)
+                (scroll.parent as? FrameLayout)?.removeView(scroll)
             }
         }
         overlay.addView(
@@ -181,7 +214,14 @@ class MainActivity : ComponentActivity() {
                 topMargin = (20 * density).toInt()
             },
         )
-        return overlay
+        scroll.addView(
+            overlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        return scroll
     }
 
     private fun onToggleClicked() {
@@ -208,9 +248,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestVpnConsentAndStart() {
-        val prepareIntent = VpnService.prepare(this)
+        val prepareIntent = try {
+            VpnService.prepare(this)
+        } catch (_: Throwable) {
+            null
+        }
         if (prepareIntent != null) {
-            vpnPermissionLauncher.launch(prepareIntent)
+            try {
+                vpnPermissionLauncher.launch(prepareIntent)
+            } catch (_: ActivityNotFoundException) {
+                YolacNative.nativeReportPlatformError(YolacNative.ERROR_PERMISSION_DENIED)
+                buttonView.state = YolacButtonView.UiState.ERROR
+            }
         } else {
             startVpnService()
         }
@@ -220,10 +269,15 @@ class MainActivity : ComponentActivity() {
         val startIntent = Intent(this, YolacVpnService::class.java).apply {
             action = YolacVpnService.ACTION_START
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(startIntent)
-        } else {
-            startService(startIntent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(startIntent)
+            } else {
+                startService(startIntent)
+            }
+        } catch (_: Throwable) {
+            YolacNative.nativeReportPlatformError(YolacNative.ERROR_PERMISSION_DENIED)
+            buttonView.state = YolacButtonView.UiState.ERROR
         }
     }
 }

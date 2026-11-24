@@ -74,6 +74,7 @@ pub struct DnsAnswer {
 pub struct DnsResponse {
     pub id: u16,
     pub rcode: u8,
+    pub truncated: bool,
     pub qname: String,
     pub qtype: QType,
     pub answers: Vec<DnsAnswer>,
@@ -128,7 +129,7 @@ pub fn decode_dns_name(packet: &[u8], offset: usize) -> Option<(String, usize)> 
             if total_len > 255 {
                 return None;
             }
-            let label = std::str::from_utf8(&packet[pos..pos + label_len]).ok()?;
+            let label = String::from_utf8_lossy(&packet[pos..pos + label_len]);
             labels.push(label.to_ascii_lowercase());
             pos += label_len;
         }
@@ -186,6 +187,7 @@ pub fn parse_dns_response(packet: &[u8]) -> Option<DnsResponse> {
         return None;
     }
     let rcode = (flags & 0x000F) as u8;
+    let truncated = (flags & 0x0200) != 0;
     let qdcount = u16::from_be_bytes([packet[4], packet[5]]);
     let ancount = u16::from_be_bytes([packet[6], packet[7]]);
 
@@ -208,7 +210,7 @@ pub fn parse_dns_response(packet: &[u8]) -> Option<DnsResponse> {
     let mut answers = Vec::with_capacity(ancount.min(32) as usize);
     let mut min_ttl = u32::MAX;
 
-    for _ in 0..ancount.min(64) {
+    for _ in 0..ancount.min(128) {
         let (_rr_name, after_name) = decode_dns_name(packet, pos)?;
         if after_name + 10 > packet.len() {
             return None;
@@ -242,7 +244,10 @@ pub fn parse_dns_response(packet: &[u8]) -> Option<DnsResponse> {
                 DnsRecordData::AAAA(Ipv6Addr::from(octs))
             }
             5 => {
-                let (cname, _) = decode_dns_name(packet, rdata_start)?;
+                let (cname, next_end) = decode_dns_name(packet, rdata_start)?;
+                if next_end > rdata_end {
+                    return None;
+                }
                 DnsRecordData::CNAME(cname)
             }
             65 => parse_https_rdata(packet, rdata_start, rdata_end)
@@ -261,6 +266,7 @@ pub fn parse_dns_response(packet: &[u8]) -> Option<DnsResponse> {
     Some(DnsResponse {
         id,
         rcode,
+        truncated,
         qname,
         qtype,
         answers,
@@ -382,7 +388,7 @@ pub fn build_dns_query(id: u16, domain: &str, qtype: QType) -> Vec<u8> {
     pkt.extend_from_slice(&0u16.to_be_bytes());
     pkt.extend_from_slice(&0u16.to_be_bytes());
     for label in domain.trim_end_matches('.').split('.') {
-        if !label.is_empty() {
+        if !label.is_empty() && label.len() <= 63 {
             pkt.push(label.len() as u8);
             pkt.extend_from_slice(label.as_bytes());
         }

@@ -2,12 +2,13 @@
 
 mod dns_guard;
 mod integrity;
+mod net_optimizer;
 mod permissions;
 mod tray;
 mod ui;
 mod windivert;
 
 fn main() {
-    let autostart = std::env::args().any(|a| a == "--autostart");
-    ui::run_win32_ui(autostart);
+    let elevated_start = std::env::args().any(|a| a == "--elevated-start" || a == "--autostart");
+    ui::run_win32_ui(elevated_start);
 }

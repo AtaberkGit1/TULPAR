@@ -36,12 +36,14 @@ pub fn estimate_hop_count(observed_ttl: u8) -> u8 {
 ///   back to `BadChecksum` so the decoy can never corrupt the server's TCP stream.
 pub fn recommend_fake_mode(observed_ttl: u8) -> FakePacketMode {
     let hops = estimate_hop_count(observed_ttl);
-    if hops <= 2 {
+    // Very close CDN PoP (<= 2 hops) or anomalous initial-TTL guess (> 32 hops):
+    // always use BadChecksum so decoys can never reach or corrupt the server stream.
+    if hops <= 2 || hops > 32 {
         return FakePacketMode::BadChecksum;
     }
-    let max_safe = hops.saturating_sub(1).max(2);
+    let max_safe = hops.saturating_sub(1).clamp(2, 5);
     let calibrated = (hops / 2).clamp(2, max_safe);
-    FakePacketMode::LowTtl(calibrated)
+    FakePacketMode::LowTtlWrongSeq(calibrated)
 }
 
 /// Ephemeral RAM-only hop calibrator keyed by per-instance randomly-seeded 64-bit hashes.
@@ -96,7 +98,7 @@ impl TtlCalibrator {
                 return recommend_fake_mode(ttl);
             }
         }
-        FakePacketMode::LowTtl(fallback_ttl.max(1))
+        FakePacketMode::LowTtlWrongSeq(fallback_ttl.clamp(2, 5))
     }
 
     pub fn len(&self) -> usize {
@@ -141,10 +143,10 @@ mod tests {
 
     #[test]
     fn recommends_calibrated_ttl_and_falls_back_to_bad_checksum_when_close() {
-        // 10 hops away -> fake TTL 5 (reaches ISP middlebox, expires well before server)
-        assert_eq!(recommend_fake_mode(54), FakePacketMode::LowTtl(5));
+        // 10 hops away -> server-safe LowTtlWrongSeq(5) (reaches ISP middlebox, expires well before server)
+        assert_eq!(recommend_fake_mode(54), FakePacketMode::LowTtlWrongSeq(5));
         // 4 hops away -> fake TTL 2
-        assert_eq!(recommend_fake_mode(60), FakePacketMode::LowTtl(2));
+        assert_eq!(recommend_fake_mode(60), FakePacketMode::LowTtlWrongSeq(2));
         // 1 or 2 hops away -> BadChecksum instead of risking LowTtl hitting server
         assert_eq!(recommend_fake_mode(63), FakePacketMode::BadChecksum);
         assert_eq!(recommend_fake_mode(62), FakePacketMode::BadChecksum);
@@ -156,14 +158,14 @@ mod tests {
         let peer_v4 = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
         let peer_v6 = IpAddr::V6(Ipv6Addr::new(0x2606, 0x2800, 0x220, 1, 0, 0, 0, 1));
 
-        // Before observation -> fallback TTL
-        assert_eq!(cal.recommended_fake_mode(peer_v4, 3), FakePacketMode::LowTtl(3));
+        // Before observation -> fallback server-safe LowTtlWrongSeq
+        assert_eq!(cal.recommended_fake_mode(peer_v4, 3), FakePacketMode::LowTtlWrongSeq(3));
 
-        cal.observe_syn_ack(peer_v4, 52); // 12 hops -> LowTtl(6)
+        cal.observe_syn_ack(peer_v4, 52); // 12 hops -> capped LowTtlWrongSeq(5)
         cal.observe_syn_ack(peer_v6, 63); // 1 hop -> BadChecksum
 
         assert_eq!(cal.estimated_hops(peer_v4), Some(12));
-        assert_eq!(cal.recommended_fake_mode(peer_v4, 3), FakePacketMode::LowTtl(6));
+        assert_eq!(cal.recommended_fake_mode(peer_v4, 3), FakePacketMode::LowTtlWrongSeq(5));
         assert_eq!(cal.recommended_fake_mode(peer_v6, 3), FakePacketMode::BadChecksum);
         assert_eq!(cal.len(), 2);
 

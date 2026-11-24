@@ -19,17 +19,45 @@ const DEFAULT_IPV6_PROBES: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0x2620, 0x00fe, 0, 0, 0, 0, 0, 0x00fe)), 443),
 ];
 
-/// Determines the safest IPv6 leak mode for the current network using a short bounded TCP probe.
+/// Determines the safest IPv6 leak mode for the current network by racing bounded TCP probes
+/// concurrently (max total wall time <= `probe_timeout` instead of sequential `2 * probe_timeout`).
 pub async fn probe_ipv6_leak_mode(
     protector: &dyn SocketProtector,
     custom_targets: Option<&[SocketAddr]>,
     probe_timeout: Duration,
 ) -> Ipv6LeakMode {
     let targets = custom_targets.unwrap_or(&DEFAULT_IPV6_PROBES);
-    for &addr in targets {
-        if let Ok(Ok(_stream)) = timeout(probe_timeout, connect_protected_tcp(addr, protector)).await
-        {
-            return Ipv6LeakMode::DualStackProtected;
+    if targets.is_empty() {
+        return Ipv6LeakMode::BlockUnprotectedIpv6;
+    }
+    if targets.len() == 1 {
+        return match timeout(probe_timeout, connect_protected_tcp(targets[0], protector)).await {
+            Ok(Ok(_)) => Ipv6LeakMode::DualStackProtected,
+            _ => Ipv6LeakMode::BlockUnprotectedIpv6,
+        };
+    }
+
+    // Race first two targets concurrently without requiring `'static` protector lifetime
+    let f0 = timeout(probe_timeout, connect_protected_tcp(targets[0], protector));
+    let f1 = timeout(probe_timeout, connect_protected_tcp(targets[1], protector));
+    tokio::pin!(f0);
+    tokio::pin!(f1);
+    let mut done0 = false;
+    let mut done1 = false;
+    while !done0 || !done1 {
+        tokio::select! {
+            res = &mut f0, if !done0 => {
+                done0 = true;
+                if matches!(res, Ok(Ok(_))) {
+                    return Ipv6LeakMode::DualStackProtected;
+                }
+            }
+            res = &mut f1, if !done1 => {
+                done1 = true;
+                if matches!(res, Ok(Ok(_))) {
+                    return Ipv6LeakMode::DualStackProtected;
+                }
+            }
         }
     }
     Ipv6LeakMode::BlockUnprotectedIpv6

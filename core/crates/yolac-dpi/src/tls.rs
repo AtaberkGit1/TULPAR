@@ -53,11 +53,13 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
         return None;
     }
     let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-    if record_len < 4 {
+    // RFC 8446 §5.1: TLSPlaintext fragment length MUST NOT exceed 2^14 (16384 bytes)
+    if !(4..=16384).contains(&record_len) {
         return None;
     }
     let record_total_len = 5 + record_len;
-    if !allow_truncated && data.len() < record_total_len {
+    let is_truncated = data.len() < record_total_len;
+    if !allow_truncated && is_truncated {
         return None;
     }
     let avail_record_end = record_total_len.min(data.len());
@@ -68,17 +70,25 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
         return None;
     }
     let hs_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
-    if !allow_truncated && hs.len() < 4 + hs_len {
+    // Minimum valid ClientHello body is 38 bytes (2 ver + 32 random + 1 sid + 2 ciphers + 1 comp)
+    if hs_len < 38 {
+        return None;
+    }
+    let body_truncated = is_truncated || hs.len() < 4 + hs_len;
+    if !allow_truncated && body_truncated {
         return None;
     }
     let avail_body_end = (4 + hs_len).min(hs.len());
     let body = &hs[4..avail_body_end];
+    if body.len() >= 2 && body[0] != 0x03 {
+        return None;
+    }
 
     // ClientHello body:
     // 2 bytes client_version + 32 bytes random = 34 bytes
     let mut pos = 34usize;
     if body.len() < pos + 1 {
-        return if allow_truncated {
+        return if allow_truncated && body_truncated {
             Some(ClientHelloInfo {
                 sni: None,
                 sni_range: None,
@@ -94,7 +104,7 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
     pos += 1 + session_id_len;
 
     if body.len() < pos + 2 {
-        return if allow_truncated {
+        return if allow_truncated && body_truncated {
             Some(ClientHelloInfo {
                 sni: None,
                 sni_range: None,
@@ -110,7 +120,7 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
     pos += 2 + cipher_suites_len;
 
     if body.len() < pos + 1 {
-        return if allow_truncated {
+        return if allow_truncated && body_truncated {
             Some(ClientHelloInfo {
                 sni: None,
                 sni_range: None,
@@ -136,7 +146,7 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
         });
     }
     if body.len() < pos + 2 {
-        return if allow_truncated {
+        return if allow_truncated && body_truncated {
             Some(ClientHelloInfo {
                 sni: None,
                 sni_range: None,
@@ -168,6 +178,21 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
         pos += 4;
         if pos + ext_len > ext_end {
             if allow_truncated {
+                // Chrome 131+ PQ extension permutation: if SNI straddles MSS boundary, extract partial SNI range
+                if ext_type == 0x0000 && pos + 5 < ext_end {
+                    let avail = &body[pos..ext_end];
+                    let name_type = avail[2];
+                    let declared_name_len = u16::from_be_bytes([avail[3], avail[4]]) as usize;
+                    let avail_name_len = declared_name_len.min(avail.len() - 5);
+                    if name_type == 0 && avail_name_len > 0 {
+                        let abs_start = BODY_BASE + pos + 5;
+                        let abs_end = abs_start + avail_name_len;
+                        sni_range = Some((abs_start, abs_end));
+                        if let Ok(partial) = std::str::from_utf8(&avail[5..5 + avail_name_len]) {
+                            sni = Some(partial.to_ascii_lowercase());
+                        }
+                    }
+                }
                 break;
             }
             return None;
@@ -250,11 +275,10 @@ pub fn fragment_tls_client_hello(data: &[u8], strategy: SplitStrategy) -> Option
             } else {
                 (record_payload.len() / 2).clamp(1, record_payload.len() - 1)
             };
-            if p2 > p1 {
-                vec![p1, p2]
-            } else {
-                vec![p1]
-            }
+            let mut pts = vec![p1, p2];
+            pts.sort_unstable();
+            pts.dedup();
+            pts
         }
         SplitStrategy::FixedOffset(off) => {
             let point = off.clamp(1, record_payload.len() - 1);
@@ -268,9 +292,19 @@ pub fn fragment_tls_client_hello(data: &[u8], strategy: SplitStrategy) -> Option
                 pts.push(idx);
                 idx += step;
             }
+            // Guarantee SNI hostname itself is ALWAYS split across two TLS records
+            if let Some((start, end)) = info.sni_range {
+                let rel_start = start.saturating_sub(5);
+                let rel_end = end.saturating_sub(5);
+                let mid = (rel_start + (rel_end.saturating_sub(rel_start)) / 2)
+                    .clamp(1, record_payload.len() - 1);
+                pts.push(mid);
+            }
             if pts.is_empty() {
                 pts.push(record_payload.len() / 2);
             }
+            pts.sort_unstable();
+            pts.dedup();
             pts
         }
     };

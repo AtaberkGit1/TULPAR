@@ -30,41 +30,68 @@ class TulparTileService : TileService() {
 
     override fun onStartListening() {
         super.onStartListening()
+        YolacVpnService.syncStateFromNative()
         syncTile()
     }
 
     override fun onClick() {
         super.onClick()
+        if (isLocked) {
+            unlockAndRun { performToggle() }
+        } else {
+            performToggle()
+        }
+    }
+
+    private fun performToggle() {
+        YolacVpnService.syncStateFromNative()
         val current = YolacVpnService.stateFlow.value
         if (current == YolacNative.STATE_ACTIVATING || current == YolacNative.STATE_DEACTIVATING) {
             return
         }
 
         if (current == YolacNative.STATE_ACTIVE) {
-            val stopIntent = Intent(this, YolacVpnService::class.java).apply {
-                action = YolacVpnService.ACTION_STOP
+            try {
+                val stopIntent = Intent(this, YolacVpnService::class.java).apply {
+                    action = YolacVpnService.ACTION_STOP
+                }
+                startService(stopIntent)
+            } catch (_: Throwable) {
             }
-            startService(stopIntent)
             syncTile()
             return
         }
 
         // If VPN permission was already granted by the user, start directly without opening the app.
-        val prepareIntent = VpnService.prepare(this)
+        val prepareIntent = try {
+            VpnService.prepare(this)
+        } catch (_: Throwable) {
+            null
+        }
         if (prepareIntent == null) {
-            val startIntent = Intent(this, YolacVpnService::class.java).apply {
-                action = YolacVpnService.ACTION_START
+            try {
+                val startIntent = Intent(this, YolacVpnService::class.java).apply {
+                    action = YolacVpnService.ACTION_START
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(startIntent)
+                } else {
+                    startService(startIntent)
+                }
+                syncTile()
+                return
+            } catch (_: Throwable) {
+                // Fall back to launching MainActivity cleanly on OEM FGS restriction
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(startIntent)
-            } else {
-                startService(startIntent)
-            }
-            syncTile()
-        } else {
-            val launchIntent = Intent(this, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
+        }
+        openAppActivity()
+    }
+
+    private fun openAppActivity() {
+        val launchIntent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 val pending = PendingIntent.getActivity(
                     this,
@@ -77,6 +104,7 @@ class TulparTileService : TileService() {
                 @Suppress("DEPRECATION")
                 startActivityAndCollapse(launchIntent)
             }
+        } catch (_: Throwable) {
         }
     }
 

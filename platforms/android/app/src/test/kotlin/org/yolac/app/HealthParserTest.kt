@@ -48,16 +48,33 @@ class HealthParserTest {
     }
 
     @Test
-    fun validatesOfficialGithubReleaseUrlsAndRejectsThirdParty() {
+    fun validatesOfficialGithubReleaseUrlsAndRejectsThirdPartyAndSpoofedRepos() {
         val official = HealthParser.parseUpdateResult(
-            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://github.com/AtaberkGit1/TULPAR/releases/tag/v0.2.0"}""",
+            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://github.com/AtaberkGit1/TULPAR/releases/tag/v0.4.0"}""",
         )
         assertTrue(official.isTrustedOfficialGithubReleaseUrl())
 
-        val spoofed = HealthParser.parseUpdateResult(
-            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://evil.example.org/yolac.apk"}""",
+        val spoofedDomain = HealthParser.parseUpdateResult(
+            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://evil.example.org/tulpar.apk"}""",
         )
-        assertFalse(spoofed.isTrustedOfficialGithubReleaseUrl())
+        assertFalse(spoofedDomain.isTrustedOfficialGithubReleaseUrl())
+
+        val spoofedGithubRepo = HealthParser.parseUpdateResult(
+            """{"status":"update_available","message":"Yeni sürüm","release_url":"https://github.com/attacker/TULPAR/releases/tag/v9.9.9"}""",
+        )
+        assertFalse(spoofedGithubRepo.isTrustedOfficialGithubReleaseUrl())
+    }
+
+    @Test
+    fun parsesDiagnosticResultCleanly() {
+        val diag = HealthParser.parseDiagnosticResult(
+            """{"ok":true,"fastest_dns":"cloudflare-doh","fastest_rtt_ms":19,"summary":"En Hızlı Şifreli DNS: cloudflare-doh (19 ms)"}""",
+        )
+        assertTrue(diag.ok)
+        assertTrue(diag.summary.contains("19 ms"))
+
+        val broken = HealthParser.parseDiagnosticResult("not-json")
+        assertFalse(broken.ok)
     }
 
     @Test

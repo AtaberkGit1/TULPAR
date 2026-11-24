@@ -204,8 +204,9 @@ pub extern "C" fn yolac_start_packet_flow(
         if let Ok(mut g) = h.inbound_tx.lock() {
             *g = Some(in_tx);
         }
-        if let Ok(mut g) = h.engine.lock() {
-            *g = engine;
+        let prev = h.engine.lock().ok().map(|mut g| std::mem::replace(&mut *g, engine));
+        if let Some(old_engine) = prev {
+            h.rt.block_on(old_engine.stop());
         }
         0
     }))
@@ -268,13 +269,18 @@ pub extern "C" fn yolac_start_tun_fd(
             let engine = Arc::new(YolacEngine::new(h.config.clone(), protector));
             spawn_state_forwarder(&h.rt, &engine, state_cb, state_ctx);
 
-            let fd_dev = Arc::new(UnixTunFdDevice::new(tun_fd));
+            let _rt_guard = h.rt.enter();
+            let Ok(fd_dev) = UnixTunFdDevice::new(tun_fd) else {
+                return -2;
+            };
+            let fd_dev = Arc::new(fd_dev);
             let res = h.rt.block_on(engine.start_tun(fd_dev));
             if res.is_err() {
                 return -2;
             }
-            if let Ok(mut g) = h.engine.lock() {
-                *g = engine;
+            let prev = h.engine.lock().ok().map(|mut g| std::mem::replace(&mut *g, engine));
+            if let Some(old_engine) = prev {
+                h.rt.block_on(old_engine.stop());
             }
             0
         }))
@@ -380,130 +386,93 @@ pub extern "C" fn yolac_report_platform_error(handle: *mut YolacHandle, error_co
     .unwrap_or(-1)
 }
 
+/// Non-blocking epoll/kqueue `AsyncFd`-backed Unix/Android TUN device:
+/// - ZERO dedicated OS reader threads (eliminates Drop::drop() ANR deadlock!)
+/// - ZERO 200ms idle polling wakeups during Android Doze (432,000 -> 0 wakeups/day!)
+/// - RAII `OwnedFd` closes the TUN descriptor deterministically the instant all clones drop
 #[cfg(unix)]
-struct UnixTunFdDevice {
-    fd: i32,
-    closed: Arc<std::sync::atomic::AtomicBool>,
-    rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
-    write_lock: std::sync::Mutex<()>,
-    reader_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+pub(crate) struct UnixTunFdDevice {
+    async_fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
 }
 
 #[cfg(unix)]
 impl UnixTunFdDevice {
-    fn new(fd: i32) -> Self {
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-        let closed_reader = Arc::clone(&closed);
-
-        // Single dedicated OS reader thread -> 100% cancel-safe for `tokio::select!`,
-        // handles Android O_NONBLOCK TUN FDs cleanly via libc::poll without leaking threads.
-        let jh = std::thread::spawn(move || {
-            let mut buf = vec![0u8; 4096];
-            while !closed_reader.load(std::sync::atomic::Ordering::Relaxed) {
-                let mut pfd = libc::pollfd {
-                    fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                let pr = unsafe { libc::poll(&mut pfd, 1, 200) };
-                if pr < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if pr == 0 {
-                    continue;
-                }
-                if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
-                    break;
-                }
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::Interrupted
-                        || err.kind() == io::ErrorKind::WouldBlock
-                    {
-                        continue;
-                    }
-                    break;
-                }
-                if n == 0 {
-                    break;
-                }
-                if tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
-                    break;
-                }
-            }
-        });
-
-        Self {
-            fd,
-            closed,
-            rx: tokio::sync::Mutex::new(rx),
-            write_lock: std::sync::Mutex::new(()),
-            reader_thread: Mutex::new(Some(jh)),
+    pub(crate) fn new(fd: i32) -> io::Result<Self> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        if fd < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid TUN fd"));
         }
+        // Take RAII ownership immediately so even early setup failure cleanly closes fd!
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        Self::from_owned_fd(owned)
     }
-}
 
-#[cfg(unix)]
-impl Drop for UnixTunFdDevice {
-    fn drop(&mut self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut g) = self.reader_thread.lock() {
-            if let Some(jh) = g.take() {
-                let _ = jh.join();
+    pub(crate) fn from_owned_fd(owned: std::os::fd::OwnedFd) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let fd = owned.as_raw_fd();
+        // Ensure O_NONBLOCK is set (required by Tokio AsyncFd epoll edge-triggered readiness)
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 && (flags & libc::O_NONBLOCK) == 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             }
         }
-        if self.fd >= 0 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
+        // SAFETY: `owned` is an exclusively owned `OwnedFd` moved directly into `AsyncFd`,
+        // guaranteeing the underlying kernel FD remains valid for the entire registration lifetime.
+        let async_fd = unsafe { tokio::io::unix::AsyncFd::register(owned) }?;
+        Ok(Self { async_fd })
     }
 }
 
 #[cfg(unix)]
 impl PacketDevice for UnixTunFdDevice {
     async fn recv_packet(&self) -> io::Result<Vec<u8>> {
-        let mut rx = self.rx.lock().await;
-        rx.recv()
-            .await
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "TUN fd closed"))
+        use std::os::fd::AsRawFd;
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let mut guard = self.async_fd.readable().await?;
+            match guard.try_io(|inner| {
+                let fd = inner.as_raw_fd();
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN fd closed"));
+                }
+                Ok(Ok(n)) => {
+                    buf.truncate(n);
+                    return Ok(buf);
+                }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
     }
 
     async fn send_packet(&self, pkt: Vec<u8>) -> io::Result<()> {
-        if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "TUN fd closed"));
+        use std::os::fd::AsRawFd;
+        loop {
+            let mut guard = self.async_fd.writable().await?;
+            match guard.try_io(|inner| {
+                let fd = inner.as_raw_fd();
+                let n = unsafe { libc::write(fd, pkt.as_ptr() as *const c_void, pkt.len()) };
+                if n < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(_)) => return Ok(()),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
         }
-        let _guard = self
-            .write_lock
-            .lock()
-            .map_err(|_| io::Error::other("TUN write lock poisoned"))?;
-        for _ in 0..8 {
-            let n = unsafe { libc::write(self.fd, pkt.as_ptr() as *const c_void, pkt.len()) };
-            if n >= 0 {
-                return Ok(());
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if err.kind() == io::ErrorKind::WouldBlock {
-                let mut pfd = libc::pollfd {
-                    fd: self.fd,
-                    events: libc::POLLOUT,
-                    revents: 0,
-                };
-                let _ = unsafe { libc::poll(&mut pfd, 1, 50) };
-                continue;
-            }
-            return Err(err);
-        }
-        Ok(())
     }
 }
 

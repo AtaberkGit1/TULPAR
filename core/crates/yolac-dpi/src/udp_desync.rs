@@ -41,21 +41,23 @@ pub fn detect_udp_desync_target(udp_payload: &[u8], dst_port: u16) -> Option<Udp
     }
 
     // 1. Discord Voice IP Discovery: 74 bytes starting with type=0x0001, length=0x0046 (70)
-    if dst_port >= 49152
+    if dst_port >= 10_000
         && udp_payload.len() == 74
         && udp_payload[0..4] == [0x00, 0x01, 0x00, 0x46]
     {
         return Some(UdpDesyncKind::DiscordVoiceDiscovery);
     }
 
-    // 2. RFC 5389 STUN Binding Request (type 0x0001, first two bits 00, magic cookie at bytes 4..8)
+    // 2. RFC 5389 STUN Binding Request (type 0x0001, magic cookie at 4..8, exact message length match)
     if udp_payload.len() >= 20
-        && (udp_payload[0] & 0xC0) == 0
         && udp_payload[0] == 0x00
         && udp_payload[1] == 0x01
         && udp_payload[4..8] == STUN_MAGIC_COOKIE
     {
-        return Some(UdpDesyncKind::StunBinding);
+        let msg_len = u16::from_be_bytes([udp_payload[2], udp_payload[3]]) as usize;
+        if 20 + msg_len == udp_payload.len() {
+            return Some(UdpDesyncKind::StunBinding);
+        }
     }
 
     // 3. Roblox RakNet OpenConnectionRequest1 (ID 0x05 + 16-byte RakNet offline magic on UDP 49152..=65535)
@@ -79,8 +81,13 @@ pub fn build_udp_desync_decoys(raw_udp_packet: &[u8], fake_ttl: u8) -> Option<Ve
         return None;
     }
     let udp = parse_udp(ip.payload)?;
-    let decoy_payload = [0u8; 32];
-    let safe_ttl = fake_ttl.clamp(2, 5);
+    // Realistic benign STUN-like UDP decoy payload (non-zero entropy so stateful UDP DPI processes it)
+    let decoy_payload: [u8; 28] = [
+        0x00, 0x01, 0x00, 0x08, 0x21, 0x12, 0xA4, 0x42, 0x54, 0x55, 0x4C, 0x50, 0x41, 0x52, 0x01,
+        0x02, 0x03, 0x04, 0x05, 0x06, 0x80, 0x22, 0x00, 0x04, 0x69, 0x61, 0x6E, 0x61,
+    ];
+    let max_ttl = ip.ttl.saturating_sub(1).max(1);
+    let safe_ttl = fake_ttl.clamp(2, 5).min(max_ttl);
 
     let (low_ttl_pkt, mut bad_csum_pkt) = match (ip.src_ip, ip.dst_ip) {
         (IpAddr::V4(s), IpAddr::V4(d)) => (
@@ -122,17 +129,24 @@ pub fn build_udp_desync_decoys(raw_udp_packet: &[u8], fake_ttl: u8) -> Option<Ve
 const SENSITIVE_UNBLOCKED_SUFFIXES: &[&str] = &[
     "whatsapp.com",
     "whatsapp.net",
+    "wa.me",
     "gov.tr",
     "edu.tr",
+    "k12.tr",
     "bel.tr",
     "pol.tr",
     "tsk.tr",
     "garantibbva.com.tr",
+    "garanti.com.tr",
     "isbank.com.tr",
+    "isbank.com",
     "yapikredi.com.tr",
     "akbank.com",
+    "akbank.com.tr",
     "ziraatbank.com.tr",
+    "ziraatkatilim.com.tr",
     "vakifbank.com.tr",
+    "vakifkatilim.com.tr",
     "halkbank.com.tr",
     "qnb.com.tr",
     "qnbfinansbank.com",
@@ -142,20 +156,30 @@ const SENSITIVE_UNBLOCKED_SUFFIXES: &[&str] = &[
     "ing.com.tr",
     "teb.com.tr",
     "kuveytturk.com.tr",
+    "albaraka.com.tr",
+    "bkm.com.tr",
+    "troy.com.tr",
+    "iyzico.com",
 ];
 
-/// Returns `true` if `sni` belongs to a critical unblocked service that should try clean
-/// Passthrough first (falling back to full DPI desync automatically if ever reset/blocked).
+/// Zero-allocation check returning `true` if `sni` belongs to a critical unblocked service that
+/// should try clean Passthrough first (escalating to full DPI desync automatically if ever blocked).
 pub fn is_sensitive_unblocked_domain(sni: &str) -> bool {
-    let norm = sni.trim().trim_end_matches('.').to_ascii_lowercase();
-    if norm.is_empty() {
+    let trimmed = sni.trim().trim_end_matches('.');
+    if trimmed.is_empty() {
         return false;
     }
+    let bytes = trimmed.as_bytes();
     SENSITIVE_UNBLOCKED_SUFFIXES.iter().any(|&suffix| {
-        norm == suffix
-            || (norm.len() > suffix.len()
-                && norm.ends_with(suffix)
-                && norm.as_bytes()[norm.len() - suffix.len() - 1] == b'.')
+        let sb = suffix.as_bytes();
+        if bytes.len() == sb.len() {
+            bytes.eq_ignore_ascii_case(sb)
+        } else if bytes.len() > sb.len() {
+            bytes[bytes.len() - sb.len() - 1] == b'.'
+                && bytes[bytes.len() - sb.len()..].eq_ignore_ascii_case(sb)
+        } else {
+            false
+        }
     })
 }
 

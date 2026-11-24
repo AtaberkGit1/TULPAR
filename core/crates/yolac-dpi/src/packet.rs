@@ -42,6 +42,10 @@ pub struct ParsedIpPacket<'a> {
     pub dst_ip: IpAddr,
     pub protocol: IpProtocol,
     pub ttl: u8,
+    /// IPv4 identification field (`0` for IPv6).
+    pub ip_id: u16,
+    /// IPv4 Don't Fragment flag (`true` for IPv6).
+    pub df: bool,
     pub ip_header_len: usize,
     pub total_len: usize,
     pub payload: &'a [u8],
@@ -98,11 +102,13 @@ pub fn parse_ip_packet(buf: &[u8]) -> Option<ParsedIpPacket<'_>> {
             if total_len < ihl || buf.len() < total_len {
                 return None;
             }
-            // Reject fragmented non-zero-offset packets from L4 parsing
+            // Reject ALL fragmented IPv4 packets (both MF=1 first fragment and non-zero offset)
             let frag = u16::from_be_bytes([buf[6], buf[7]]);
-            if (frag & 0x1FFF) != 0 {
+            if (frag & 0x3FFF) != 0 {
                 return None;
             }
+            let ip_id = u16::from_be_bytes([buf[4], buf[5]]);
+            let df = (frag & 0x4000) != 0;
             let ttl = buf[8];
             let proto = IpProtocol::from(buf[9]);
             let src_ip = IpAddr::V4(Ipv4Addr::new(buf[12], buf[13], buf[14], buf[15]));
@@ -113,6 +119,8 @@ pub fn parse_ip_packet(buf: &[u8]) -> Option<ParsedIpPacket<'_>> {
                 dst_ip,
                 protocol: proto,
                 ttl,
+                ip_id,
+                df,
                 ip_header_len: ihl,
                 total_len,
                 payload: &buf[ihl..total_len],
@@ -158,6 +166,8 @@ pub fn parse_ip_packet(buf: &[u8]) -> Option<ParsedIpPacket<'_>> {
                 dst_ip: IpAddr::V6(Ipv6Addr::from(dst)),
                 protocol: IpProtocol::from(next_hdr),
                 ttl,
+                ip_id: 0,
+                df: true,
                 ip_header_len: offset,
                 total_len,
                 payload: &buf[offset..total_len],
@@ -202,18 +212,18 @@ pub fn parse_udp(payload: &[u8]) -> Option<ParsedUdp<'_>> {
     })
 }
 
-fn sum_words(mut sum: u32, data: &[u8]) -> u32 {
+fn sum_words(mut sum: u64, data: &[u8]) -> u64 {
     let (chunks, rem) = data.as_chunks::<2>();
     for chunk in chunks {
-        sum += u16::from_be_bytes(*chunk) as u32;
+        sum += u16::from_be_bytes(*chunk) as u64;
     }
     if let Some(&byte) = rem.first() {
-        sum += (byte as u32) << 8;
+        sum += (byte as u64) << 8;
     }
     sum
 }
 
-fn finalize_checksum(mut sum: u32) -> u16 {
+fn finalize_checksum(mut sum: u64) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
@@ -221,96 +231,96 @@ fn finalize_checksum(mut sum: u32) -> u16 {
 }
 
 pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
-    let mut sum = 0u32;
+    let mut sum = 0u64;
     let (chunks, _) = header.as_chunks::<2>();
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 5 {
             // Skip checksum field at bytes 10..12
             continue;
         }
-        sum += u16::from_be_bytes(*chunk) as u32;
+        sum += u16::from_be_bytes(*chunk) as u64;
     }
     finalize_checksum(sum)
 }
 
-fn ipv4_pseudo_sum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4_len: u16) -> u32 {
-    let mut sum = 0u32;
+fn ipv4_pseudo_sum(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, l4_len: u16) -> u64 {
+    let mut sum = 0u64;
     sum = sum_words(sum, &src.octets());
     sum = sum_words(sum, &dst.octets());
-    sum += proto as u32;
-    sum += l4_len as u32;
+    sum += proto as u64;
+    sum += l4_len as u64;
     sum
 }
 
-fn ipv6_pseudo_sum(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, l4_len: u32) -> u32 {
-    let mut sum = 0u32;
+fn ipv6_pseudo_sum(src: Ipv6Addr, dst: Ipv6Addr, proto: u8, l4_len: u32) -> u64 {
+    let mut sum = 0u64;
     sum = sum_words(sum, &src.octets());
     sum = sum_words(sum, &dst.octets());
-    sum += (l4_len >> 16) & 0xFFFF;
-    sum += l4_len & 0xFFFF;
-    sum += proto as u32;
+    sum += ((l4_len >> 16) & 0xFFFF) as u64;
+    sum += (l4_len & 0xFFFF) as u64;
+    sum += proto as u64;
     sum
 }
 
 pub fn tcp_checksum_ipv4(src: Ipv4Addr, dst: Ipv4Addr, tcp_segment: &[u8]) -> u16 {
-    let mut sum = ipv4_pseudo_sum(src, dst, 6, tcp_segment.len() as u16);
+    let mut sum = ipv4_pseudo_sum(src, dst, 6, tcp_segment.len().min(u16::MAX as usize) as u16);
     let (chunks, rem) = tcp_segment.as_chunks::<2>();
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 8 {
             // Skip checksum field at bytes 16..18
             continue;
         }
-        sum += u16::from_be_bytes(*chunk) as u32;
+        sum += u16::from_be_bytes(*chunk) as u64;
     }
     if let Some(&byte) = rem.first() {
-        sum += (byte as u32) << 8;
+        sum += (byte as u64) << 8;
     }
     finalize_checksum(sum)
 }
 
 pub fn tcp_checksum_ipv6(src: Ipv6Addr, dst: Ipv6Addr, tcp_segment: &[u8]) -> u16 {
-    let mut sum = ipv6_pseudo_sum(src, dst, 6, tcp_segment.len() as u32);
+    let mut sum = ipv6_pseudo_sum(src, dst, 6, tcp_segment.len().min(u32::MAX as usize) as u32);
     let (chunks, rem) = tcp_segment.as_chunks::<2>();
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 8 {
             continue;
         }
-        sum += u16::from_be_bytes(*chunk) as u32;
+        sum += u16::from_be_bytes(*chunk) as u64;
     }
     if let Some(&byte) = rem.first() {
-        sum += (byte as u32) << 8;
+        sum += (byte as u64) << 8;
     }
     finalize_checksum(sum)
 }
 
 pub fn udp_checksum_ipv4(src: Ipv4Addr, dst: Ipv4Addr, udp_packet: &[u8]) -> u16 {
-    let mut sum = ipv4_pseudo_sum(src, dst, 17, udp_packet.len() as u16);
+    let mut sum = ipv4_pseudo_sum(src, dst, 17, udp_packet.len().min(u16::MAX as usize) as u16);
     let (chunks, rem) = udp_packet.as_chunks::<2>();
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 3 {
             // Skip checksum field at bytes 6..8
             continue;
         }
-        sum += u16::from_be_bytes(*chunk) as u32;
+        sum += u16::from_be_bytes(*chunk) as u64;
     }
     if let Some(&byte) = rem.first() {
-        sum += (byte as u32) << 8;
+        sum += (byte as u64) << 8;
     }
     let c = finalize_checksum(sum);
     if c == 0 { 0xFFFF } else { c }
 }
 
 pub fn udp_checksum_ipv6(src: Ipv6Addr, dst: Ipv6Addr, udp_packet: &[u8]) -> u16 {
-    let mut sum = ipv6_pseudo_sum(src, dst, 17, udp_packet.len() as u32);
+    let mut sum = ipv6_pseudo_sum(src, dst, 17, udp_packet.len().min(u32::MAX as usize) as u32);
     let (chunks, rem) = udp_packet.as_chunks::<2>();
     for (i, chunk) in chunks.iter().enumerate() {
         if i == 3 {
             continue;
         }
-        sum += u16::from_be_bytes(*chunk) as u32;
+        sum += u16::from_be_bytes(*chunk) as u64;
     }
     if let Some(&byte) = rem.first() {
-        sum += (byte as u32) << 8;
+        sum += (byte as u64) << 8;
     }
     let c = finalize_checksum(sum);
     if c == 0 { 0xFFFF } else { c }
@@ -394,8 +404,11 @@ pub fn build_ipv4_tcp_packet(
     tcp_options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
-    let pad = (4 - (tcp_options.len() % 4)) % 4;
-    let tcp_hdr_len = 20 + tcp_options.len() + pad;
+    let opts = &tcp_options[..tcp_options.len().min(40)];
+    let pad = (4 - (opts.len() % 4)) % 4;
+    let tcp_hdr_len = 20 + opts.len() + pad;
+    let max_payload = (u16::MAX as usize).saturating_sub(20 + tcp_hdr_len);
+    let payload = &payload[..payload.len().min(max_payload)];
     let total_len = 20 + tcp_hdr_len + payload.len();
     let mut pkt = vec![0u8; total_len];
 
@@ -418,8 +431,8 @@ pub fn build_ipv4_tcp_packet(
     pkt[tcp_start + 12] = ((tcp_hdr_len / 4) as u8) << 4;
     pkt[tcp_start + 13] = flags;
     pkt[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
-    if !tcp_options.is_empty() {
-        pkt[tcp_start + 20..tcp_start + 20 + tcp_options.len()].copy_from_slice(tcp_options);
+    if !opts.is_empty() {
+        pkt[tcp_start + 20..tcp_start + 20 + opts.len()].copy_from_slice(opts);
     }
     pkt[tcp_start + tcp_hdr_len..].copy_from_slice(payload);
 
@@ -443,8 +456,11 @@ pub fn build_ipv6_tcp_packet(
     tcp_options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
-    let pad = (4 - (tcp_options.len() % 4)) % 4;
-    let tcp_hdr_len = 20 + tcp_options.len() + pad;
+    let opts = &tcp_options[..tcp_options.len().min(40)];
+    let pad = (4 - (opts.len() % 4)) % 4;
+    let tcp_hdr_len = 20 + opts.len() + pad;
+    let max_payload = (u16::MAX as usize).saturating_sub(tcp_hdr_len);
+    let payload = &payload[..payload.len().min(max_payload)];
     let l4_len = tcp_hdr_len + payload.len();
     let mut pkt = vec![0u8; 40 + l4_len];
 
@@ -463,8 +479,8 @@ pub fn build_ipv6_tcp_packet(
     pkt[tcp_start + 12] = ((tcp_hdr_len / 4) as u8) << 4;
     pkt[tcp_start + 13] = flags;
     pkt[tcp_start + 14..tcp_start + 16].copy_from_slice(&window.to_be_bytes());
-    if !tcp_options.is_empty() {
-        pkt[tcp_start + 20..tcp_start + 20 + tcp_options.len()].copy_from_slice(tcp_options);
+    if !opts.is_empty() {
+        pkt[tcp_start + 20..tcp_start + 20 + opts.len()].copy_from_slice(opts);
     }
     pkt[tcp_start + tcp_hdr_len..].copy_from_slice(payload);
 

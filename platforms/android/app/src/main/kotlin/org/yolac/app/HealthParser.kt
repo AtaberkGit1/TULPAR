@@ -2,6 +2,7 @@ package org.yolac.app
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 
 data class UpdateCheckUiResult(
     val status: String,
@@ -9,9 +10,15 @@ data class UpdateCheckUiResult(
     val releaseUrl: String,
 ) {
     fun isTrustedOfficialGithubReleaseUrl(): Boolean {
-        return releaseUrl.startsWith("https://github.com/") && releaseUrl.contains("/releases")
+        return releaseUrl.lowercase(Locale.US)
+            .startsWith("https://github.com/ataberkgit1/tulpar/releases")
     }
 }
+
+data class DiagnosticUiResult(
+    val ok: Boolean,
+    val summary: String,
+)
 
 object HealthParser {
     fun parseModules(rawJson: String): List<ModuleHealthItem> {
@@ -37,7 +44,14 @@ object HealthParser {
     fun formatErrorSummary(items: List<ModuleHealthItem>): String? {
         val errors = items.filter { it.status == 2 }
         if (errors.isEmpty()) return null
-        return errors.joinToString("\n") { "${it.name}: ${it.detail}" }
+        val seen = LinkedHashSet<String>()
+        val lines = mutableListOf<String>()
+        for (item in errors) {
+            if (seen.add(item.detail)) {
+                lines.add("${item.name}: ${item.detail}")
+            }
+        }
+        return lines.joinToString("\n")
     }
 
     fun parseUpdateResult(rawJson: String): UpdateCheckUiResult {
@@ -53,6 +67,21 @@ object HealthParser {
                 status = "error",
                 message = "Güncelleme yanıtı okunamadı.",
                 releaseUrl = "",
+            )
+        }
+    }
+
+    fun parseDiagnosticResult(rawJson: String): DiagnosticUiResult {
+        return try {
+            val obj = JSONObject(rawJson)
+            DiagnosticUiResult(
+                ok = obj.optBoolean("ok", false),
+                summary = obj.optString("summary", "Ağ testi sonucu okunamadı."),
+            )
+        } catch (_: Exception) {
+            DiagnosticUiResult(
+                ok = false,
+                summary = "Ağ testi yanıtı çözümlenemedi.",
             )
         }
     }

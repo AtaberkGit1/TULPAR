@@ -25,6 +25,9 @@ const CAPTIVE_PORTAL_PROBES: &[&str] = &[
     "detectportal.firefox.com",
     "nmcheck.gnome.org",
     "networkcheck.kde.org",
+    "connect.rom.miui.com",
+    "connectivitycheck.platform.hicloud.com",
+    "d2uzsrnmmf6mrj.cloudfront.net",
 ];
 
 /// Returns `true` if `domain` is a standard OS/browser captive-portal connectivity check host.
@@ -103,7 +106,7 @@ impl CaptivePortalMonitor {
     ) -> bool {
         if consecutive_dns_failures >= 2 && is_captive_portal_probe_domain(qname) {
             if let Ok(mut guard) = self.bypass_started_at.lock() {
-                if guard.is_none() {
+                if guard.is_none_or(|started| started.elapsed() >= self.max_duration) {
                     *guard = Some(Instant::now());
                 }
             }
@@ -115,7 +118,7 @@ impl CaptivePortalMonitor {
     /// Manually activates temporary portal allowance (bounded by `max_duration`).
     pub fn trigger_portal_bypass(&self) {
         if let Ok(mut guard) = self.bypass_started_at.lock() {
-            if guard.is_none() {
+            if guard.is_none_or(|started| started.elapsed() >= self.max_duration) {
                 *guard = Some(Instant::now());
             }
         }

@@ -27,10 +27,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Build & Test TULPAR Windows (.exe)
         working-directory: platforms/windows
         run: |
           cargo test
+          cargo clippy --all-targets -- -D warnings
           cargo build --release
       - uses: actions/upload-artifact@v4
         with:
@@ -52,7 +55,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
-      - name: Build Android Rust JNI & Test + Assemble APK
+      - name: Build Android Rust JNI & Test + Lint + Assemble APK
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
@@ -76,31 +79,8 @@ jobs:
             keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TULPAR,O=TULPAR,C=TR"
           fi
           cd ../platforms/android
-          gradle testDebugUnitTest assembleRelease --no-daemon
+          gradle testDebugUnitTest lintVitalRelease assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: tulpar-android-apk
           path: platforms/android/app/build/outputs/apk/release/*.apk
-
-  ios-ipa:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
-      - name: Build XCFramework & Unsigned iOS Archive (.ipa)
-        run: |
-          brew install xcodegen
-          chmod +x platforms/ios/scripts/build-xcframework.sh
-          ./platforms/ios/scripts/build-xcframework.sh
-          cd platforms/ios
-          xcodegen generate
-          xcodebuild -project Yolac.xcodeproj -scheme YolacApp -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
-          mkdir -p build/ipa/Payload
-          cp -R build/Build/Products/Release-iphoneos/TULPAR.app build/ipa/Payload/
-          (cd build/ipa && zip -qr ../tulpar-ios-unsigned.ipa Payload)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tulpar-ios-ipa-unsigned
-          path: platforms/ios/build/tulpar-ios-unsigned.ipa

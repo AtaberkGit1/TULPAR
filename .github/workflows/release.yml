@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.2.0)"
+        description: "Release tag (e.g. v0.4.0)"
         required: true
-        default: "v0.2.0"
+        default: "v0.4.0"
 
 permissions:
   contents: write
@@ -26,7 +26,7 @@ jobs:
           YOLAC_GITHUB_REPO: ${{ github.repository }}
         run: |
           cd platforms/windows
-          Invoke-WebRequest -Uri "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip" -OutFile "wd.zip"
+          Invoke-WebRequest -Uri "https://reqrypt.org/download/WinDivert-2.2.2-A.zip" -OutFile "wd.zip"
           Expand-Archive -Path wd.zip -DestinationPath wd
           $dllHash = (Get-FileHash "wd/WinDivert-2.2.2-A/x64/WinDivert.dll" -Algorithm SHA256).Hash.ToLower()
           $sysHash = (Get-FileHash "wd/WinDivert-2.2.2-A/x64/WinDivert64.sys" -Algorithm SHA256).Hash.ToLower()
@@ -63,7 +63,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
-      - name: Build Android Rust JNI + JUnit Tests + APK (.apk)
+      - name: Build Android Rust JNI + JUnit Tests + Lint + APK (.apk)
         env:
           YOLAC_GITHUB_REPO: ${{ github.repository }}
         run: |
@@ -89,39 +89,13 @@ jobs:
             keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TULPAR,O=TULPAR,C=TR"
           fi
           cd ../platforms/android
-          gradle testDebugUnitTest assembleRelease --no-daemon
+          gradle testDebugUnitTest lintVitalRelease assembleRelease --no-daemon
           ls -lh app/build/outputs/apk/release/
           cp app/build/outputs/apk/release/app-release.apk tulpar.apk
       - uses: actions/upload-artifact@v4
         with:
           name: release-android
           path: platforms/android/tulpar.apk
-
-  build-ios-release:
-    runs-on: macos-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-ios,aarch64-apple-ios-sim
-      - name: Build iOS XCFramework & Unsigned IPA (.ipa)
-        env:
-          YOLAC_GITHUB_REPO: ${{ github.repository }}
-        run: |
-          brew install xcodegen
-          chmod +x platforms/ios/scripts/build-xcframework.sh
-          ./platforms/ios/scripts/build-xcframework.sh
-          cd platforms/ios
-          xcodegen generate
-          xcodebuild -project Yolac.xcodeproj -scheme YolacApp -configuration Release -sdk iphoneos -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
-          mkdir -p build/ipa/Payload
-          cp -R build/Build/Products/Release-iphoneos/TULPAR.app build/ipa/Payload/
-          (cd build/ipa && zip -qr ../tulpar-ios-unsigned.ipa Payload)
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-ios
-          path: platforms/ios/build/tulpar-ios-unsigned.ipa
 
   publish-github-release:
     needs: [build-windows-release, build-android-release]
@@ -151,20 +125,3 @@ jobs:
           else
             gh release create "$TAG" release-assets/* --repo "$REPO" --title "TULPAR $TAG" --notes "$NOTES"
           fi
-
-  publish-ios-release:
-    needs: [publish-github-release, build-ios-release]
-    if: ${{ needs.build-ios-release.result == 'success' }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-ios
-          path: release-ios
-      - name: Upload iOS Unsigned IPA to Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
-          REPO="${{ github.repository }}"
-          gh release upload "$TAG" release-ios/tulpar-ios-unsigned.ipa --repo "$REPO" --clobber

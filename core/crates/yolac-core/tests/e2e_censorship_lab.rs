@@ -1092,6 +1092,7 @@ async fn test_9_turkey_isp_stateful_dpi_blocks_weak_split_but_multi_record_and_e
     let btk_resp = yolac_dns::wire::DnsResponse {
         id: 77,
         rcode: 0,
+        truncated: false,
         qname: "www.roblox.com".into(),
         qtype: QType::A,
         answers: vec![yolac_dns::wire::DnsAnswer {
@@ -1251,4 +1252,120 @@ async fn test_10_whatsapp_non_tls_server_first_and_tun_abort_rst_failover() {
 
     let _ = shut_tx.send(true);
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn test_11_v0_4_rfc6864_rst_blocklist_precision_and_http_post_streaming() {
+    // 1. RFC 6864: Legitimate Linux/Cloudflare IPv4 RST with DF=1 and IP.ID=0 and matching TTL
+    //    MUST NOT be dropped as forged passive DPI RST!
+    let mut legit_rst = build_ipv4_tcp_packet(
+        Ipv4Addr::new(104, 18, 2, 1),
+        Ipv4Addr::new(192, 168, 1, 10),
+        443,
+        55000,
+        100,
+        200,
+        ParsedTcp::RST | ParsedTcp::ACK,
+        0,
+        56,
+        0, // IP.ID = 0 with DF = 1 (standard Linux kernel)
+        &[],
+        &[],
+    );
+    assert!(
+        !yolac_dpi::is_forged_passive_dpi_rst(&legit_rst, Some(56)),
+        "RFC 6864 Linux/Cloudflare RST (DF=1, IP.ID=0, matching TTL) must NOT be misclassified as forged"
+    );
+    // Forged passive DPI RST with TTL mismatch (>= 3 hops) IS caught:
+    assert!(
+        yolac_dpi::is_forged_passive_dpi_rst(&legit_rst, Some(52)),
+        "Passive DPI RST with TTL delta >= 3 must be detected and dropped"
+    );
+    // Forged passive DPI RST with DF=0 and IP.ID=0 IS caught:
+    legit_rst[6] &= !0x40; // clear DF bit
+    let ip_csum = yolac_dpi::ipv4_header_checksum(&legit_rst[..20]);
+    legit_rst[10..12].copy_from_slice(&ip_csum.to_be_bytes());
+    assert!(
+        yolac_dpi::is_forged_passive_dpi_rst(&legit_rst, Some(56)),
+        "Classic passive DPI RST (DF=0, IP.ID=0) must be detected and dropped"
+    );
+
+    // 2. Upgraded Blocklist: zero false positives on previously broken SaaS/app domains + Turkish ad networks blocked
+    let bl = Blocklist::embedded_default();
+    for essential in [
+        "branch.io",
+        "onesignal.com",
+        "intercom.io",
+        "hubspot.com",
+        "disqus.com",
+        "connect.facebook.net",
+        "cdn.cookielaw.org",
+    ] {
+        assert!(!bl.is_blocked(essential), "False positive still present: {essential}");
+    }
+    for tr_ad in ["admatic.com.tr", "reklamstore.com", "hit.gemius.pl", "telemetry.roblox.com"] {
+        assert!(bl.is_blocked(tr_ad), "High-hit Turkish/global ad/tracker missing: {tr_ad}");
+    }
+
+    // 3. Large HTTP POST (> 8 KB) through DpiTcpRelay must stream cleanly without 2.5s deadlock or duplicate POSTs!
+    let post_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let post_hits_srv = Arc::clone(&post_hits);
+    let post_srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let post_addr = post_srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = post_srv.accept().await {
+            let hits = Arc::clone(&post_hits_srv);
+            tokio::spawn(async move {
+                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut total = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while let Ok(n) = s.read(&mut tmp).await {
+                    if n == 0 {
+                        break;
+                    }
+                    total.extend_from_slice(&tmp[..n]);
+                    if total.len() >= 10_000 {
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                        let _ = s.flush().await;
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let relay = Arc::new(DpiTcpRelay::new(
+        Arc::new(NoopProtector),
+        Arc::new(NoopStrategyAdvisor {
+            default_strategy: DpiStrategy::TlsMultiRecordAndTcpSplit,
+        }),
+    ));
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = proxy.accept().await {
+            let _ = relay.relay_stream(sock, post_addr).await;
+        }
+    });
+
+    let mut cli = TcpStream::connect(proxy_addr).await.unwrap();
+    let body = vec![b'X'; 10_000];
+    let header = format!(
+        "POST /upload HTTP/1.1\r\nHost: api.example.org\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    cli.write_all(header.as_bytes()).await.unwrap();
+    cli.write_all(&body).await.unwrap();
+    cli.flush().await.unwrap();
+    let mut resp = [0u8; 128];
+    let n = tokio::time::timeout(Duration::from_secs(2), cli.read(&mut resp))
+        .await
+        .expect("Large HTTP POST must never deadlock waiting for server response before sending body")
+        .unwrap();
+    assert!(std::str::from_utf8(&resp[..n]).unwrap_or("").contains("200 OK"));
+    assert_eq!(
+        post_hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "Non-idempotent HTTP POST must NEVER be duplicated/retried!"
+    );
 }

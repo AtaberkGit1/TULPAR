@@ -16,9 +16,9 @@ pub mod resolver;
 pub mod upstream;
 pub mod wire;
 
-pub use cache::DnsCache;
-pub use poison::{detect_poisoning, PoisonReason};
-pub use resolver::{DnsConfig, DnsEngine, DnsOutcome, DnsStatsSnapshot};
+pub use cache::{CacheLookup, DnsCache};
+pub use poison::{detect_poisoning, detect_poisoning_tls, PoisonReason};
+pub use resolver::{DnsConfig, DnsEngine, DnsOutcome, DnsStatsSnapshot, UpstreamBenchmark};
 pub use upstream::{default_public_upstreams, UpstreamConfig, UpstreamProtocol};
 pub use wire::{
     build_blocked_response, build_empty_noerror_response, parse_dns_query, parse_dns_response,

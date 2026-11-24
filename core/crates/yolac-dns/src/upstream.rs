@@ -144,6 +144,17 @@ pub fn default_rustls_config() -> Arc<ClientConfig> {
     Arc::new(cfg)
 }
 
+/// RFC 7858 / RFC 7301 ALPN-compliant TLS config for DNS-over-TLS (port 853, ALPN = "dot").
+pub fn default_dot_rustls_config() -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"dot".to_vec()];
+    Arc::new(cfg)
+}
+
 /// Wraps a `TcpStream` to fragment the very first TLS ClientHello write across TLS records
 /// so DoH/DoT connections also evade SNI-based DPI middleboxes.
 pub(crate) struct DpiEvasiveTlsStream {
@@ -188,6 +199,12 @@ impl AsyncWrite for DpiEvasiveTlsStream {
             let this = &mut *self;
             let remaining = &this.pending_tail[this.tail_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "failed to flush fragmented TLS ClientHello",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.tail_pos += n;
                     if this.tail_pos >= this.pending_tail.len() {
@@ -240,14 +257,18 @@ impl AsyncWrite for DpiEvasiveTlsStream {
             let this = &mut *self;
             let remaining = &this.pending_tail[this.tail_pos..];
             match Pin::new(&mut this.inner).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero during TLS flush",
+                    )));
+                }
                 Poll::Ready(Ok(n)) => {
                     this.tail_pos += n;
                     if this.tail_pos < this.pending_tail.len() {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
-                    this.pending_tail.clear();
-                    this.tail_pos = 0;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
@@ -346,7 +367,7 @@ pub(crate) async fn exchange_on_tls_stream(
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 DoH headers"))?
                 .to_string();
             let status_line = header_str.lines().next().unwrap_or("");
-            if !status_line.contains(" 200") {
+            if status_line.split_whitespace().nth(1) != Some("200") {
                 return Err(io::Error::other(format!(
                     "DoH upstream returned HTTP status: {status_line}"
                 )));
@@ -356,6 +377,10 @@ pub(crate) async fn exchange_on_tls_stream(
                 let lower = l.to_ascii_lowercase();
                 lower.starts_with("connection:") && lower.contains("close")
             });
+            let is_chunked = header_str.lines().any(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower.starts_with("transfer-encoding:") && lower.contains("chunked")
+            });
             let content_len = header_str.lines().find_map(|l| {
                 let lower = l.to_ascii_lowercase();
                 lower
@@ -363,9 +388,19 @@ pub(crate) async fn exchange_on_tls_stream(
                     .and_then(|v| v.trim().parse::<usize>().ok())
             });
 
+            const MAX_DNS_BODY: usize = 65_535;
             let body_start = hdr_end + 4;
             if let Some(clen) = content_len {
-                while raw.len() < body_start + clen {
+                if clen > MAX_DNS_BODY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DoH Content-Length exceeds 65535 bytes",
+                    ));
+                }
+                let exact_end = body_start
+                    .checked_add(clen)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "DoH length overflow"))?;
+                while raw.len() < exact_end {
                     let n = tls.read(&mut tmp).await?;
                     if n == 0 {
                         return Err(io::Error::new(
@@ -375,12 +410,42 @@ pub(crate) async fn exchange_on_tls_stream(
                     }
                     raw.extend_from_slice(&tmp[..n]);
                 }
-                let exact_end = body_start + clen;
                 let reusable = !server_wants_close && raw.len() == exact_end;
                 return Ok((raw[body_start..exact_end].to_vec(), reusable));
             }
 
+            if is_chunked {
+                // Incremental chunked decoding: terminates immediately on `0\r\n\r\n` instead of
+                // blocking 2.5s waiting for keep-alive TCP EOF!
+                loop {
+                    if let Some((decoded, consumed)) = try_decode_chunked_complete(&raw[body_start..])? {
+                        let reusable = !server_wants_close && body_start + consumed == raw.len();
+                        return Ok((decoded, reusable));
+                    }
+                    if raw.len().saturating_sub(body_start) > MAX_DNS_BODY + 1024 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "chunked DoH body too large",
+                        ));
+                    }
+                    let n = tls.read(&mut tmp).await?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "truncated chunked DoH body",
+                        ));
+                    }
+                    raw.extend_from_slice(&tmp[..n]);
+                }
+            }
+
             loop {
+                if raw.len().saturating_sub(body_start) > MAX_DNS_BODY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "DoH body exceeds 65535 bytes",
+                    ));
+                }
                 match tls.read(&mut tmp).await {
                     Ok(0) => break,
                     Ok(n) => raw.extend_from_slice(&tmp[..n]),
@@ -427,14 +492,18 @@ fn parse_http_dns_body(header_str: &str, body: &[u8]) -> io::Result<Vec<u8>> {
     }
 }
 
-fn decode_chunked_body(mut body: &[u8]) -> io::Result<Vec<u8>> {
+/// Incrementally decodes an HTTP/1.1 chunked body.
+/// Returns `Ok(Some((decoded, bytes_consumed)))` as soon as the final `0\r\n...\r\n` terminator arrives,
+/// `Ok(None)` if more bytes need to be read from the TLS stream, or `Err` on malformed/oversized framing.
+fn try_decode_chunked_complete(body: &[u8]) -> io::Result<Option<(Vec<u8>, usize)>> {
+    const MAX_DECODED: usize = 65_535;
     let mut out = Vec::new();
+    let mut pos = 0usize;
     loop {
-        let line_end = body
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid chunked encoding"))?;
-        let size_str = std::str::from_utf8(&body[..line_end])
+        let Some(rel_end) = body[pos..].windows(2).position(|w| w == b"\r\n") else {
+            return Ok(None);
+        };
+        let size_str = std::str::from_utf8(&body[pos..pos + rel_end])
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk hex"))?
             .split(';')
             .next()
@@ -442,17 +511,46 @@ fn decode_chunked_body(mut body: &[u8]) -> io::Result<Vec<u8>> {
             .trim();
         let size = usize::from_str_radix(size_str, 16)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid chunk size"))?;
-        body = &body[line_end + 2..];
+        pos += rel_end + 2;
         if size == 0 {
-            break;
+            // Expect terminating `\r\n` (or optional trailers followed by `\r\n\r\n`)
+            if body.len() >= pos + 2 && &body[pos..pos + 2] == b"\r\n" {
+                return Ok(Some((out, pos + 2)));
+            }
+            if let Some(tr_end) = body[pos..].windows(4).position(|w| w == b"\r\n\r\n") {
+                return Ok(Some((out, pos + tr_end + 4)));
+            }
+            return Ok(None);
         }
-        if body.len() < size + 2 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated chunk"));
+        if out.len().saturating_add(size) > MAX_DECODED {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked DoH payload exceeds 65535 bytes",
+            ));
         }
-        out.extend_from_slice(&body[..size]);
-        body = &body[size + 2..];
+        let end_with_crlf = pos
+            .checked_add(size)
+            .and_then(|v| v.checked_add(2))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk size overflow"))?;
+        if body.len() < end_with_crlf {
+            return Ok(None);
+        }
+        if &body[pos + size..end_with_crlf] != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing CRLF after chunk",
+            ));
+        }
+        out.extend_from_slice(&body[pos..pos + size]);
+        pos = end_with_crlf;
     }
-    Ok(out)
+}
+
+fn decode_chunked_body(body: &[u8]) -> io::Result<Vec<u8>> {
+    match try_decode_chunked_complete(body)? {
+        Some((decoded, _)) => Ok(decoded),
+        None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated chunk")),
+    }
 }
 
 #[cfg(test)]

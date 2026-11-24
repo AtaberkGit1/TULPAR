@@ -38,8 +38,9 @@ mod win_impl {
         NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, SetForegroundWindow,
-        TrackPopupMenu, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, LoadIconW, PostMessageW,
+        SetForegroundWindow, TrackPopupMenu, IDI_APPLICATION, MF_SEPARATOR, MF_STRING,
+        TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_NULL,
     };
 
     const TRAY_ICON_ID: u32 = 1;
@@ -119,6 +120,8 @@ mod win_impl {
             hwnd,
             std::ptr::null(),
         );
+        // Win32 KB135788: post WM_NULL so clicking outside dismisses cleanly on next right-click
+        let _ = PostMessageW(hwnd, WM_NULL, 0, 0);
         let _ = DestroyMenu(menu);
     }
 }

@@ -1,6 +1,16 @@
-//! Android JNI bridge (`org.yolac.app.YolacNative`) using `jni` crate.
+//! Panic-safe Android JNI bridge (`org.yolac.app.YolacNative`) using `jni` crate.
+//!
+//! v0.4.0 Upgrades:
+//! - RAII `OwnedFd` closes TUN fd deterministically on any early error (zero kernel FD leaks)
+//! - Zero-overhead `protect_fd()` fast-path when `self_app_excluded && !is_lockdown` (0 µs!)
+//! - Permanent Tokio worker JVM attachment (`attach_current_thread_permanently`) when protect IS needed
+//! - Non-initializing `try_get_holder()` keeps cold-start Main Thread instant
+//! - `nativeStop` swaps out engine to immediately release `YolacVpnService` GlobalRef
+//! - Live Rust -> Kotlin state callback (`onNativeStateChanged`) + `nativeRunDiagnosticsJson`
 
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use jni::objects::{GlobalRef, JClass, JObject, JValue};
@@ -12,16 +22,21 @@ use yolac_net::SocketProtector;
 struct JniVpnProtector {
     jvm: JavaVM,
     vpn_service: GlobalRef,
-    /// When `VpnService.Builder.addDisallowedApplication(packageName)` succeeded, Android's kernel
-    /// already routes all sockets created by TULPAR outside the VPN tunnel. Calling `protect(fd)`
-    /// remains active for defense-in-depth, while avoiding false `PermissionDenied` errors on
-    /// strict OEM ROMs where `protect(fd)` can return false for already-disallowed packages.
     self_app_excluded: bool,
+    is_lockdown: bool,
 }
 
 impl SocketProtector for JniVpnProtector {
     fn protect_fd(&self, fd: i32) -> io::Result<()> {
-        let mut env = match self.jvm.attach_current_thread() {
+        // Fast path: when Android UID exclusion (`addDisallowedApplication(packageName)`) succeeded
+        // and VPN Lockdown is NOT active, Android's netd kernel routing ALREADY bypasses the VPN
+        // for every socket owned by TULPAR -> 0 µs overhead, zero Binder IPC!
+        if self.self_app_excluded && !self.is_lockdown {
+            return Ok(());
+        }
+
+        // Permanent thread attachment avoids repeated JVM attach/detach overhead on Tokio workers
+        let mut env = match self.jvm.attach_current_thread_permanently() {
             Ok(e) => e,
             Err(e) => {
                 if self.self_app_excluded {
@@ -68,6 +83,11 @@ struct AndroidRuntimeHolder {
 
 static GLOBAL_ANDROID_RUNTIME: Mutex<Option<Arc<AndroidRuntimeHolder>>> = Mutex::new(None);
 
+fn try_get_holder() -> Option<Arc<AndroidRuntimeHolder>> {
+    let guard = GLOBAL_ANDROID_RUNTIME.lock().ok()?;
+    guard.as_ref().map(Arc::clone)
+}
+
 fn get_or_init_holder() -> Option<Arc<AndroidRuntimeHolder>> {
     let mut guard = GLOBAL_ANDROID_RUNTIME.lock().ok()?;
     if let Some(h) = guard.as_ref() {
@@ -87,6 +107,13 @@ fn get_or_init_holder() -> Option<Arc<AndroidRuntimeHolder>> {
     Some(holder)
 }
 
+fn new_jstring_or_empty(env: &JNIEnv, s: &str) -> jstring {
+    env.new_string(s)
+        .or_else(|_| env.new_string(""))
+        .map(|js| js.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
     env: JNIEnv,
@@ -95,38 +122,90 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
     tun_fd: jint,
     block_unprotected_ipv6: jboolean,
     self_app_excluded: jboolean,
+    is_lockdown: jboolean,
 ) -> jboolean {
-    let Ok(jvm) = env.get_java_vm() else {
-        return JNI_FALSE;
-    };
-    let Ok(service_ref) = env.new_global_ref(vpn_service) else {
-        return JNI_FALSE;
-    };
-    let Some(holder) = get_or_init_holder() else {
-        return JNI_FALSE;
-    };
-
-    let mut cfg = YolacConfig::mobile_android();
-    if block_unprotected_ipv6 == JNI_TRUE {
-        cfg.ipv6_mode = yolac_net::Ipv6LeakMode::BlockUnprotectedIpv6;
-    }
-
-    let protector = Arc::new(JniVpnProtector {
-        jvm,
-        vpn_service: service_ref,
-        self_app_excluded: self_app_excluded == JNI_TRUE,
-    });
-    let engine = Arc::new(YolacEngine::new(cfg, Some(protector)));
-    let dev = Arc::new(crate::UnixTunFdDevice::new(tun_fd));
-
-    let res = holder.rt.block_on(engine.start_tun(dev));
-    if res.is_err() {
+    // Take RAII ownership of tun_fd IMMEDIATELY so any early error/panic closes it cleanly!
+    if tun_fd < 0 {
         return JNI_FALSE;
     }
-    if let Ok(mut eng_guard) = holder.engine.lock() {
-        *eng_guard = engine;
-    }
-    JNI_TRUE
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+
+    catch_unwind(AssertUnwindSafe(move || {
+        let Ok(jvm) = env.get_java_vm() else {
+            return JNI_FALSE;
+        };
+        let Ok(service_ref) = env.new_global_ref(vpn_service) else {
+            return JNI_FALSE;
+        };
+        let Some(holder) = get_or_init_holder() else {
+            return JNI_FALSE;
+        };
+
+        let mut cfg = YolacConfig::mobile_android();
+        if block_unprotected_ipv6 == JNI_TRUE {
+            cfg.ipv6_mode = yolac_net::Ipv6LeakMode::BlockUnprotectedIpv6;
+        }
+
+        let state_service_ref = service_ref.clone();
+        let state_jvm = match env.get_java_vm() {
+            Ok(j) => Some(j),
+            Err(_) => None,
+        };
+
+        let protector = Arc::new(JniVpnProtector {
+            jvm,
+            vpn_service: service_ref,
+            self_app_excluded: self_app_excluded == JNI_TRUE,
+            is_lockdown: is_lockdown == JNI_TRUE,
+        });
+        let engine = Arc::new(YolacEngine::new(cfg, Some(protector)));
+
+        let _rt_guard = holder.rt.enter();
+        let Ok(dev) = crate::UnixTunFdDevice::from_owned_fd(owned_fd) else {
+            return JNI_FALSE;
+        };
+        let dev = Arc::new(dev);
+
+        // Stop any previous running engine first & carry forward manual update-check result
+        let prev_engine = holder.engine.lock().ok().map(|g| Arc::clone(&g));
+        if let Some(old) = prev_engine {
+            engine
+                .health_monitor()
+                .carry_update_state_from(old.health_monitor());
+            holder.rt.block_on(old.stop());
+        }
+
+        if holder.rt.block_on(engine.start_tun(dev)).is_err() {
+            return JNI_FALSE;
+        }
+
+        // Propagate unexpected engine death/state changes back to Kotlin YolacVpnService
+        if let Some(cb_jvm) = state_jvm {
+            let mut rx = engine.subscribe_state();
+            holder.rt.spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let st = rx.borrow().as_u8() as jint;
+                    if let Ok(mut cb_env) = cb_jvm.attach_current_thread_permanently() {
+                        let res = cb_env.call_method(
+                            state_service_ref.as_obj(),
+                            "onNativeStateChanged",
+                            "(I)V",
+                            &[JValue::Int(st)],
+                        );
+                        if res.is_err() {
+                            let _ = cb_env.exception_clear();
+                        }
+                    }
+                }
+            });
+        }
+
+        if let Ok(mut eng_guard) = holder.engine.lock() {
+            *eng_guard = engine;
+        }
+        JNI_TRUE
+    }))
+    .unwrap_or(JNI_FALSE)
 }
 
 #[no_mangle]
@@ -134,12 +213,21 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStop(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    if let Some(holder) = get_or_init_holder() {
-        let eng = holder.engine.lock().ok().map(|g| Arc::clone(&g));
-        if let Some(engine) = eng {
-            holder.rt.block_on(engine.stop());
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(holder) = try_get_holder() {
+            let fresh_inactive = Arc::new(YolacEngine::new(YolacConfig::mobile_android(), None));
+            let old_opt = holder.engine.lock().ok().map(|mut g| {
+                fresh_inactive
+                    .health_monitor()
+                    .carry_update_state_from(g.health_monitor());
+                std::mem::replace(&mut *g, fresh_inactive)
+            });
+            if let Some(old_engine) = old_opt {
+                // Stopping and dropping `old_engine` immediately releases `YolacVpnService` GlobalRef!
+                holder.rt.block_on(old_engine.stop());
+            }
         }
-    }
+    }));
 }
 
 #[no_mangle]
@@ -147,12 +235,16 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeGetState(
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
-    if let Some(holder) = get_or_init_holder() {
-        if let Ok(guard) = holder.engine.lock() {
-            return guard.state().as_u8() as jint;
+    catch_unwind(AssertUnwindSafe(|| {
+        // Never spin up Tokio runtime on cold-start MainActivity.onResume()!
+        if let Some(holder) = try_get_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                return guard.state().as_u8() as jint;
+            }
         }
-    }
-    0
+        0
+    }))
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -160,12 +252,29 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeNotifyNetworkChange(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    if let Some(holder) = get_or_init_holder() {
-        let _rt_guard = holder.rt.enter();
-        if let Ok(guard) = holder.engine.lock() {
-            guard.notify_network_change();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(holder) = try_get_holder() {
+            let _rt_guard = holder.rt.enter();
+            if let Ok(guard) = holder.engine.lock() {
+                guard.notify_network_change();
+            }
         }
-    }
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeSetDynamicIpv6Block(
+    _env: JNIEnv,
+    _class: JClass,
+    block: jboolean,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(holder) = try_get_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                guard.set_dynamic_ipv6_block(block == JNI_TRUE);
+            }
+        }
+    }));
 }
 
 #[no_mangle]
@@ -173,18 +282,19 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeGetHealthJson(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let json = if let Some(holder) = get_or_init_holder() {
-        if let Ok(guard) = holder.engine.lock() {
-            health_reports_to_json(&guard.health_snapshot())
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = if let Some(holder) = get_or_init_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                health_reports_to_json(&guard.health_snapshot())
+            } else {
+                "[]".to_string()
+            }
         } else {
             "[]".to_string()
-        }
-    } else {
-        "[]".to_string()
-    };
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+        };
+        new_jstring_or_empty(&env, &json)
+    }))
+    .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -192,19 +302,41 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeCheckUpdatesJson(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let json = if let Some(holder) = get_or_init_holder() {
-        let eng = holder.engine.lock().ok().map(|g| Arc::clone(&g));
-        if let Some(engine) = eng {
-            holder.rt.block_on(engine.check_updates_manual(None)).to_json()
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = if let Some(holder) = get_or_init_holder() {
+            let eng = holder.engine.lock().ok().map(|g| Arc::clone(&g));
+            if let Some(engine) = eng {
+                holder.rt.block_on(engine.check_updates_manual(None)).to_json()
+            } else {
+                "{\"status\":\"error\",\"message\":\"Motor hazır değil.\",\"release_url\":\"\"}".into()
+            }
         } else {
-            "{\"status\":\"error\",\"message\":\"Motor hazır değil.\",\"release_url\":\"\"}".into()
-        }
-    } else {
-        "{\"status\":\"error\",\"message\":\"Çalışma zamanı başlatılamadı.\",\"release_url\":\"\"}".into()
-    };
-    env.new_string(json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+            "{\"status\":\"error\",\"message\":\"Çalışma zamanı başlatılamadı.\",\"release_url\":\"\"}".into()
+        };
+        new_jstring_or_empty(&env, &json)
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeRunDiagnosticsJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = if let Some(holder) = get_or_init_holder() {
+            let eng = holder.engine.lock().ok().map(|g| Arc::clone(&g));
+            if let Some(engine) = eng {
+                holder.rt.block_on(engine.run_live_diagnostics()).to_json()
+            } else {
+                "{\"ok\":false,\"summary\":\"Motor hazır değil.\"}".into()
+            }
+        } else {
+            "{\"ok\":false,\"summary\":\"Çalışma zamanı başlatılamadı.\"}".into()
+        };
+        new_jstring_or_empty(&env, &json)
+    }))
+    .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
@@ -213,16 +345,18 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeReportPlatformError(
     _class: JClass,
     error_code: jint,
 ) {
-    if let Some(holder) = get_or_init_holder() {
-        if let Ok(guard) = holder.engine.lock() {
-            let code = match error_code {
-                1 => ErrorCode::PermissionDenied,
-                2 => ErrorCode::TunSetupFailed,
-                3 => ErrorCode::DriverMissing,
-                4 => ErrorCode::AlreadyRunning,
-                _ => ErrorCode::InternalError,
-            };
-            guard.record_platform_error(code);
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(holder) = get_or_init_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                let code = match error_code {
+                    1 => ErrorCode::PermissionDenied,
+                    2 => ErrorCode::TunSetupFailed,
+                    3 => ErrorCode::DriverMissing,
+                    4 => ErrorCode::AlreadyRunning,
+                    _ => ErrorCode::InternalError,
+                };
+                guard.record_platform_error(code);
+            }
         }
-    }
+    }));
 }

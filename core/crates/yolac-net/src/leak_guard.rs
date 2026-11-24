@@ -78,7 +78,7 @@ impl LeakGuard {
             }
             IpProtocol::Tcp if self.block_plaintext_dns_tcp_bypass => {
                 if let Some(tcp) = parse_tcp(ip.payload) {
-                    if tcp.dst_port == 53 {
+                    if matches!(tcp.dst_port, 53 | 853) {
                         return LeakDecision::BlockDnsBypassTcp;
                     }
                 }

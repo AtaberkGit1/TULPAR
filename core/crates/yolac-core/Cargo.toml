@@ -7,7 +7,6 @@ description = "YOLAÇ core orchestrator, adaptive DPI strategy selector, and zer
 
 [dependencies]
 tokio.workspace = true
-rand.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
@@ -17,4 +16,5 @@ yolac-dns = { path = "../yolac-dns" }
 yolac-net = { path = "../yolac-net" }
 
 [dev-dependencies]
+rand.workspace = true
 rcgen = "0.13"

@@ -5,11 +5,13 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
+import android.view.MotionEvent
 import android.view.View
 import kotlin.math.min
 
 /**
  * Minimalist single centered circular toggle button matching docs/DESIGN_SPEC.md.
+ * Restricts touch hit-testing to the circular button area so accidental background taps are ignored.
  */
 class YolacButtonView(context: Context) : View(context) {
 
@@ -43,6 +45,7 @@ class YolacButtonView(context: Context) : View(context) {
         strokeCap = Paint.Cap.ROUND
     }
     private val arcRect = RectF()
+    private var trackingInsideCircle = false
 
     init {
         isClickable = true
@@ -64,6 +67,45 @@ class YolacButtonView(context: Context) : View(context) {
         val minDimDp = min(width, height) / density
         val targetDp = (minDimDp * 0.42f).coerceIn(160f, 220f)
         return targetDp * density
+    }
+
+    private fun isInsideButtonCircle(x: Float, y: Float): Boolean {
+        val cx = width / 2f
+        val cy = height / 2f
+        val hitRadius = (buttonDiameterPx() / 2f) * 1.08f
+        val dx = x - cx
+        val dy = y - cy
+        return (dx * dx + dy * dy) <= (hitRadius * hitRadius)
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (!isInsideButtonCircle(event.x, event.y)) {
+                    trackingInsideCircle = false
+                    return false
+                }
+                trackingInsideCircle = true
+                return true
+            }
+            MotionEvent.ACTION_UP -> {
+                val fire = trackingInsideCircle && isInsideButtonCircle(event.x, event.y)
+                trackingInsideCircle = false
+                if (fire) {
+                    performClick()
+                }
+                return fire
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                trackingInsideCircle = false
+                return false
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    override fun performClick(): Boolean {
+        return super.performClick()
     }
 
     override fun onDraw(canvas: Canvas) {

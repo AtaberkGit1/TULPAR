@@ -76,7 +76,12 @@ pub fn segment_tcp_packet(raw_packet: &[u8], split_at: usize) -> Option<(Vec<u8>
         return None;
     }
     let tcp = parse_tcp(ip.payload)?;
-    if tcp.payload.len() < 2 || split_at == 0 || split_at >= tcp.payload.len() {
+    // Reject TCP Fast Open SYN+payload packets (SYN consumes 1 seq number and must not be duplicated)
+    if (tcp.flags & ParsedTcp::SYN) != 0
+        || tcp.payload.len() < 2
+        || split_at == 0
+        || split_at >= tcp.payload.len()
+    {
         return None;
     }
 
@@ -94,6 +99,7 @@ pub fn segment_tcp_packet(raw_packet: &[u8], split_at: usize) -> Option<(Vec<u8>
     let flags2 = tcp.flags;
     let seq1 = tcp.seq;
     let seq2 = tcp.seq.wrapping_add(split_at as u32);
+    let base_id = if ip.ip_id == 0 { 0x1000 } else { ip.ip_id };
 
     let (pkt1, pkt2) = match (ip.src_ip, ip.dst_ip) {
         (IpAddr::V4(s), IpAddr::V4(d)) => (
@@ -107,7 +113,7 @@ pub fn segment_tcp_packet(raw_packet: &[u8], split_at: usize) -> Option<(Vec<u8>
                 flags1,
                 tcp.window,
                 ip.ttl,
-                1,
+                base_id,
                 tcp_options,
                 part1,
             ),
@@ -121,7 +127,7 @@ pub fn segment_tcp_packet(raw_packet: &[u8], split_at: usize) -> Option<(Vec<u8>
                 flags2,
                 tcp.window,
                 ip.ttl,
-                2,
+                base_id.wrapping_add(1),
                 tcp_options,
                 part2,
             ),
@@ -167,7 +173,7 @@ pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Op
         return None;
     }
     let tcp = parse_tcp(ip.payload)?;
-    if tcp.payload.len() < 2 {
+    if (tcp.flags & ParsedTcp::SYN) != 0 || tcp.payload.len() < 2 {
         return None;
     }
 
@@ -207,7 +213,8 @@ pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Op
             tcp.flags & !ParsedTcp::FIN
         };
         let seq = tcp.seq.wrapping_add(start as u32);
-        let ip_id = 10u16.wrapping_add(i as u16);
+        let base_id = if ip.ip_id == 0 { 0x2000 } else { ip.ip_id };
+        let ip_id = base_id.wrapping_add(i as u16);
 
         let pkt = match (ip.src_ip, ip.dst_ip) {
             (IpAddr::V4(s), IpAddr::V4(d)) => build_ipv4_tcp_packet(
@@ -268,6 +275,13 @@ fn build_single_fake_packet(
         FakePacketMode::LowTtl(_) | FakePacketMode::BadChecksum => (tcp.seq, tcp.ack),
     };
 
+    let tcp_options = if tcp.header_len > 20 {
+        &ip.payload[20..tcp.header_len]
+    } else {
+        &[]
+    };
+    let safe_flags = (tcp.flags & !(ParsedTcp::SYN | ParsedTcp::FIN | ParsedTcp::RST)) | ParsedTcp::ACK;
+
     let mut fake_pkt = match (ip.src_ip, ip.dst_ip) {
         (IpAddr::V4(s), IpAddr::V4(d)) => build_ipv4_tcp_packet(
             s,
@@ -276,11 +290,11 @@ fn build_single_fake_packet(
             tcp.dst_port,
             seq,
             ack,
-            tcp.flags,
+            safe_flags,
             tcp.window,
             ttl,
             ip_id,
-            &[],
+            tcp_options,
             decoy_payload,
         ),
         (IpAddr::V6(s), IpAddr::V6(d)) => build_ipv6_tcp_packet(
@@ -290,10 +304,10 @@ fn build_single_fake_packet(
             tcp.dst_port,
             seq,
             ack,
-            tcp.flags,
+            safe_flags,
             tcp.window,
             ttl,
-            &[],
+            tcp_options,
             decoy_payload,
         ),
         _ => return None,
@@ -331,8 +345,16 @@ pub fn build_turkey_desync_packets(
         return None;
     }
     let tcp = parse_tcp(ip.payload)?;
+    if (tcp.flags & ParsedTcp::SYN) != 0 {
+        return None;
+    }
     let mut segs = segment_tcp_packet_multi(raw_packet, split_points)?;
 
+    let base_fake_id = if ip.ip_id == 0 {
+        0x3000u16
+    } else {
+        ip.ip_id.wrapping_sub(fake_modes.len() as u16)
+    };
     let mut out = Vec::with_capacity(fake_modes.len() + segs.len());
     for (idx, &mode) in fake_modes.iter().enumerate() {
         if let Some(fake) = build_single_fake_packet(
@@ -340,7 +362,7 @@ pub fn build_turkey_desync_packets(
             &tcp,
             mode,
             fake_payload,
-            90u16.wrapping_add(idx as u16),
+            base_fake_id.wrapping_add(idx as u16),
         ) {
             out.push(fake);
         }
@@ -373,8 +395,9 @@ pub fn build_turkey_desync_packets(
 
 /// Detects forged inbound `TCP RST` packets injected by passive optical-splitter DPI boxes
 /// (e.g. Türk Telekom / Vodafone Procera / Sandvine):
-/// - IPv4 `IP.ID == 0x0000` or `0x0001` (classic passive DPI generator fingerprint)
-/// - OR inbound TTL differs by `>= 3` hops from the real server's observed `SYN-ACK` TTL.
+/// - Inbound TTL differs by `>= 3` hops from the real server's observed `SYN-ACK` TTL
+/// - OR IPv4 `IP.ID <= 1` with `DF == 0` (classic passive DPI injector fingerprint; NEVER drops
+///   legitimate RFC 6864 Linux/Cloudflare/Google atomic `RST`s which carry `DF == 1, IP.ID == 0`!).
 pub fn is_forged_passive_dpi_rst(raw_packet: &[u8], expected_syn_ack_ttl: Option<u8>) -> bool {
     let Some(ip) = parse_ip_packet(raw_packet) else {
         return false;
@@ -389,23 +412,18 @@ pub fn is_forged_passive_dpi_rst(raw_packet: &[u8], expected_syn_ack_ttl: Option
         return false;
     }
 
-    if ip.version == 4 && raw_packet.len() >= 6 {
-        let ip_id = u16::from_be_bytes([raw_packet[4], raw_packet[5]]);
-        if ip_id == 0 || ip_id == 1 {
-            return true;
-        }
-    }
-
     if let Some(syn_ttl) = expected_syn_ack_ttl {
         if syn_ttl > 0 && ip.ttl > 0 && syn_ttl.abs_diff(ip.ttl) >= 3 {
             return true;
         }
     }
 
-    false
+    ip.version == 4 && !ip.df && (ip.ip_id == 0 || ip.ip_id == 1)
 }
 
-/// Detects forged inbound plaintext HTTP 302/307 ISP censorship redirect responses (e.g. BTK block page).
+/// Detects forged inbound plaintext HTTP 301/302/303/307/308 ISP censorship redirect responses
+/// (e.g. BTK block page) by inspecting ONLY the `Location:` header (zero false positives on
+/// legitimate ISP/gov `http -> https` upgrades and zero allocation on non-redirect `200 OK` packets).
 pub fn is_forged_dpi_http_redirect(raw_packet: &[u8]) -> bool {
     let Some(ip) = parse_ip_packet(raw_packet) else {
         return false;
@@ -419,20 +437,36 @@ pub fn is_forged_dpi_http_redirect(raw_packet: &[u8]) -> bool {
     if tcp.payload.len() < 16 || !tcp.payload.starts_with(b"HTTP/1.") {
         return false;
     }
-    let text = String::from_utf8_lossy(tcp.payload).to_ascii_lowercase();
-    let is_redirect = text.starts_with("http/1.1 302")
-        || text.starts_with("http/1.0 302")
-        || text.starts_with("http/1.1 307");
-    if !is_redirect {
+    // Fast-path byte check on status code (offset 9..12): avoid heap alloc for >99% of HTTP responses
+    let status = tcp.payload.get(9..12);
+    if !matches!(status, Some(b"301" | b"302" | b"303" | b"307" | b"308")) {
         return false;
     }
-    text.contains("195.175.254.2")
-        || text.contains("btk.gov.tr")
-        || text.contains("tib.gov.tr")
-        || text.contains("turktelekom")
-        || text.contains("superonline")
-        || text.contains("vodafone")
-        || text.contains("engelliweb")
+
+    // Extract ONLY the `Location:` header line
+    let header_end = tcp
+        .payload
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or(tcp.payload.len().min(2048));
+    let header_bytes = &tcp.payload[..header_end];
+    let headers = String::from_utf8_lossy(header_bytes);
+    let Some(loc_line) = headers.lines().find(|line| {
+        line.len() >= 9 && line.as_bytes()[..9].eq_ignore_ascii_case(b"location:")
+    }) else {
+        return false;
+    };
+    let loc = loc_line[9..].trim().to_ascii_lowercase();
+
+    loc.contains("195.175.254.2")
+        || loc.contains("195.175.254.3")
+        || loc.contains("tib.gov.tr")
+        || loc.contains("internet.btk.gov.tr")
+        || loc.contains("uyari.turktelekom")
+        || loc.contains("engelliweb")
+        || loc.contains("/engelli")
+        || loc.contains("/engelleme")
+        || (loc.contains("btk.gov.tr") && loc.contains("sorgu"))
 }
 
 /// Builds an out-of-order (disorder) + optional fake packet transmission plan for raw packet engines (Windows).
@@ -465,7 +499,9 @@ pub fn clamp_syn_mss(raw_packet: &[u8], max_mss: u16) -> Option<Vec<u8>> {
         return None;
     }
 
-    let safe_mss = max_mss.max(256);
+    // RFC 8200 / RFC 6691: IPv6 minimum TCP MSS is 1220 bytes (1280 MTU - 40 IPv6 - 20 TCP)
+    let min_mss = if ip.version == 6 { 1220 } else { 256 };
+    let safe_mss = max_mss.max(min_mss);
     let mut opts = ip.payload[20..tcp.header_len].to_vec();
     let mut pos = 0usize;
     let mut modified = false;

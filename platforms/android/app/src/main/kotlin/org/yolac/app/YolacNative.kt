@@ -19,22 +19,36 @@ object YolacNative {
     const val SECURITY_WARNING_TR =
         "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir."
 
+    @JvmStatic
     external fun nativeStartTun(
         service: VpnService,
         tunFd: Int,
         blockUnprotectedIpv6: Boolean,
         selfAppExcluded: Boolean,
+        isLockdown: Boolean,
     ): Boolean
 
+    @JvmStatic
     external fun nativeStop()
 
+    @JvmStatic
     external fun nativeGetState(): Int
 
+    @JvmStatic
     external fun nativeNotifyNetworkChange()
 
+    @JvmStatic
+    external fun nativeSetDynamicIpv6Block(block: Boolean)
+
+    @JvmStatic
     external fun nativeGetHealthJson(): String
 
+    @JvmStatic
     external fun nativeCheckUpdatesJson(): String
 
+    @JvmStatic
+    external fun nativeRunDiagnosticsJson(): String
+
+    @JvmStatic
     external fun nativeReportPlatformError(errorCode: Int)
 }

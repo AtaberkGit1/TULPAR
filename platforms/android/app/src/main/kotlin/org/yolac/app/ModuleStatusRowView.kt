@@ -22,7 +22,8 @@ data class ModuleHealthItem(
 
 /**
  * Single non-wrapping horizontal row of 7 minimalist module status icons.
- * Scrolls horizontally on narrow screens; never wraps onto a second row.
+ * Uses START child gravity + centered LinearLayout with isFillViewport=true so narrow screens
+ * scroll smoothly without clipping the leftmost icon, while wide screens center cleanly.
  */
 class ModuleStatusRowView(
     context: Context,
@@ -32,7 +33,7 @@ class ModuleStatusRowView(
     private val density = resources.displayMetrics.density
     private val row = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
-        gravity = Gravity.CENTER_VERTICAL
+        gravity = Gravity.CENTER_VERTICAL or Gravity.CENTER_HORIZONTAL
         val pad = (8 * density).toInt()
         setPadding(pad, pad, pad, pad)
     }
@@ -48,9 +49,14 @@ class ModuleStatusRowView(
         addView(
             row,
             LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.CENTER_HORIZONTAL
+                gravity = Gravity.START
             },
         )
+    }
+
+    fun setSelectedModuleId(id: Int?) {
+        selectedId = id
+        refreshSelection()
     }
 
     fun updateModules(newItems: List<ModuleHealthItem>) {
@@ -89,8 +95,10 @@ class ModuleStatusRowView(
 
     private fun refreshSelection() {
         for (i in items.indices) {
-            iconViews[i].isSelectedCell = (selectedId == items[i].id)
-            iconViews[i].invalidate()
+            if (i < iconViews.size) {
+                iconViews[i].isSelectedCell = (selectedId == items[i].id)
+                iconViews[i].invalidate()
+            }
         }
     }
 }
@@ -129,9 +137,9 @@ private class ModuleIconCell(
         val radius = (minOf(width, height) / 2f) - 2f * density
 
         val color = when (status) {
-            1 -> Color.parseColor("#2ECC71") // Green: verified working
-            2 -> Color.parseColor("#E74C3C") // Red: real error
-            else -> Color.parseColor("#6E6E6E") // Gray: passive or unchecked
+            1 -> Color.parseColor("#2ECC71")
+            2 -> Color.parseColor("#E74C3C")
+            else -> Color.parseColor("#6E6E6E")
         }
 
         ringPaint.color = if (isSelectedCell) Color.WHITE else Color.parseColor("#262626")
@@ -144,7 +152,6 @@ private class ModuleIconCell(
 
         when (moduleId) {
             0 -> {
-                // Akıllı Koruma: minimalist shield
                 path.moveTo(cx, cy - r)
                 path.lineTo(cx + r * 0.85f, cy - r * 0.55f)
                 path.lineTo(cx + r * 0.72f, cy + r * 0.35f)
@@ -155,33 +162,28 @@ private class ModuleIconCell(
                 canvas.drawPath(path, strokePaint)
             }
             1 -> {
-                // DNS Koruması: minimalist globe
                 canvas.drawCircle(cx, cy, r, strokePaint)
                 canvas.drawLine(cx - r, cy, cx + r, cy, strokePaint)
                 rect.set(cx - r * 0.48f, cy - r, cx + r * 0.48f, cy + r)
                 canvas.drawOval(rect, strokePaint)
             }
             2 -> {
-                // Reklam ve Takip Engelleme: block slash circle
                 canvas.drawCircle(cx, cy, r, strokePaint)
                 val d = r * 0.70f
                 canvas.drawLine(cx - d, cy - d, cx + d, cy + d, strokePaint)
             }
             3 -> {
-                // Gelişmiş Sansür Aşma: split path bypass
                 canvas.drawLine(cx - r, cy, cx - r * 0.15f, cy, strokePaint)
                 canvas.drawLine(cx - r * 0.15f, cy, cx + r * 0.85f, cy - r * 0.65f, strokePaint)
                 canvas.drawLine(cx - r * 0.15f, cy, cx + r * 0.85f, cy + r * 0.65f, strokePaint)
             }
             4 -> {
-                // Bağlantı Güvenliği: padlock
                 rect.set(cx - r * 0.75f, cy - r * 0.1f, cx + r * 0.75f, cy + r * 0.9f)
                 canvas.drawRoundRect(rect, 2f * density, 2f * density, strokePaint)
                 rect.set(cx - r * 0.45f, cy - r * 0.9f, cx + r * 0.45f, cy + r * 0.1f)
                 canvas.drawArc(rect, 180f, 180f, false, strokePaint)
             }
             5 -> {
-                // Performans: minimalist bolt
                 path.moveTo(cx + r * 0.15f, cy - r)
                 path.lineTo(cx - r * 0.6f, cy + r * 0.05f)
                 path.lineTo(cx + r * 0.05f, cy + r * 0.05f)
@@ -192,7 +194,6 @@ private class ModuleIconCell(
                 canvas.drawPath(path, strokePaint)
             }
             else -> {
-                // Güncellemeler: circular refresh arrow
                 rect.set(cx - r * 0.85f, cy - r * 0.85f, cx + r * 0.85f, cy + r * 0.85f)
                 canvas.drawArc(rect, -40f, 290f, false, strokePaint)
                 val ax = cx + (r * 0.85f * cos(Math.toRadians(-40.0))).toFloat()

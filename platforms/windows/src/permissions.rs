@@ -33,18 +33,23 @@ pub fn is_elevated() -> bool {
     false
 }
 
-/// Requests explicit Windows UAC elevation by relaunching the current executable with `--autostart`.
+/// Requests explicit Windows UAC elevation by relaunching the current executable with `--elevated-start`,
+/// preserving full UTF-16 path & working directory (never loops if elevation is suppressed).
 #[cfg(all(windows, not(test)))]
 pub fn request_uac_elevation() -> bool {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    let mut exe_w: Vec<u16> = exe.to_string_lossy().encode_utf16().chain(Some(0)).collect();
+    let mut exe_w: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut dir_w: Option<Vec<u16>> = exe
+        .parent()
+        .map(|d| d.as_os_str().encode_wide().chain(Some(0)).collect());
     let mut verb: Vec<u16> = "runas\0".encode_utf16().collect();
-    let mut args: Vec<u16> = "--autostart\0".encode_utf16().collect();
+    let mut args: Vec<u16> = "--elevated-start\0".encode_utf16().collect();
 
     let h = unsafe {
         ShellExecuteW(
@@ -52,7 +57,7 @@ pub fn request_uac_elevation() -> bool {
             verb.as_mut_ptr(),
             exe_w.as_mut_ptr(),
             args.as_mut_ptr(),
-            std::ptr::null(),
+            dir_w.as_mut().map_or(std::ptr::null(), |v| v.as_ptr()),
             SW_SHOWNORMAL,
         )
     };

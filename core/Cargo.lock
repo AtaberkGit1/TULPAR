@@ -779,11 +779,11 @@ dependencies = [
 
 [[package]]
 name = "yolac-blocklist"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "yolac-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "tokio",
  "yolac-blocklist",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "yolac-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rand",
  "rcgen",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "yolac-dns"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rustls",
  "tokio",
@@ -822,11 +822,11 @@ dependencies = [
 
 [[package]]
 name = "yolac-dpi"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "yolac-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "jni",
  "libc",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "yolac-net"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "smoltcp",

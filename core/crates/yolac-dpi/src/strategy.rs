@@ -101,7 +101,22 @@ impl PlatformCapabilities {
             ]
         };
 
-        let pos = ladder.iter().position(|&s| s == current)?;
-        ladder.get(pos + 1).copied().filter(|s| self.supports(*s))
+        let normalized = match (self.supports_raw_packets, current) {
+            (true, DpiStrategy::RawFakeTtl { .. }) => DpiStrategy::RawFakeTtl { ttl: 3 },
+            (
+                true,
+                DpiStrategy::TcpSniSplit
+                | DpiStrategy::TlsMultiRecordAndTcpSplit
+                | DpiStrategy::TlsSmallChunks
+                | DpiStrategy::TcpOobAndTlsSplit,
+            ) => DpiStrategy::TlsAndTcpSplit,
+            _ => current,
+        };
+
+        let pos = ladder.iter().position(|&s| s == normalized)?;
+        ladder[pos + 1..]
+            .iter()
+            .copied()
+            .find(|&s| self.supports(s))
     }
 }

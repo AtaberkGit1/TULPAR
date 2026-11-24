@@ -26,7 +26,7 @@ impl Default for HttpEvasionOptions {
     }
 }
 
-const HTTP_METHODS: [&[u8]; 7] = [
+const HTTP_METHODS: [&[u8]; 8] = [
     b"GET ",
     b"POST ",
     b"HEAD ",
@@ -34,6 +34,7 @@ const HTTP_METHODS: [&[u8]; 7] = [
     b"DELETE ",
     b"OPTIONS ",
     b"PATCH ",
+    b"CONNECT ",
 ];
 
 /// Parses an HTTP/1.x request's `Host` header offsets cleanly.
@@ -64,12 +65,21 @@ pub fn parse_http_host(data: &[u8]) -> Option<HttpHostInfo> {
                 val_end -= 1;
             }
             if val_end > val_start {
-                if let Ok(host) = std::str::from_utf8(&data[val_start..val_end]) {
-                    return Some(HttpHostInfo {
-                        host: host.to_ascii_lowercase(),
-                        header_name_start: line_start,
-                        host_range: (val_start, val_end),
-                    });
+                if let Ok(raw_host) = std::str::from_utf8(&data[val_start..val_end]) {
+                    let (host_only, host_len) = if let Some(bracket_end) = raw_host.find(']') {
+                        (&raw_host[..=bracket_end], bracket_end + 1)
+                    } else if let Some(colon) = raw_host.rfind(':') {
+                        (&raw_host[..colon], colon)
+                    } else {
+                        (raw_host, raw_host.len())
+                    };
+                    if host_len > 0 {
+                        return Some(HttpHostInfo {
+                            host: host_only.to_ascii_lowercase(),
+                            header_name_start: line_start,
+                            host_range: (val_start, val_start + host_len),
+                        });
+                    }
                 }
             }
         }

@@ -1,7 +1,7 @@
-//! Unified YOLAÇ engine orchestrator.
+//! Unified TULPAR engine orchestrator (Windows & Android).
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +16,10 @@ use yolac_net::{
 };
 
 use crate::adaptive::AdaptiveController;
+use crate::diagnostics::DiagnosticReport;
 use crate::health::{HealthMonitor, ModuleHealthReport};
 use crate::state::{EngineState, EphemeralMetrics, ErrorCode};
-use crate::updater::{check_github_release, UpdateCheckResult};
+use crate::updater::{check_github_release_with_protector, UpdateCheckResult};
 
 #[derive(Debug, Clone)]
 pub struct YolacConfig {
@@ -65,6 +66,11 @@ impl YolacConfig {
     }
 }
 
+struct RunningTask {
+    shutdown_tx: watch::Sender<bool>,
+    handle: JoinHandle<()>,
+}
+
 pub struct YolacEngine {
     config: YolacConfig,
     blocklist: Arc<Blocklist>,
@@ -72,22 +78,23 @@ pub struct YolacEngine {
     adaptive: Arc<AdaptiveController>,
     captive_portal: Arc<CaptivePortalMonitor>,
     block_ipv6_dynamic: Arc<AtomicBool>,
+    probe_gen: Arc<AtomicU64>,
     protector: Arc<dyn SocketProtector>,
     metrics: Arc<EphemeralMetrics>,
     health: Arc<HealthMonitor>,
     state_tx: watch::Sender<EngineState>,
     _state_rx: watch::Receiver<EngineState>,
-    shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
-    runner_task: Mutex<Option<JoinHandle<()>>>,
+    running: Mutex<Option<RunningTask>>,
 }
 
 impl YolacEngine {
     pub fn new(config: YolacConfig, protector: Option<Arc<dyn SocketProtector>>) -> Self {
-        let protector: Arc<dyn SocketProtector> = protector.unwrap_or_else(|| Arc::new(NoopProtector));
+        let protector: Arc<dyn SocketProtector> =
+            protector.unwrap_or_else(|| Arc::new(NoopProtector));
         let blocklist = Arc::new(Blocklist::embedded_default());
 
         let cache_max = match config.profile {
-            MemoryProfile::Standard => 4096,
+            MemoryProfile::Standard => 8192,
             MemoryProfile::LowMemoryIos => 1024,
         };
         let suppress_aaaa = config.ipv6_mode == Ipv6LeakMode::BlockUnprotectedIpv6;
@@ -121,13 +128,13 @@ impl YolacEngine {
             adaptive,
             captive_portal: Arc::new(CaptivePortalMonitor::new()),
             block_ipv6_dynamic: Arc::new(AtomicBool::new(suppress_aaaa)),
+            probe_gen: Arc::new(AtomicU64::new(0)),
             protector,
             metrics: Arc::new(EphemeralMetrics::default()),
             health: Arc::new(HealthMonitor::new()),
             state_tx,
             _state_rx: state_rx,
-            shutdown_tx: Mutex::new(None),
-            runner_task: Mutex::new(None),
+            running: Mutex::new(None),
         }
     }
 
@@ -159,6 +166,10 @@ impl YolacEngine {
         &self.metrics
     }
 
+    pub fn health_monitor(&self) -> &Arc<HealthMonitor> {
+        &self.health
+    }
+
     pub fn set_state(&self, new_state: EngineState) {
         if let EngineState::Error(code) = new_state {
             self.health.record_platform_error(Some(code));
@@ -183,6 +194,11 @@ impl YolacEngine {
         self.health.record_platform_error(None);
     }
 
+    pub fn set_dynamic_ipv6_block(&self, block: bool) {
+        self.block_ipv6_dynamic.store(block, Ordering::Relaxed);
+        self.dns.set_suppress_aaaa(block);
+    }
+
     /// Evaluates and returns real health reports for all 7 TULPAR modules.
     pub fn health_snapshot(&self) -> [ModuleHealthReport; 7] {
         self.health.evaluate_all(
@@ -196,48 +212,85 @@ impl YolacEngine {
 
     /// User-triggered manual GitHub Releases update check (never runs automatically in background).
     pub async fn check_updates_manual(&self, repo_override: Option<&str>) -> UpdateCheckResult {
-        let res = check_github_release(repo_override).await;
+        let res =
+            check_github_release_with_protector(repo_override, Some(self.protector.as_ref())).await;
         self.health.record_update_result(&res);
         res
     }
 
+    /// Runs live zero-telemetry Swiss-Army-Knife diagnostics: benchmarks all 5+ encrypted DNS
+    /// upstreams concurrently (promoting the fastest one), tests real IPv6 reachability,
+    /// and compiles live ad-blocking & cache hit-rate stats.
+    pub async fn run_live_diagnostics(&self) -> DiagnosticReport {
+        let (benchmarks, ipv6_mode) = tokio::join!(
+            self.dns.benchmark_all_upstreams(),
+            probe_ipv6_leak_mode(self.protector.as_ref(), None, Duration::from_millis(600))
+        );
+        let ipv6_ok = ipv6_mode == Ipv6LeakMode::DualStackProtected;
+        let stats = self.dns.stats_snapshot();
+        DiagnosticReport::build(
+            benchmarks,
+            ipv6_ok,
+            stats.blocked_queries,
+            stats.total_queries,
+            stats.cache_hits,
+        )
+    }
+
+    /// Handles Wi-Fi <-> Cellular or sleep-wake transitions cleanly:
+    /// clears stale DPI tables & dead keep-alive DNS sockets, re-probes fastest DNS + IPv6.
     pub fn notify_network_change(&self) {
         self.adaptive.on_network_change();
-        self.dns.reset_preferred_upstream();
         self.captive_portal.reset();
-        // Re-evaluate live IPv6 reachability asynchronously on Wi-Fi <-> Cellular transitions
-        // if dual-stack was requested (prevents IPv6 blackholes on IPv4-only Wi-Fi!).
-        if self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected {
-            if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
-                let protector = Arc::clone(&self.protector);
-                let dns = Arc::clone(&self.dns);
-                let block_v6 = Arc::clone(&self.block_ipv6_dynamic);
-                rt_handle.spawn(async move {
-                    let mode = probe_ipv6_leak_mode(
-                        protector.as_ref(),
-                        None,
-                        Duration::from_millis(600),
-                    )
-                    .await;
-                    let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
-                    block_v6.store(should_block, Ordering::Relaxed);
-                    dns.set_suppress_aaaa(should_block);
-                });
-            }
+        let gen = self.probe_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+        if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+            let dns = Arc::clone(&self.dns);
+            let protector = Arc::clone(&self.protector);
+            let block_v6 = Arc::clone(&self.block_ipv6_dynamic);
+            let probe_gen = Arc::clone(&self.probe_gen);
+            let dual_stack = self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected;
+
+            rt_handle.spawn(async move {
+                dns.on_network_change().await;
+                if probe_gen.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let dns_probe = dns.probe_fastest_upstream();
+                if dual_stack {
+                    let v6_probe =
+                        probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(600));
+                    let (_, mode) = tokio::join!(dns_probe, v6_probe);
+                    if probe_gen.load(Ordering::SeqCst) == gen {
+                        let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+                        block_v6.store(should_block, Ordering::Relaxed);
+                        dns.set_suppress_aaaa(should_block);
+                    }
+                } else {
+                    let _ = dns_probe.await;
+                }
+            });
+        } else {
+            self.dns.reset_preferred_upstream();
         }
     }
 
     /// Starts the userspace TUN packet engine on the given `PacketDevice`.
     pub async fn start_tun<D: PacketDevice + 'static>(&self, device: Arc<D>) -> io::Result<()> {
-        let mut task_guard = self.runner_task.lock().await;
-        if task_guard.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "YOLAÇ engine is already running",
-            ));
+        let mut running_guard = self.running.lock().await;
+        if let Some(prev) = running_guard.as_ref() {
+            if !prev.handle.is_finished() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "TULPAR engine is already running",
+                ));
+            }
+            // Reap finished handle cleanly so engine never gets permanently locked out
+            running_guard.take();
         }
 
         self.set_state(EngineState::Activating);
+        let gen = self.probe_gen.fetch_add(1, Ordering::SeqCst) + 1;
 
         let tun_cfg = TunConfig {
             mtu: self.config.mtu,
@@ -254,25 +307,33 @@ impl YolacEngine {
             Arc::clone(&self.block_ipv6_dynamic),
         );
 
-        // Background 600ms IPv6 probe when DualStackProtected is configured: if host Wi-Fi/carrier
-        // lacks real IPv6 routing, automatically suppress AAAA & disable IPv6 TUN blackholes!
-        if self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected {
+        // Background startup acceleration:
+        // 1. Race all encrypted DNS upstreams and warm-pool the fastest responder for this ISP
+        // 2. If DualStackProtected, run concurrent 600ms IPv6 probe with generation counter
+        {
             let protector = Arc::clone(&self.protector);
             let dns = Arc::clone(&self.dns);
             let block_v6 = Arc::clone(&self.block_ipv6_dynamic);
+            let probe_gen = Arc::clone(&self.probe_gen);
+            let dual_stack = self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected;
             tokio::spawn(async move {
-                let mode =
-                    probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(600))
-                        .await;
-                let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
-                block_v6.store(should_block, Ordering::Relaxed);
-                dns.set_suppress_aaaa(should_block);
+                let dns_probe = dns.probe_fastest_upstream();
+                if dual_stack {
+                    let v6_probe =
+                        probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(600));
+                    let (_, mode) = tokio::join!(dns_probe, v6_probe);
+                    if probe_gen.load(Ordering::SeqCst) == gen {
+                        let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+                        block_v6.store(should_block, Ordering::Relaxed);
+                        dns.set_suppress_aaaa(should_block);
+                    }
+                } else {
+                    let _ = dns_probe.await;
+                }
             });
         }
 
         let (shut_tx, shut_rx) = watch::channel(false);
-        *self.shutdown_tx.lock().await = Some(shut_tx);
-
         let state_tx = self.state_tx.clone();
         state_tx.send_replace(EngineState::Active);
         let handle = tokio::spawn(async move {
@@ -282,26 +343,33 @@ impl YolacEngine {
                 state_tx.send_replace(EngineState::Inactive);
             }
         });
-        *task_guard = Some(handle);
+        *running_guard = Some(RunningTask {
+            shutdown_tx: shut_tx,
+            handle,
+        });
         Ok(())
     }
 
     /// Gracefully stops the engine and wipes all ephemeral DNS/strategy caches from RAM.
     pub async fn stop(&self) {
-        let current = self.state();
-        if current == EngineState::Inactive {
-            return;
-        }
-        self.set_state(EngineState::Deactivating);
+        self.probe_gen.fetch_add(1, Ordering::SeqCst);
 
-        if let Some(shut_tx) = self.shutdown_tx.lock().await.take() {
-            let _ = shut_tx.send(true);
-        }
-        if let Some(handle) = self.runner_task.lock().await.take() {
-            let _ = handle.await;
+        let running_task = {
+            let mut guard = self.running.lock().await;
+            guard.take()
+        };
+
+        if let Some(task) = running_task {
+            self.set_state(EngineState::Deactivating);
+            let _ = task.shutdown_tx.send(true);
+            let _ = task.handle.await;
         }
 
         self.dns.clear_ephemeral_state().await;
+        let default_suppress = self.config.ipv6_mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+        self.block_ipv6_dynamic
+            .store(default_suppress, Ordering::Relaxed);
+        self.dns.set_suppress_aaaa(default_suppress);
         self.adaptive.clear();
         self.captive_portal.reset();
         self.metrics.reset();
@@ -328,7 +396,7 @@ mod tests {
         use crate::health::{ModuleHealthStatus, ModuleId};
         use crate::updater::{APP_VERSION, SECURITY_WARNING_TR};
 
-        assert_eq!(APP_VERSION, "0.3.0");
+        assert_eq!(APP_VERSION, "0.4.0");
         assert!(SECURITY_WARNING_TR.contains("TULPAR'ı"));
 
         let engine = YolacEngine::new(YolacConfig::mobile_android(), None);
@@ -336,7 +404,10 @@ mod tests {
 
         // Normal mode -> ConnectionSecurity is Green (Healthy)
         let normal = engine.health_snapshot();
-        assert_eq!(normal[ModuleId::ConnectionSecurity as usize].status, ModuleHealthStatus::Healthy);
+        assert_eq!(
+            normal[ModuleId::ConnectionSecurity as usize].status,
+            ModuleHealthStatus::Healthy
+        );
 
         // Trigger Captive Portal temporary allowance -> ConnectionSecurity reports Turkish portal notice
         engine.captive_portal().trigger_portal_bypass();
