@@ -19,6 +19,11 @@ TULPAR; Android, iOS ve Windows üzerinde çalışan, kullanıcıları DPI taban
 
 ---
 
+## v0.3.0 Yenilikleri
+- **WhatsApp, Telegram, Banka ve e-Devlet Tam Uyumluluğu**: Android'de gerçek küresel IPv6 erişim algılaması (`LinkProperties` + 600ms canlı IPv6 probu) ile IPv4-only ağlarda IPv6 kara deliği tamamen giderildi; uzun ömürlü/non-TLS protokoller (WhatsApp `WA\x06`, port 5222, sunucu-önce-konuşan soketler) doğrudan tünel moduna alındı ve bağlantı hatalarında anında `TCP RST` (`sock.abort`) gönderiliyor.
+- **Türkiye ISS Çok Katmanlı DPI & UDP Desync Motoru**: Windows ve Android için geçerli zararsız Fake ClientHello + sunucu-güvenli `BadChecksum`/`WrongSeq` + ters sıra çoklu bölme, pasif DPI sahte `RST` ve BTK `302` düşürme, gerçek `FlowTracker` otomatik yükseltme, Discord Ses (STUN/IP-Discovery) ve Roblox RakNet (`UDP 49152–65535`) sunucusuz UDP desync eklendi.
+- **Mobil Pil Tasarrufu & Yerel Ağ Desteği**: Boşta 20 Hz CPU uyanması 30 sn derin uykuya indirildi; `.local`/`.lan`/tek-etiketli yerel LAN DNS sorguları ve Android multicast (`224.0.0.0/4`) doğrudan yerel ağa yönlendiriliyor.
+
 ## v0.2.0 Yenilikleri
 
 - **Yeni Nesil DPI & Protokol Motoru**:
@@ -57,7 +62,7 @@ Ayrıntılar için:
 
 | Platform / Bileşen | Paket Formatı | Uygulama Durumu | Hedef OS / Dağıtım Notu |
 |---|---|---|---|
-| **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.2.0`) | Tüm platformlar tarafından paylaşılır |
+| **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.3.0`) | Tüm platformlar tarafından paylaşılır |
 | **Windows (`platforms/windows`)** | `tulpar.exe` / `.zip` | Tamamlandı (Win32 `#000000` UI, Sistem Tepsisi, Ayarlar & 7 modül, UAC, WinDivert 2.2.2 **SHA-256 + Authenticode** doğrulama, Otomatik TTL) | Canlı kernel yakalama için imzalı `WinDivert.dll` + `WinDivert64.sys` gerekir; `release.yml` doğrulamalı `.zip` + `SHA256SUMS.txt` üretir |
 | **Android (`platforms/android`)** | `tulpar.apk` | Tamamlandı (Kotlin `VpnService`, Hızlı Ayarlar Kutucuğu, Always-On VPN, `#000000` UI, Ayarlar & 7 modül, JNI) | Android 8.0+ (API 26+) |
 | **iOS (`platforms/ios`)** | `tulpar-ios-unsigned.ipa` | Kaynak & proje tamamlandı (SwiftUI `#000000` UI, Ayarlar, `NEPacketTunnelProvider`, `NEOnDemandRule`, `LowMemoryIos`, `PrivacyInfo.xcprivacy`) | `.ipa` imzalaması Apple kısıtlaması gereği **macOS + Xcode + Apple Developer Program** gerektirir |

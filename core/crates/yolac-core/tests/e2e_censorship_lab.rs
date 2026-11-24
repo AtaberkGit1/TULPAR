@@ -1106,3 +1106,149 @@ async fn test_9_turkey_isp_stateful_dpi_blocks_weak_split_but_multi_record_and_e
         "Turkish ISP BTK sinkhole 195.175.254.2 must be rejected as DNS poisoning!"
     );
 }
+
+#[tokio::test]
+async fn test_10_whatsapp_non_tls_server_first_and_tun_abort_rst_failover() {
+    let relay = Arc::new(DpiTcpRelay::new(
+        Arc::new(NoopProtector),
+        Arc::new(NoopStrategyAdvisor {
+            default_strategy: DpiStrategy::TlsMultiRecordAndTcpSplit,
+        }),
+    ));
+
+    // Part A: Server-speaks-first protocol on non-web port (e.g. WhatsApp 5222 / SSH / IMAP)
+    let banner_srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let banner_addr = banner_srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = banner_srv.accept().await {
+            let _ = s.write_all(b"WA_BANNER_OK").await;
+            let _ = s.flush().await;
+            let mut reply = [0u8; 32];
+            if let Ok(n) = s.read(&mut reply).await {
+                if n > 0 {
+                    let _ = s.write_all(&reply[..n]).await;
+                }
+            }
+        }
+    });
+
+    let proxy_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_a_addr = proxy_a.local_addr().unwrap();
+    let relay_a = Arc::clone(&relay);
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = proxy_a.accept().await {
+            let _ = relay_a.relay_stream(sock, banner_addr).await;
+        }
+    });
+
+    let mut cli_a = TcpStream::connect(proxy_a_addr).await.unwrap();
+    let mut banner = [0u8; 32];
+    let bn = tokio::time::timeout(Duration::from_secs(1), cli_a.read(&mut banner))
+        .await
+        .expect("Server-speaks-first banner must arrive immediately without waiting 5s for client")
+        .unwrap();
+    assert_eq!(&banner[..bn], b"WA_BANNER_OK");
+
+    // Part B: Binary WhatsApp Noise protocol (`WA\x06\x03`) passing untouched through TunEngine -> DpiTcpRelay
+    let wa_srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wa_addr = wa_srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = wa_srv.accept().await {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = s.read(&mut buf).await {
+                if &buf[..n] == b"WA\x06\x03HELLO_MSG" {
+                    let _ = s.write_all(b"WA_DELIVERED").await;
+                }
+            }
+        }
+    });
+    let proxy_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_b_addr = proxy_b.local_addr().unwrap();
+    let relay_b = Arc::clone(&relay);
+    tokio::spawn(async move {
+        if let Ok((sock, _)) = proxy_b.accept().await {
+            let _ = relay_b.relay_stream(sock, wa_addr).await;
+        }
+    });
+    let mut cli_b = TcpStream::connect(proxy_b_addr).await.unwrap();
+    cli_b.write_all(b"WA\x06\x03HELLO_MSG").await.unwrap();
+    let mut resp_b = [0u8; 32];
+    let rn = tokio::time::timeout(Duration::from_secs(1), cli_b.read(&mut resp_b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&resp_b[..rn], b"WA_DELIVERED");
+
+    // Part C: Unreachable TCP destination through TunEngine emits immediate TCP RST (sock.abort)
+    // so Android/iOS Happy Eyeballs switches to IPv4 in <5ms instead of hanging!
+    let closed_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed_listener.local_addr().unwrap().port();
+    drop(closed_listener); // guaranteed ECONNREFUSED
+
+    let bl = Arc::new(Blocklist::embedded_default());
+    let dns = Arc::new(DnsEngine::new(
+        DnsConfig {
+            upstreams: vec![],
+            ..DnsConfig::default()
+        },
+        bl,
+        None,
+    ));
+    let tun = Arc::new(TunEngine::new(
+        TunConfig::default(),
+        dns,
+        Arc::new(NoopProtector),
+        Arc::new(NoopStrategyAdvisor {
+            default_strategy: DpiStrategy::TlsMultiRecordAndTcpSplit,
+        }),
+    ));
+    let (to_tun_tx, to_tun_rx) = mpsc::channel::<Vec<u8>>(64);
+    let (from_tun_tx, mut from_tun_rx) = mpsc::channel::<Vec<u8>>(64);
+    let dev = Arc::new(ChannelPacketDevice::new(to_tun_rx, from_tun_tx));
+    let (shut_tx, shut_rx) = tokio::sync::watch::channel(false);
+    let tun_run = Arc::clone(&tun);
+    let task = tokio::spawn(async move {
+        let _ = tun_run.run(dev, shut_rx).await;
+    });
+
+    let client_v4 = Ipv4Addr::new(10, 219, 0, 1);
+    let syn = build_ipv4_tcp_packet(
+        client_v4,
+        Ipv4Addr::LOCALHOST,
+        55900,
+        closed_port,
+        100,
+        0,
+        ParsedTcp::SYN,
+        65535,
+        64,
+        1,
+        &[],
+        &[],
+    );
+    to_tun_tx.send(syn).await.unwrap();
+
+    let mut saw_rst = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(pkt)) = tokio::time::timeout(Duration::from_millis(200), from_tun_rx.recv()).await {
+            if let Some(ip) = parse_ip_packet(&pkt) {
+                if ip.protocol == IpProtocol::Tcp {
+                    if let Some(tcp) = parse_tcp(ip.payload) {
+                        if (tcp.flags & ParsedTcp::RST) != 0 {
+                            saw_rst = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        saw_rst,
+        "TunEngine must emit immediate TCP RST on upstream connect refusal/ENETUNREACH for instant Happy Eyeballs failover"
+    );
+
+    let _ = shut_tx.send(true);
+    let _ = task.await;
+}

@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use yolac_dpi::{
-    evade_http_request, fragment_tls_client_hello, parse_client_hello, parse_http_host,
-    plan_tcp_splits, DpiStrategy, HttpEvasionOptions, SplitStrategy,
+    evade_http_request, fragment_tls_client_hello, is_sensitive_unblocked_domain,
+    parse_client_hello, parse_client_hello_prefix, parse_http_host, plan_tcp_splits, DpiStrategy,
+    HttpEvasionOptions, SplitStrategy,
 };
 
 use crate::protect::{connect_protected_tcp, SocketProtector};
@@ -62,23 +63,50 @@ impl DpiTcpRelay {
         }
     }
 
-    /// Relays a client stream to `dst`, applying DPI circumvention on the initial ClientHello / HTTP request,
-    /// then entering zero-overhead `copy_bidirectional` for steady-state traffic.
+    /// Relays a client stream to `dst`, applying DPI circumvention on TLS ClientHello / HTTP requests,
+    /// while passing non-HTTP/TLS protocols (e.g. WhatsApp port 5222 / Noise `WA\x06`, SSH, IMAP,
+    /// server-speaks-first protocols, and pre-warmed long-lived sockets) straight through transparently.
     pub async fn relay_stream<S>(&self, mut client: S, dst: SocketAddr) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        // Read initial client payload (e.g., TLS ClientHello or HTTP request).
-        // Modern browsers (Chrome 131+ X25519MLKEM768 post-quantum TLS 1.3) send ClientHellos
-        // larger than a single 1460-byte TCP MSS segment; reassemble the complete first TLS
-        // record (bounded at 8 KiB / 400ms) so TLS record fragmentation always succeeds.
+        // Tier 1: Known non-web / messaging / server-speaks-first ports (WhatsApp 5222/5223/5228,
+        // Viber 5242, SSH 22, FTP 21, SMTP/IMAP/POP3): connect upstream immediately with zero wait.
+        let is_direct_non_web_port = matches!(
+            dst.port(),
+            21 | 22 | 25 | 110 | 143 | 465 | 587 | 993 | 995 | 5222 | 5223 | 5228 | 5242
+        );
+        if is_direct_non_web_port {
+            let mut upstream = connect_protected_tcp(dst, self.protector.as_ref()).await?;
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            return Ok(());
+        }
+
+        // Tier 2: Standard web/TLS ports wait up to 30s so pre-warmed idle mobile sockets
+        // (Chrome, WhatsApp/Telegram push) are never dropped prematurely.
+        // Tier 3: Other/custom ports peek briefly (150ms) so custom HTTPS ports still get DPI
+        // protection while arbitrary server-speaks-first protocols connect right away.
+        let is_standard_web_port =
+            matches!(dst.port(), 443 | 80 | 8443 | 8080 | 2053 | 2083 | 2087 | 2096);
+        let initial_peek_timeout = if is_standard_web_port {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_millis(150)
+        };
+
+        // Read initial client payload (e.g., TLS ClientHello, HTTP request, or binary WhatsApp Noise on 443).
         let mut initial = Vec::with_capacity(2048);
         let mut chunk = [0u8; 4096];
-        let n = match timeout(Duration::from_secs(5), client.read(&mut chunk)).await {
+        let n = match timeout(initial_peek_timeout, client.read(&mut chunk)).await {
             Ok(Ok(0)) => return Ok(()),
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "client initial read timeout")),
+            Err(_) => {
+                // Server-speaks-first or idle pre-warmed socket -> connect upstream directly
+                let mut upstream = connect_protected_tcp(dst, self.protector.as_ref()).await?;
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                return Ok(());
+            }
         };
         initial.extend_from_slice(&chunk[..n]);
 
@@ -99,13 +127,40 @@ impl DpiTcpRelay {
         }
         let initial = initial.as_slice();
 
-        let sni = parse_client_hello(initial)
-            .and_then(|c| c.sni)
-            .or_else(|| parse_http_host(initial).map(|h| h.host));
+        let tls_info = parse_client_hello(initial).or_else(|| parse_client_hello_prefix(initial));
+        let http_info = if tls_info.is_none() {
+            parse_http_host(initial)
+        } else {
+            None
+        };
 
-        // Attempt 1 + transparent multi-stage retry (up to 3 escalated strategies) on DPI RST / EOF / timeout
-        // BEFORE any bytes reach client so the very first browser page load succeeds automatically!
-        let mut strategy = self.advisor.select_strategy(dst, sni.as_deref());
+        // Non-TLS / Non-HTTP binary protocols running on port 443 (e.g., WhatsApp Noise `WA\x06\x03`,
+        // Telegram MTProto, custom VPN/messaging protocols): relay directly with ZERO DPI mangling
+        // and ZERO 2.5s handshake-timeout kill!
+        if tls_info.is_none() && http_info.is_none() {
+            let mut upstream = connect_protected_tcp(dst, self.protector.as_ref()).await?;
+            upstream.write_all(initial).await?;
+            upstream.flush().await?;
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+            return Ok(());
+        }
+
+        let sni = tls_info
+            .and_then(|c| c.sni)
+            .or_else(|| http_info.map(|h| h.host));
+
+        // Attempt 1 + transparent multi-stage retry (up to 3 escalated strategies) on DPI RST / EOF / timeout.
+        // Sensitive unblocked services (WhatsApp, e-Devlet, banks) start in clean Passthrough and
+        // escalate automatically ONLY if an ISP actually blocks/resets them!
+        let sensitive_passthrough = sni
+            .as_deref()
+            .map(is_sensitive_unblocked_domain)
+            .unwrap_or(false);
+        let mut strategy = if sensitive_passthrough {
+            DpiStrategy::Passthrough
+        } else {
+            self.advisor.select_strategy(dst, sni.as_deref())
+        };
         let mut attempt = 0u8;
         const MAX_RETRIES: u8 = 3;
         let (mut upstream, first_resp) = loop {

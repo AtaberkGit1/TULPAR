@@ -22,12 +22,14 @@ use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 use yolac_core::{AdaptiveController, EngineState, ErrorCode};
+use yolac_dns::wire::is_local_lan_hostname;
 use yolac_dns::{parse_dns_query, DnsEngine, DnsOutcome};
 use yolac_dpi::{
     build_benign_fake_client_hello, build_benign_fake_http_request,
     build_disorder_and_fake_packets, build_ipv4_tcp_packet, build_ipv6_tcp_packet,
-    build_turkey_desync_packets, clamp_syn_mss, detect_quic_initial, evade_http_request,
-    is_forged_dpi_http_redirect, is_forged_passive_dpi_rst, parse_client_hello_prefix,
+    build_turkey_desync_packets, build_udp_desync_decoys, clamp_syn_mss, detect_quic_initial,
+    detect_udp_desync_target, evade_http_request, is_forged_dpi_http_redirect,
+    is_forged_passive_dpi_rst, is_sensitive_unblocked_domain, parse_client_hello_prefix,
     parse_http_host, parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet,
     DpiStrategy, FakePacketMode, HttpEvasionOptions, IpProtocol, QuicPolicy, TtlCalibrator,
 };
@@ -97,6 +99,9 @@ pub enum ChecksumAction {
     /// Intentionally corrupted TCP checksum fake packet: do NOT recalculate TCP checksum,
     /// and mark IPChecksum + TCPChecksum valid so NIC hardware offload does not repair our decoy!
     PreserveBadTcpChecksum,
+    /// Intentionally corrupted UDP checksum fake packet (Discord Voice / Roblox RakNet UDP desync):
+    /// mark IPChecksum + UDPChecksum valid so NIC hardware offload does not repair our UDP decoy!
+    PreserveBadUdpChecksum,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +133,7 @@ pub struct FlowTracker {
     max_entries: usize,
     syn_ack_ttls: Mutex<HashMap<u64, u8>>,
     pending: Mutex<HashMap<u64, PendingFlow>>,
+    udp_desynced: Mutex<HashMap<u64, Instant>>,
 }
 
 impl FlowTracker {
@@ -137,7 +143,33 @@ impl FlowTracker {
             max_entries: max_entries.max(128),
             syn_ack_ttls: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            udp_desynced: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Returns `true` ONLY on the first handshake packet of a UDP flow (cooldown 30s),
+    /// ensuring Discord Voice / Roblox RakNet UDP desync adds zero steady-state game latency!
+    pub fn should_desync_udp_flow(&self, local_port: u16, remote_ip: IpAddr, remote_port: u16) -> bool {
+        let key = self.flow_key(local_port, remote_ip, remote_port);
+        let Ok(mut guard) = self.udp_desynced.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        if let Some(&prev) = guard.get(&key) {
+            if now.duration_since(prev) < Duration::from_secs(30) {
+                return false;
+            }
+        }
+        if guard.len() >= self.max_entries {
+            guard.retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(30));
+            if guard.len() >= self.max_entries {
+                if let Some(&evict) = guard.keys().next() {
+                    guard.remove(&evict);
+                }
+            }
+        }
+        guard.insert(key, now);
+        true
     }
 
     fn flow_key(&self, local_port: u16, remote_ip: IpAddr, remote_port: u16) -> u64 {
@@ -279,6 +311,9 @@ impl FlowTracker {
             g.clear();
         }
         if let Ok(mut g) = self.pending.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.udp_desynced.lock() {
             g.clear();
         }
     }
@@ -446,10 +481,11 @@ impl WindowsPacketEngine {
             (code, detail)
         })?);
 
-        // Zero overhead on HTTPS bulk downloads: inbound port 443 captures ONLY Syn/Rst/Fin control
-        // packets (for hop TTL calibration, forged passive-DPI RST drop & real active escalation!).
+        // Zero overhead on HTTPS bulk downloads & steady-state UDP gaming:
+        // - Inbound port 443 captures ONLY Syn/Rst/Fin control packets
+        // - Outbound UDP >= 49152 enables single-shot Discord Voice STUN & Roblox RakNet UDP desync
         let full_filter = CString::new(
-            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin)) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength > 0)))))",
+            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443 or udp.DstPort >= 49152)) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin)) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength > 0)))))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert filtre derleme hatası.".into()))?;
         let fallback_filter = CString::new(
@@ -531,8 +567,12 @@ impl WindowsPacketEngine {
                     if let Some(ip) = parse_ip_packet(pkt) {
                         if ip.protocol == IpProtocol::Udp {
                             if let Some(udp) = parse_udp(ip.payload) {
+                                let is_local_name = parse_dns_query(udp.payload)
+                                    .map(|q| is_local_lan_hostname(&q.qname))
+                                    .unwrap_or(false);
                                 if udp.dst_port == 53
                                     && !(portal.is_bypass_active() && is_local_lan_ip(ip.dst_ip))
+                                    && !(is_local_name && is_local_lan_ip(ip.dst_ip))
                                 {
                                     if let Ok(permit) = Arc::clone(&dns_sem).try_acquire_owned() {
                                         let dns_c = Arc::clone(&dns);
@@ -631,6 +671,10 @@ impl WindowsPacketEngine {
                         ChecksumAction::PreserveBadTcpChecksum => {
                             let is_v6 = out.bytes.first().map(|b| (b >> 4) == 6).unwrap_or(false);
                             out.addr.mark_checksums_valid(is_v6, true);
+                        }
+                        ChecksumAction::PreserveBadUdpChecksum => {
+                            let is_v6 = out.bytes.first().map(|b| (b >> 4) == 6).unwrap_or(false);
+                            out.addr.mark_checksums_valid(is_v6, false);
                         }
                     }
                     let mut send_len = 0u32;
@@ -880,11 +924,15 @@ fn process_outbound_inner(
             };
 
             // 1. Intercept ALL UDP/53 DNS queries locally via DoH/DoT + blocklist -> zero ISP DNS leak
+            //    (except direct local LAN hostnames like .local/.lan/single-label or active Captive Portal)
             if udp.dst_port == 53 {
-                if portal.is_bypass_active() && is_local_lan_ip(ip.dst_ip) {
+                let qname = parse_dns_query(udp.payload).map(|q| q.qname);
+                if is_local_lan_ip(ip.dst_ip)
+                    && (portal.is_bypass_active()
+                        || qname.as_deref().map(is_local_lan_hostname).unwrap_or(false))
+                {
                     return vec![passthrough(pkt.to_vec(), addr)];
                 }
-                let qname = parse_dns_query(udp.payload).map(|q| q.qname);
                 let (resp_opt, outcome) = rt.block_on(dns.resolve(udp.payload));
                 match outcome {
                     DnsOutcome::UpstreamResolved => portal.on_dns_upstream_success(),
@@ -921,6 +969,33 @@ fn process_outbound_inner(
             {
                 return vec![];
             }
+
+            // 3. Single-shot Zapret-style UDP desync for Discord Voice STUN/IP-Discovery & Roblox RakNet
+            //    Only runs on the FIRST handshake packet of a flow -> zero steady-state game/voice latency!
+            if udp.dst_port >= 49152
+                && !is_local_lan_ip(ip.dst_ip)
+                && detect_udp_desync_target(udp.payload, udp.dst_port).is_some()
+                && flows.should_desync_udp_flow(udp.src_port, ip.dst_ip, udp.dst_port)
+            {
+                if let Some(decoys) = build_udp_desync_decoys(pkt, 3) {
+                    let mut burst = Vec::with_capacity(decoys.len() + 1);
+                    for d in decoys {
+                        if d.preserve_bad_udp_checksum {
+                            let mut bad_addr = addr;
+                            bad_addr.mark_checksums_valid(ip.version == 6, false);
+                            burst.push(OutgoingPacket {
+                                bytes: d.bytes,
+                                addr: bad_addr,
+                                checksum: ChecksumAction::PreserveBadUdpChecksum,
+                            });
+                        } else {
+                            burst.push(recalc(d.bytes, addr));
+                        }
+                    }
+                    burst.push(passthrough(pkt.to_vec(), addr));
+                    return burst;
+                }
+            }
         }
         IpProtocol::Tcp => {
             let Some(tcp) = parse_tcp(ip.payload) else {
@@ -952,7 +1027,17 @@ fn process_outbound_inner(
 
             if !tcp.payload.is_empty() {
                 if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
+                    let is_sensitive = ch
+                        .sni
+                        .as_deref()
+                        .map(is_sensitive_unblocked_domain)
+                        .unwrap_or(false);
                     let mut strategy = adaptive.select_strategy(dst, None);
+                    // Sensitive unblocked services (WhatsApp, e-Devlet, Turkish banks):
+                    // try clean Passthrough first while FlowTracker monitors; auto-escalates if ever blocked!
+                    if is_sensitive && strategy == DpiStrategy::TurkeyDesyncAuto {
+                        strategy = DpiStrategy::Passthrough;
+                    }
 
                     // Real silent-blackhole detection: if Windows TCP retransmitted the EXACT same
                     // ClientHello seq, our previous strategy was blackholed by ISP DPI -> ESCALATE IMMEDIATELY!
@@ -1000,34 +1085,22 @@ fn process_outbound_inner(
                     match strategy {
                         DpiStrategy::Passthrough => {}
                         DpiStrategy::TurkeyDesyncAuto => {
-                            // Stage 1 Default (All Turkish ISPs: Vodafone / Türk Telekom / Superonline / Kablonet / TurkNet):
-                            // - When hop distance >= 4: exact-seq LowTtl(hops/2) that expires >= 2 hops before server
-                            //   + exact-seq BadChecksum + WrongSeq+BadChecksum (defeats Sandvine/Procera/Huawei/Allot)
-                            // - When hop <= 3 or unknown: safe exact-seq BadChecksum + LowTtlWrongSeq(2) + BadChecksumWrongSeq
-                            // - Real ClientHello: 3-segment reverse-order split at offset 2 (`-e 2`) and mid-SNI!
-                            let fakes: [FakePacketMode; 3] =
-                                if let Some(hops) = calibrator.estimated_hops(ip.dst_ip) {
-                                    if hops >= 4 {
-                                        let safe_ttl = (hops / 2).clamp(2, hops.saturating_sub(2).min(5));
-                                        [
-                                            FakePacketMode::LowTtl(safe_ttl),
-                                            FakePacketMode::BadChecksum,
-                                            FakePacketMode::BadChecksumWrongSeq,
-                                        ]
-                                    } else {
-                                        [
-                                            FakePacketMode::BadChecksum,
-                                            FakePacketMode::LowTtlWrongSeq(2),
-                                            FakePacketMode::BadChecksumWrongSeq,
-                                        ]
-                                    }
-                                } else {
-                                    [
-                                        FakePacketMode::BadChecksum,
-                                        FakePacketMode::LowTtlWrongSeq(3),
-                                        FakePacketMode::BadChecksumWrongSeq,
-                                    ]
-                                };
+                            // Safe-First Stage 1 Default (All Turkish ISPs: Vodafone / Türk Telekom / Superonline / Kablonet / TurkNet):
+                            // Uses ONLY 100% server-safe decoys (NEVER exact-seq valid-checksum LowTtl on Stage 1!)
+                            // so asymmetric routes to nearby Istanbul Anycast servers can NEVER corrupt a real TLS handshake:
+                            //   1. Exact-seq BadChecksum (server kernel drops 100% of the time; ISP DPI accepts www.iana.org)
+                            //   2. Calibrated LowTtlWrongSeq (passes home NAT, expires mid-path, RFC 5961 out-of-window even at 1 hop)
+                            //   3. BadChecksumWrongSeq (Vodafone/Superonline `--wrong-seq --wrong-chksum`)
+                            // + 3-segment reverse-order split at offset 2 (`-e 2`) and mid-SNI!
+                            let safe_ttl = calibrator
+                                .estimated_hops(ip.dst_ip)
+                                .map(|h| (h / 2).clamp(2, 5))
+                                .unwrap_or(3);
+                            let fakes = [
+                                FakePacketMode::BadChecksum,
+                                FakePacketMode::LowTtlWrongSeq(safe_ttl),
+                                FakePacketMode::BadChecksumWrongSeq,
+                            ];
                             if let Some(desync) = build_turkey_desync_packets(
                                 pkt,
                                 &[2, sni_mid],
@@ -1490,8 +1563,9 @@ mod tests {
         let mut out_addr = WinDivertAddress::default();
         out_addr.set_outbound();
         let out1 = process_packet_with_tracker(&ch_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
-        assert_eq!(out1.len(), 6); // Stage 1: 3 decoys (Auto-TTL=5, BadChecksum, BadChecksumWrongSeq) + 3 real segments
-        assert_eq!(parse_ip_packet(&out1[0].bytes).unwrap().ttl, 5); // Calibrated from SYN-ACK TTL=54 (10 hops -> 5)
+        assert_eq!(out1.len(), 6); // Stage 1: 3 server-safe decoys (BadChecksum, LowTtlWrongSeq(5), BadChecksumWrongSeq) + 3 real segments
+        assert_eq!(out1[0].checksum, ChecksumAction::PreserveBadTcpChecksum);
+        assert_eq!(parse_ip_packet(&out1[1].bytes).unwrap().ttl, 5); // Calibrated from SYN-ACK TTL=54 (10 hops -> 5)
         assert_eq!(adaptive.select_strategy(dst, None), DpiStrategy::TurkeyDesyncAuto);
 
         // 3. Passive DPI injects forged RST with IP.ID=0 and TTL=60 (diff 6 from SYN-ACK TTL 54) -> MUST BE DROPPED!
@@ -1605,5 +1679,75 @@ mod tests {
         let m_out = process_outbound_packet(&mullvad_pkt, out_addr, &rt, &dns, &adaptive);
         assert_eq!(m_out.len(), 1);
         assert_eq!(m_out[0].checksum, ChecksumAction::Passthrough);
+    }
+
+    #[test]
+    fn protects_whatsapp_edevlet_local_dns_and_desyncs_discord_roblox_udp() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+        let portal = CaptivePortalMonitor::new();
+        let mut out_addr = WinDivertAddress::default();
+        out_addr.set_outbound();
+
+        // 1. WhatsApp Web & e-Devlet start in clean Passthrough (never broken by unnecessary splits!)
+        let wa_ch = sample_tls_client_hello("web.whatsapp.com");
+        let wa_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(157, 240, 22, 60),
+            56100,
+            443,
+            1000,
+            2000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &wa_ch,
+        );
+        let wa_out = process_packet_with_tracker(&wa_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(wa_out.len(), 1);
+        assert_eq!(wa_out[0].checksum, ChecksumAction::Passthrough);
+
+        // 2. Local LAN .local DNS query to home router passes through directly to local router
+        let local_q = build_dns_query(0x4444, "printer.local", QType::A);
+        let local_dns_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(192, 168, 1, 1),
+            56101,
+            53,
+            64,
+            &local_q,
+        );
+        let dns_out = process_packet_with_tracker(&local_dns_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(dns_out.len(), 1);
+        assert_eq!(dns_out[0].checksum, ChecksumAction::Passthrough);
+        assert!(dns_out[0].addr.is_outbound());
+
+        // 3. Roblox RakNet UDP handshake emits 2 decoys (LowTtl + PreserveBadUdpChecksum) + real packet ONCE per flow!
+        let mut raknet = vec![0u8; 64];
+        raknet[0] = 0x05;
+        raknet[1..17].copy_from_slice(&[
+            0x00, 0xFF, 0xFF, 0x00, 0xFE, 0xFE, 0xFE, 0xFE, 0xFD, 0xFD, 0xFD, 0xFD, 0x12, 0x34, 0x56, 0x78,
+        ]);
+        let udp_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(128, 116, 114, 3),
+            56102,
+            53120,
+            64,
+            &raknet,
+        );
+        let first_udp = process_packet_with_tracker(&udp_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(first_udp.len(), 3);
+        assert_eq!(parse_ip_packet(&first_udp[0].bytes).unwrap().ttl, 3);
+        assert_eq!(first_udp[1].checksum, ChecksumAction::PreserveBadUdpChecksum);
+        assert_eq!(first_udp[2].checksum, ChecksumAction::Passthrough);
+
+        // Second packet on same UDP flow passes straight through with ZERO overhead!
+        let second_udp = process_packet_with_tracker(&udp_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(second_udp.len(), 1);
+        assert_eq!(second_udp[0].checksum, ChecksumAction::Passthrough);
     }
 }

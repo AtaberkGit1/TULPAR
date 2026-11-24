@@ -393,6 +393,32 @@ pub fn build_dns_query(id: u16, domain: &str, qtype: QType) -> Vec<u8> {
     pkt
 }
 
+/// Returns `true` if `qname` is a local-only / private-LAN hostname (single-label hostnames
+/// like `DESKTOP-PC` / `wpad`, or RFC 6762/6761 local suffixes `.local`, `.lan`, `.home`,
+/// `.internal`, `.arpa`, `.localdomain`, `.corp`). These should resolve via the local LAN DNS
+/// rather than public DoH/DoT so printers, NAS devices, routers, and intranets keep working.
+pub fn is_local_lan_hostname(qname: &str) -> bool {
+    let norm = qname.trim().trim_end_matches('.').to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    if !norm.contains('.') {
+        return true;
+    }
+    const LOCAL_SUFFIXES: &[&str] = &[
+        ".local",
+        ".lan",
+        ".home",
+        ".internal",
+        ".arpa",
+        ".localdomain",
+        ".corp",
+        ".intranet",
+        ".localnet",
+    ];
+    LOCAL_SUFFIXES.iter().any(|&s| norm.ends_with(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +495,17 @@ mod tests {
                 has_ech: true,
             }
         );
+    }
+
+    #[test]
+    fn distinguishes_local_lan_hostnames_from_public_domains() {
+        assert!(is_local_lan_hostname("DESKTOP-1234"));
+        assert!(is_local_lan_hostname("wpad"));
+        assert!(is_local_lan_hostname("printer.local."));
+        assert!(is_local_lan_hostname("router.lan"));
+        assert!(is_local_lan_hostname("1.1.168.192.in-addr.arpa"));
+        assert!(is_local_lan_hostname("portal.corp"));
+        assert!(!is_local_lan_hostname("www.roblox.com"));
+        assert!(!is_local_lan_hostname("g.whatsapp.net"));
     }
 }

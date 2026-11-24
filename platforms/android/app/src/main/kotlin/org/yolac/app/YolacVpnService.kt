@@ -11,12 +11,14 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.IpPrefix
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.service.quicksettings.TileService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import java.net.Inet6Address
 import java.net.InetAddress
 
 class YolacVpnService : VpnService() {
@@ -96,12 +98,13 @@ class YolacVpnService : VpnService() {
                 builder.setMetered(false)
             }
 
-            // Exclude RFC1918/link-local LAN subnets on API 33+ for seamless Captive Portal & local router access
+            // Exclude RFC1918/link-local LAN subnets & multicast (Chromecast/mDNS/printers) on API 33+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 try {
                     builder.excludeRoute(IpPrefix(InetAddress.getByName("192.168.0.0"), 16))
                     builder.excludeRoute(IpPrefix(InetAddress.getByName("172.16.0.0"), 12))
                     builder.excludeRoute(IpPrefix(InetAddress.getByName("169.254.0.0"), 16))
+                    builder.excludeRoute(IpPrefix(InetAddress.getByName("224.0.0.0"), 4))
                 } catch (_: Exception) {
                 }
             }
@@ -117,6 +120,39 @@ class YolacVpnService : VpnService() {
             TunEstablishResult(pfd = pfd, selfAppExcluded = selfExcluded)
         } catch (_: Throwable) {
             null
+        }
+    }
+
+    /**
+     * Checks whether the phone's active underlying Wi-Fi / cellular network actually has a globally
+     * routable IPv6 address. On IPv4-only networks (most Turkish home Wi-Fi), advertising a virtual
+     * IPv6 TUN route traps apps like WhatsApp/Instagram in an unreachable IPv6 blackhole!
+     */
+    private fun hasGlobalIpv6Connectivity(): Boolean {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+            val activeNet = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(activeNet)
+            if (caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                return false
+            }
+            val lp = cm.getLinkProperties(activeNet) ?: return false
+            val hasGlobalAddr = lp.linkAddresses.any { linkAddr ->
+                val addr = linkAddr.address
+                addr is Inet6Address &&
+                    !addr.isLinkLocalAddress &&
+                    !addr.isLoopbackAddress &&
+                    !addr.isSiteLocalAddress &&
+                    !addr.isMulticastAddress &&
+                    !addr.isAnyLocalAddress &&
+                    ((addr.address[0].toInt() and 0xFE) != 0xFC) // exclude ULA fc00::/7
+            }
+            val hasDefaultV6Route = lp.routes.any { route ->
+                route.isDefaultRoute && route.destination.address is Inet6Address
+            }
+            hasGlobalAddr && hasDefaultV6Route
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -142,10 +178,11 @@ class YolacVpnService : VpnService() {
             return
         }
 
-        // Try dual-stack IPv4+IPv6 first; fall back seamlessly to IPv4-only + IPv6 leak blocking if OEM kernel lacks IPv6 TUN
-        var usedIpv6 = true
-        var established = establishTun(includeIpv6 = true)
-        if (established == null) {
+        // Enable IPv6 TUN ONLY if the underlying network genuinely has global IPv6 connectivity;
+        // on IPv4-only networks, start IPv4-only + suppress AAAA so WhatsApp/Instagram never hang on IPv6!
+        var usedIpv6 = hasGlobalIpv6Connectivity()
+        var established = establishTun(includeIpv6 = usedIpv6)
+        if (established == null && usedIpv6) {
             usedIpv6 = false
             established = establishTun(includeIpv6 = false)
         }

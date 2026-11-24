@@ -17,6 +17,7 @@ pub mod strategy;
 pub mod tcp;
 pub mod tls;
 pub mod ttl;
+pub mod udp_desync;
 
 pub use fake_hello::{build_benign_fake_client_hello, build_benign_fake_http_request};
 pub use http::{evade_http_request, parse_http_host, HttpEvasionOptions, HttpHostInfo};
@@ -38,3 +39,7 @@ pub use tls::{
     SplitStrategy,
 };
 pub use ttl::{estimate_hop_count, recommend_fake_mode, TtlCalibrator};
+pub use udp_desync::{
+    build_udp_desync_decoys, detect_udp_desync_target, is_sensitive_unblocked_domain,
+    UdpDesyncKind, UdpDesyncPacket,
+};

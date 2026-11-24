@@ -161,6 +161,7 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeNotifyNetworkChange(
     _class: JClass,
 ) {
     if let Some(holder) = get_or_init_holder() {
+        let _rt_guard = holder.rt.enter();
         if let Ok(guard) = holder.engine.lock() {
             guard.notify_network_change();
         }

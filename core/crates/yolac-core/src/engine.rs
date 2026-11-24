@@ -1,6 +1,7 @@
 //! Unified YOLAÇ engine orchestrator.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,8 +11,8 @@ use yolac_blocklist::Blocklist;
 use yolac_dns::{default_public_upstreams, DnsConfig, DnsEngine};
 use yolac_dpi::{DpiStrategy, PlatformCapabilities, QuicPolicy};
 use yolac_net::{
-    CaptivePortalMonitor, Ipv6LeakMode, MemoryProfile, NoopProtector, PacketDevice,
-    ProtectedDialer, SocketProtector, TunConfig, TunEngine,
+    probe_ipv6_leak_mode, CaptivePortalMonitor, Ipv6LeakMode, MemoryProfile, NoopProtector,
+    PacketDevice, ProtectedDialer, SocketProtector, TunConfig, TunEngine,
 };
 
 use crate::adaptive::AdaptiveController;
@@ -70,6 +71,7 @@ pub struct YolacEngine {
     dns: Arc<DnsEngine>,
     adaptive: Arc<AdaptiveController>,
     captive_portal: Arc<CaptivePortalMonitor>,
+    block_ipv6_dynamic: Arc<AtomicBool>,
     protector: Arc<dyn SocketProtector>,
     metrics: Arc<EphemeralMetrics>,
     health: Arc<HealthMonitor>,
@@ -118,6 +120,7 @@ impl YolacEngine {
             dns,
             adaptive,
             captive_portal: Arc::new(CaptivePortalMonitor::new()),
+            block_ipv6_dynamic: Arc::new(AtomicBool::new(suppress_aaaa)),
             protector,
             metrics: Arc::new(EphemeralMetrics::default()),
             health: Arc::new(HealthMonitor::new()),
@@ -202,6 +205,26 @@ impl YolacEngine {
         self.adaptive.on_network_change();
         self.dns.reset_preferred_upstream();
         self.captive_portal.reset();
+        // Re-evaluate live IPv6 reachability asynchronously on Wi-Fi <-> Cellular transitions
+        // if dual-stack was requested (prevents IPv6 blackholes on IPv4-only Wi-Fi!).
+        if self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected {
+            if let Ok(rt_handle) = tokio::runtime::Handle::try_current() {
+                let protector = Arc::clone(&self.protector);
+                let dns = Arc::clone(&self.dns);
+                let block_v6 = Arc::clone(&self.block_ipv6_dynamic);
+                rt_handle.spawn(async move {
+                    let mode = probe_ipv6_leak_mode(
+                        protector.as_ref(),
+                        None,
+                        Duration::from_millis(600),
+                    )
+                    .await;
+                    let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+                    block_v6.store(should_block, Ordering::Relaxed);
+                    dns.set_suppress_aaaa(should_block);
+                });
+            }
+        }
     }
 
     /// Starts the userspace TUN packet engine on the given `PacketDevice`.
@@ -222,13 +245,30 @@ impl YolacEngine {
             ipv6_mode: self.config.ipv6_mode,
             quic_policy: self.config.quic_policy,
         };
-        let tun = TunEngine::with_captive_portal(
+        let tun = TunEngine::with_runtime_controls(
             tun_cfg,
             Arc::clone(&self.dns),
             Arc::clone(&self.protector),
             Arc::clone(&self.adaptive) as Arc<dyn yolac_net::StrategyAdvisor>,
             Arc::clone(&self.captive_portal),
+            Arc::clone(&self.block_ipv6_dynamic),
         );
+
+        // Background 600ms IPv6 probe when DualStackProtected is configured: if host Wi-Fi/carrier
+        // lacks real IPv6 routing, automatically suppress AAAA & disable IPv6 TUN blackholes!
+        if self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected {
+            let protector = Arc::clone(&self.protector);
+            let dns = Arc::clone(&self.dns);
+            let block_v6 = Arc::clone(&self.block_ipv6_dynamic);
+            tokio::spawn(async move {
+                let mode =
+                    probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(600))
+                        .await;
+                let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+                block_v6.store(should_block, Ordering::Relaxed);
+                dns.set_suppress_aaaa(should_block);
+            });
+        }
 
         let (shut_tx, shut_rx) = watch::channel(false);
         *self.shutdown_tx.lock().await = Some(shut_tx);
@@ -288,7 +328,7 @@ mod tests {
         use crate::health::{ModuleHealthStatus, ModuleId};
         use crate::updater::{APP_VERSION, SECURITY_WARNING_TR};
 
-        assert_eq!(APP_VERSION, "0.2.0");
+        assert_eq!(APP_VERSION, "0.3.0");
         assert!(SECURITY_WARNING_TR.contains("TULPAR'ı"));
 
         let engine = YolacEngine::new(YolacConfig::mobile_android(), None);

@@ -158,6 +158,7 @@ pub extern "C" fn yolac_notify_network_change(handle: *mut YolacHandle) -> i32 {
     }
     catch_unwind(AssertUnwindSafe(|| {
         let h = unsafe { &*handle };
+        let _rt_guard = h.rt.enter();
         if let Ok(guard) = h.engine.lock() {
             guard.notify_network_change();
         }

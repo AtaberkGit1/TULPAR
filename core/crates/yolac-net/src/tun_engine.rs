@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,10 +13,12 @@ use smoltcp::socket::tcp::{Socket as SmolTcpSocket, SocketBuffer as SmolTcpSocke
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
 use tokio::sync::{mpsc, watch, Mutex, Semaphore};
+use yolac_dns::wire::is_local_lan_hostname;
 use yolac_dns::{parse_dns_query, DnsEngine, DnsOutcome};
 use yolac_dpi::{
-    build_ipv4_udp_packet, build_ipv6_udp_packet, detect_quic_initial, parse_ip_packet, parse_tcp,
-    parse_udp, IpProtocol, QuicPolicy,
+    build_ipv4_tcp_packet, build_ipv4_udp_packet, build_ipv6_tcp_packet, build_ipv6_udp_packet,
+    detect_quic_initial, detect_udp_desync_target, parse_ip_packet, parse_tcp, parse_udp,
+    IpProtocol, ParsedTcp, QuicPolicy,
 };
 
 use crate::captive_portal::CaptivePortalMonitor;
@@ -190,7 +193,10 @@ struct ActiveTcpFlow {
     to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: mpsc::Receiver<Vec<u8>>,
     relay_closed: bool,
+    connect_failed: Arc<AtomicBool>,
     pending_write: Vec<u8>,
+    client_next_seq: u32,
+    server_next_seq: u32,
 }
 
 struct UdpSession {
@@ -205,6 +211,7 @@ pub struct TunEngine {
     advisor: Arc<dyn StrategyAdvisor>,
     leak_guard: LeakGuard,
     captive_portal: Arc<CaptivePortalMonitor>,
+    block_ipv6_dynamic: Arc<AtomicBool>,
     dns_semaphore: Arc<Semaphore>,
 }
 
@@ -231,6 +238,25 @@ impl TunEngine {
         advisor: Arc<dyn StrategyAdvisor>,
         captive_portal: Arc<CaptivePortalMonitor>,
     ) -> Self {
+        let initial_block_v6 = config.ipv6_mode == Ipv6LeakMode::BlockUnprotectedIpv6;
+        Self::with_runtime_controls(
+            config,
+            dns,
+            protector,
+            advisor,
+            captive_portal,
+            Arc::new(AtomicBool::new(initial_block_v6)),
+        )
+    }
+
+    pub fn with_runtime_controls(
+        config: TunConfig,
+        dns: Arc<DnsEngine>,
+        protector: Arc<dyn SocketProtector>,
+        advisor: Arc<dyn StrategyAdvisor>,
+        captive_portal: Arc<CaptivePortalMonitor>,
+        block_ipv6_dynamic: Arc<AtomicBool>,
+    ) -> Self {
         let leak_guard = LeakGuard {
             ipv6_mode: config.ipv6_mode,
             block_plaintext_dns_tcp_bypass: true,
@@ -243,6 +269,7 @@ impl TunEngine {
             advisor,
             leak_guard,
             captive_portal,
+            block_ipv6_dynamic,
             dns_semaphore,
         }
     }
@@ -282,10 +309,19 @@ impl TunEngine {
         let mut cleanup_tick = tokio::time::interval(Duration::from_secs(10));
 
         loop {
-            let poll_delay = iface
-                .poll_delay(SmolInstant::now(), &sockets)
-                .map(|d| Duration::from_millis(d.total_millis().max(1)))
-                .unwrap_or(Duration::from_millis(50));
+            // Mobile battery optimization: when idle (0 active TCP flows and empty queues),
+            // sleep up to 30s instead of waking the CPU 20 times/second (wakes immediately on TUN packet!).
+            let poll_delay = if tcp_flows.is_empty()
+                && vdev.rx_queue.is_empty()
+                && vdev.tx_queue.is_empty()
+            {
+                Duration::from_secs(30)
+            } else {
+                iface
+                    .poll_delay(SmolInstant::now(), &sockets)
+                    .map(|d| Duration::from_millis(d.total_millis().max(1)))
+                    .unwrap_or(Duration::from_millis(50))
+            };
 
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -320,10 +356,28 @@ impl TunEngine {
 
             // Pump smoltcp interface and relay channels
             iface.poll(SmolInstant::now(), &mut vdev, &mut sockets);
-            self.pump_tcp_flows(&mut sockets, &mut tcp_flows);
+            self.pump_tcp_flows(&mut sockets, &mut tcp_flows, &mut vdev);
             iface.poll(SmolInstant::now(), &mut vdev, &mut sockets);
 
             while let Some(out_pkt) = vdev.tx_queue.pop_front() {
+                if let Some(out_ip) = parse_ip_packet(&out_pkt) {
+                    if out_ip.protocol == IpProtocol::Tcp {
+                        if let Some(out_tcp) = parse_tcp(out_ip.payload) {
+                            let rev_key = FlowKey {
+                                src_ip: out_ip.dst_ip,
+                                src_port: out_tcp.dst_port,
+                                dst_ip: out_ip.src_ip,
+                                dst_port: out_tcp.src_port,
+                            };
+                            if let Some(flow) = tcp_flows.get_mut(&rev_key) {
+                                let seg_len = out_tcp.payload.len() as u32
+                                    + u32::from((out_tcp.flags & ParsedTcp::SYN) != 0)
+                                    + u32::from((out_tcp.flags & ParsedTcp::FIN) != 0);
+                                flow.server_next_seq = out_tcp.seq.wrapping_add(seg_len);
+                            }
+                        }
+                    }
+                }
                 let _ = device.send_packet(out_pkt).await;
             }
         }
@@ -355,54 +409,36 @@ impl TunEngine {
         };
 
         let portal_active = self.captive_portal.is_bypass_active();
-        match self.leak_guard.inspect_outbound_with_portal(&ip, portal_active) {
+        let mut effective_guard = self.leak_guard;
+        if self.block_ipv6_dynamic.load(Ordering::Relaxed) {
+            effective_guard.ipv6_mode = Ipv6LeakMode::BlockUnprotectedIpv6;
+        }
+        match effective_guard.inspect_outbound_with_portal(&ip, portal_active) {
             LeakDecision::BlockIpv6Leak | LeakDecision::BlockDnsBypassTcp => return,
             LeakDecision::InterceptDnsUdp => {
                 if let Some(udp) = parse_udp(ip.payload) {
-                    let Ok(permit) = Arc::clone(&self.dns_semaphore).try_acquire_owned() else {
-                        return; // Backpressure under DNS flood
-                    };
-                    let dns = Arc::clone(&self.dns);
-                    let portal = Arc::clone(&self.captive_portal);
-                    let dev = Arc::clone(device);
-                    let query_bytes = udp.payload.to_vec();
-                    let src_ip = ip.src_ip;
-                    let dst_ip = ip.dst_ip;
-                    let src_port = udp.src_port;
-                    let dst_port = udp.dst_port;
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let qname = parse_dns_query(&query_bytes).map(|q| q.qname);
-                        let (resp_opt, outcome) = dns.resolve(&query_bytes).await;
-                        match outcome {
-                            DnsOutcome::UpstreamResolved => {
-                                portal.on_dns_upstream_success();
+                    // Allow local-only hostnames (.local/.lan/single-label) targeting local LAN DNS
+                    // to resolve directly via local router/intranet DNS without leaking public domains!
+                    if crate::captive_portal::is_local_lan_ip(ip.dst_ip) {
+                        if let Some(q) = parse_dns_query(udp.payload) {
+                            if is_local_lan_hostname(&q.qname) {
+                                // Forward directly through protected UDP NAT below
+                                let _ = q;
+                            } else {
+                                self.spawn_dns_query(device, ip.src_ip, ip.dst_ip, udp.src_port, udp.dst_port, udp.payload.to_vec());
+                                return;
                             }
-                            DnsOutcome::Failed => {
-                                if let Some(name) = qname.as_deref() {
-                                    portal.on_dns_query_and_failure_state(
-                                        name,
-                                        dns.consecutive_failures(),
-                                    );
-                                }
-                            }
-                            _ => {}
+                        } else {
+                            self.spawn_dns_query(device, ip.src_ip, ip.dst_ip, udp.src_port, udp.dst_port, udp.payload.to_vec());
+                            return;
                         }
-                        if let Some(resp) = resp_opt {
-                            let reply_pkt = match (dst_ip, src_ip) {
-                                (IpAddr::V4(s), IpAddr::V4(d)) => {
-                                    build_ipv4_udp_packet(s, d, dst_port, src_port, 64, &resp)
-                                }
-                                (IpAddr::V6(s), IpAddr::V6(d)) => {
-                                    build_ipv6_udp_packet(s, d, dst_port, src_port, 64, &resp)
-                                }
-                                _ => return,
-                            };
-                            let _ = dev.send_packet(reply_pkt).await;
-                        }
-                    });
+                    } else {
+                        self.spawn_dns_query(device, ip.src_ip, ip.dst_ip, udp.src_port, udp.dst_port, udp.payload.to_vec());
+                        return;
+                    }
+                } else {
+                    return;
                 }
-                return;
             }
             LeakDecision::Allow => {}
         }
@@ -469,11 +505,22 @@ impl TunEngine {
                         return;
                     }
                     let mut buf = vec![0u8; 2048];
+                    let mut first_outbound = true;
                     loop {
                         tokio::select! {
                             msg = rx.recv() => {
                                 match msg {
-                                    Some(payload) => { let _ = sock.send(&payload).await; }
+                                    Some(payload) => {
+                                        // Unprivileged mobile UDP desync for Discord Voice STUN / Roblox RakNet:
+                                        // emit 2 low-TTL fake UDP decoys via setsockopt(IP_TTL=3) before real packet!
+                                        if first_outbound {
+                                            first_outbound = false;
+                                            if detect_udp_desync_target(&payload, key.dst_port).is_some() {
+                                                send_unprivileged_udp_decoys(&sock, is_v6).await;
+                                            }
+                                        }
+                                        let _ = sock.send(&payload).await;
+                                    }
                                     None => break,
                                 }
                             }
@@ -530,6 +577,7 @@ impl TunEngine {
 
                     let (to_relay_tx, to_relay_rx) = mpsc::channel::<Vec<u8>>(32);
                     let (from_relay_tx, from_relay_rx) = mpsc::channel::<Vec<u8>>(32);
+                    let connect_failed = Arc::new(AtomicBool::new(false));
 
                     tcp_flows.insert(
                         key,
@@ -538,7 +586,10 @@ impl TunEngine {
                             to_relay: Some(to_relay_tx),
                             from_relay: from_relay_rx,
                             relay_closed: false,
+                            connect_failed: Arc::clone(&connect_failed),
                             pending_write: Vec::new(),
+                            client_next_seq: tcp.seq.wrapping_add(1),
+                            server_next_seq: 0,
                         },
                     );
 
@@ -548,11 +599,39 @@ impl TunEngine {
                     );
                     let wake = wake_tx.clone();
                     tokio::spawn(async move {
-                        let stream = ChannelStream::new(to_relay_rx, from_relay_tx, wake);
-                        let _ = relay
+                        let stream = ChannelStream::new(to_relay_rx, from_relay_tx, wake.clone());
+                        if let Err(err) = relay
                             .relay_stream(stream, SocketAddr::new(key.dst_ip, key.dst_port))
-                            .await;
+                            .await
+                        {
+                            // Signal immediate TCP RST on unreachable/refused errors so Happy Eyeballs
+                            // (e.g. WhatsApp/Chrome IPv6->IPv4 fallback) switches cleanly in <5ms!
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::ConnectionRefused
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::PermissionDenied
+                                    | io::ErrorKind::HostUnreachable
+                                    | io::ErrorKind::NetworkUnreachable
+                                    | io::ErrorKind::AddrNotAvailable
+                            ) || err.raw_os_error() == Some(101)
+                                || err.raw_os_error() == Some(113)
+                            {
+                                connect_failed.store(true, Ordering::Release);
+                            }
+                            let _ = wake.try_send(());
+                        }
                     });
+                }
+
+                if let Some(flow) = tcp_flows.get_mut(&key) {
+                    let seg_len = tcp.payload.len() as u32
+                        + u32::from((tcp.flags & ParsedTcp::SYN) != 0)
+                        + u32::from((tcp.flags & ParsedTcp::FIN) != 0);
+                    flow.client_next_seq = tcp.seq.wrapping_add(seg_len);
+                    if (tcp.flags & ParsedTcp::ACK) != 0 {
+                        flow.server_next_seq = tcp.ack;
+                    }
                 }
 
                 vdev.rx_queue.push_back(pkt);
@@ -567,6 +646,7 @@ impl TunEngine {
         &self,
         sockets: &mut SocketSet<'_>,
         tcp_flows: &mut HashMap<FlowKey, ActiveTcpFlow>,
+        vdev: &mut VirtualIpDevice,
     ) {
         let mut to_remove = Vec::new();
 
@@ -640,7 +720,47 @@ impl TunEngine {
             }
 
             if flow.relay_closed && flow.pending_write.is_empty() {
-                sock.close();
+                if flow.connect_failed.load(Ordering::Acquire) {
+                    sock.abort();
+                    // smoltcp's abort() only moves to State::Closed silently without sending an RST.
+                    // Actively emit an RFC 793 TCP RST|ACK so Android/iOS Happy Eyeballs switches
+                    // to IPv4 or fallback endpoints in <5ms instead of waiting for a timeout!
+                    let rst_pkt = match (key.dst_ip, key.src_ip) {
+                        (IpAddr::V4(s), IpAddr::V4(d)) => Some(build_ipv4_tcp_packet(
+                            s,
+                            d,
+                            key.dst_port,
+                            key.src_port,
+                            flow.server_next_seq,
+                            flow.client_next_seq,
+                            ParsedTcp::RST | ParsedTcp::ACK,
+                            0,
+                            64,
+                            0,
+                            &[],
+                            &[],
+                        )),
+                        (IpAddr::V6(s), IpAddr::V6(d)) => Some(build_ipv6_tcp_packet(
+                            s,
+                            d,
+                            key.dst_port,
+                            key.src_port,
+                            flow.server_next_seq,
+                            flow.client_next_seq,
+                            ParsedTcp::RST | ParsedTcp::ACK,
+                            0,
+                            64,
+                            &[],
+                            &[],
+                        )),
+                        _ => None,
+                    };
+                    if let Some(pkt) = rst_pkt {
+                        vdev.tx_queue.push_back(pkt);
+                    }
+                } else {
+                    sock.close();
+                }
             }
 
             if sock.state() == SmolTcpState::Closed
@@ -655,6 +775,95 @@ impl TunEngine {
                 sockets.remove(flow.handle);
             }
         }
+    }
+
+    fn spawn_dns_query<D: PacketDevice + 'static>(
+        &self,
+        device: &Arc<D>,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        query_bytes: Vec<u8>,
+    ) {
+        let Ok(permit) = Arc::clone(&self.dns_semaphore).try_acquire_owned() else {
+            return; // Backpressure under DNS flood
+        };
+        let dns = Arc::clone(&self.dns);
+        let portal = Arc::clone(&self.captive_portal);
+        let dev = Arc::clone(device);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let qname = parse_dns_query(&query_bytes).map(|q| q.qname);
+            let (resp_opt, outcome) = dns.resolve(&query_bytes).await;
+            match outcome {
+                DnsOutcome::UpstreamResolved => {
+                    portal.on_dns_upstream_success();
+                }
+                DnsOutcome::Failed => {
+                    if let Some(name) = qname.as_deref() {
+                        portal.on_dns_query_and_failure_state(name, dns.consecutive_failures());
+                    }
+                }
+                _ => {}
+            }
+            if let Some(resp) = resp_opt {
+                let reply_pkt = match (dst_ip, src_ip) {
+                    (IpAddr::V4(s), IpAddr::V4(d)) => {
+                        build_ipv4_udp_packet(s, d, dst_port, src_port, 64, &resp)
+                    }
+                    (IpAddr::V6(s), IpAddr::V6(d)) => {
+                        build_ipv6_udp_packet(s, d, dst_port, src_port, 64, &resp)
+                    }
+                    _ => return,
+                };
+                let _ = dev.send_packet(reply_pkt).await;
+            }
+        });
+    }
+}
+
+/// Emits 2 short low-TTL UDP decoys on unprivileged Unix/Android sockets via `setsockopt(IP_TTL, 3)`
+/// (restoring normal TTL=64 immediately afterward) to desynchronize ISP UDP DPI on Discord Voice & Roblox.
+async fn send_unprivileged_udp_decoys(sock: &tokio::net::UdpSocket, is_v6: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let low_ttl: libc::c_int = 3;
+        let normal_ttl: libc::c_int = 64;
+        let (level, opt) = if is_v6 {
+            (libc::IPPROTO_IPV6, libc::IPV6_UNICAST_HOPS)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_TTL)
+        };
+        let set_ok = unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                opt,
+                (&low_ttl as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) == 0
+        };
+        if set_ok {
+            let decoy = [0u8; 24];
+            let _ = sock.send(&decoy).await;
+            let _ = sock.send(&decoy).await;
+            unsafe {
+                let _ = libc::setsockopt(
+                    fd,
+                    level,
+                    opt,
+                    (&normal_ttl as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (sock, is_v6);
     }
 }
 

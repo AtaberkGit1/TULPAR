@@ -1,6 +1,6 @@
 [package]
 name = "yolac-windows"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "TULPAR Native Windows Application (Win32 Minimalist UI + System Tray + WinDivert Packet Engine)"

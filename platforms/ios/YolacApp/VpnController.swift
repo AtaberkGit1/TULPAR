@@ -190,7 +190,7 @@ final class VpnController: ObservableObject {
                 return
             }
 
-            let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.2.0"
+            let currentVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0.3.0"
             var req = URLRequest(url: apiUrl)
             req.timeoutInterval = 8
             req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
