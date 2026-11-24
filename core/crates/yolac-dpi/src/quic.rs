@@ -25,12 +25,13 @@ pub fn detect_quic_initial(udp_payload: &[u8]) -> Option<QuicInitialInfo> {
         return None;
     }
     let version = u32::from_be_bytes([udp_payload[1], udp_payload[2], udp_payload[3], udp_payload[4]]);
-    // QUIC v1 (0x00000001) -> Long packet type 0 = Initial
-    // QUIC v2 (0x6b3343cf) -> Long packet type 1 = Initial
+    // QUIC v1 (0x00000001) & Meta/Instagram mvfst drafts (0xfaceb00x) -> type 0 = Initial
+    // QUIC v2 (0x6b3343cf) -> type 1 = Initial
     let pkt_type = (first >> 4) & 0x03;
     let is_initial = match version {
         0x0000_0001 => pkt_type == 0,
         0x6b33_43cf => pkt_type == 1,
+        v if (v & 0xFFFF_FF00) == 0xface_b000 => pkt_type == 0,
         _ => false,
     };
     if is_initial {

@@ -97,9 +97,36 @@ jobs:
           name: release-android
           path: platforms/android/tulpar.apk
 
+  build-linux-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build Static Zero-Dependency TULPAR Linux (x86_64)
+        working-directory: platforms/linux
+        env:
+          YOLAC_GITHUB_REPO: ${{ github.repository }}
+        run: |
+          cargo test
+          cargo clippy --all-targets -- -D warnings
+          CC_x86_64_unknown_linux_musl=musl-gcc cargo build --release --target x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/tulpar tulpar-linux-x64
+          tar -czf tulpar-linux-x64.tar.gz tulpar-linux-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: |
+            platforms/linux/tulpar-linux-x64
+            platforms/linux/tulpar-linux-x64.tar.gz
+
   publish-github-release:
-    needs: [build-windows-release, build-android-release]
-    if: ${{ always() && (needs.build-windows-release.result == 'success' || needs.build-android-release.result == 'success') }}
+    needs: [build-windows-release, build-android-release, build-linux-release]
+    if: ${{ always() && (needs.build-windows-release.result == 'success' || needs.build-android-release.result == 'success' || needs.build-linux-release.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

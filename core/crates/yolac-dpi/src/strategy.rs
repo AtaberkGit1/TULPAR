@@ -55,6 +55,9 @@ impl PlatformCapabilities {
         supports_bad_checksum: true,
     };
 
+    /// Linux `NFQUEUE` + `IPPROTO_RAW` packet engine (full L3/L4 raw packet injection).
+    pub const LINUX_NFQUEUE: Self = Self::WINDOWS_WINDIVERT;
+
     pub fn supports(&self, strategy: DpiStrategy) -> bool {
         match strategy {
             DpiStrategy::Passthrough
@@ -110,6 +113,15 @@ impl PlatformCapabilities {
                 | DpiStrategy::TlsSmallChunks
                 | DpiStrategy::TcpOobAndTlsSplit,
             ) => DpiStrategy::TlsAndTcpSplit,
+            (
+                false,
+                DpiStrategy::RawDisorder
+                | DpiStrategy::RawFakeTtl { .. }
+                | DpiStrategy::RawBadChecksum
+                | DpiStrategy::TurkeyDesyncAuto
+                | DpiStrategy::TurkeyDesyncSuperonline
+                | DpiStrategy::TurkeyDesyncAggressive,
+            ) => DpiStrategy::TlsMultiRecordAndTcpSplit,
             _ => current,
         };
 

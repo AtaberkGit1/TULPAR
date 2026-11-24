@@ -166,8 +166,12 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
         };
         let dev = Arc::new(dev);
 
-        // Stop any previous running engine first & carry forward manual update-check result
-        let prev_engine = holder.engine.lock().ok().map(|g| Arc::clone(&g));
+        // Swap new engine into holder FIRST so stale forwarder checks `Arc::ptr_eq` accurately
+        let prev_engine = holder
+            .engine
+            .lock()
+            .ok()
+            .map(|mut g| std::mem::replace(&mut *g, Arc::clone(&engine)));
         if let Some(old) = prev_engine {
             engine
                 .health_monitor()
@@ -179,11 +183,25 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
             return JNI_FALSE;
         }
 
-        // Propagate unexpected engine death/state changes back to Kotlin YolacVpnService
+        // Propagate unexpected engine death/state changes back to Kotlin YolacVpnService,
+        // ignoring events once this engine has been superseded by a newer `nativeStartTun`!
         if let Some(cb_jvm) = state_jvm {
             let mut rx = engine.subscribe_state();
+            let weak_eng = Arc::downgrade(&engine);
+            let holder_ref = Arc::clone(&holder);
             holder.rt.spawn(async move {
                 while rx.changed().await.is_ok() {
+                    let Some(strong_eng) = weak_eng.upgrade() else {
+                        break;
+                    };
+                    let still_current = holder_ref
+                        .engine
+                        .lock()
+                        .map(|g| Arc::ptr_eq(&*g, &strong_eng))
+                        .unwrap_or(false);
+                    if !still_current {
+                        break;
+                    }
                     let st = rx.borrow().as_u8() as jint;
                     if let Ok(mut cb_env) = cb_jvm.attach_current_thread_permanently() {
                         let res = cb_env.call_method(
@@ -200,9 +218,6 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
             });
         }
 
-        if let Ok(mut eng_guard) = holder.engine.lock() {
-            *eng_guard = engine;
-        }
         JNI_TRUE
     }))
     .unwrap_or(JNI_FALSE)
@@ -283,14 +298,15 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeGetHealthJson(
     _class: JClass,
 ) -> jstring {
     catch_unwind(AssertUnwindSafe(|| {
-        let json = if let Some(holder) = get_or_init_holder() {
+        // Never spawn Tokio runtime / parse full blocklist synchronously on Android UI thread before start!
+        let json = if let Some(holder) = try_get_holder() {
             if let Ok(guard) = holder.engine.lock() {
                 health_reports_to_json(&guard.health_snapshot())
             } else {
                 "[]".to_string()
             }
         } else {
-            "[]".to_string()
+            "[{\"id\":0,\"name\":\"Akıllı Koruma\",\"status\":0,\"detail\":\"Koruma kapalı.\"},{\"id\":1,\"name\":\"DNS Koruması\",\"status\":0,\"detail\":\"Beklemede.\"},{\"id\":2,\"name\":\"Reklam ve Takip Engelleme\",\"status\":0,\"detail\":\"Beklemede.\"},{\"id\":3,\"name\":\"Gelişmiş Sansür Aşma\",\"status\":0,\"detail\":\"Beklemede.\"},{\"id\":4,\"name\":\"Bağlantı Güvenliği\",\"status\":0,\"detail\":\"Beklemede.\"},{\"id\":5,\"name\":\"Performans\",\"status\":0,\"detail\":\"Beklemede.\"},{\"id\":6,\"name\":\"Güncellemeler\",\"status\":0,\"detail\":\"Henüz kontrol edilmedi.\"}]".to_string()
         };
         new_jstring_or_empty(&env, &json)
     }))

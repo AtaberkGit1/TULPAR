@@ -319,12 +319,19 @@ impl DpiTcpRelay {
         let mut attempt = 0u8;
         const MAX_RETRIES: u8 = 3;
         let (mut upstream, first_resp) = loop {
+            let from_speculative = speculative_upstream.is_some();
             let mut candidate = match speculative_upstream.take() {
                 Some(s) => s,
                 None => self.connect_upstream(dst).await?,
             };
             let sent_at = Instant::now();
-            send_with_strategy_tcp(&mut candidate, initial, strategy).await?;
+            if let Err(e) = send_with_strategy_tcp(&mut candidate, initial, strategy).await {
+                if from_speculative && attempt < MAX_RETRIES {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
 
             let mut resp_buf = [0u8; 4096];
             match timeout(self.handshake_timeout, candidate.read(&mut resp_buf)).await {
@@ -341,6 +348,12 @@ impl DpiTcpRelay {
                     break (candidate, resp_buf[..rn].to_vec());
                 }
                 Ok(Ok(_)) => {
+                    // An idle pre-warmed speculative socket closed before TLS exchange must NOT
+                    // falsely escalate domain DPI strategy; retry immediately on a fresh socket!
+                    if from_speculative && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        continue;
+                    }
                     self.advisor.report_outcome(
                         dst,
                         sni.as_deref(),
@@ -361,6 +374,10 @@ impl DpiTcpRelay {
                     ));
                 }
                 Ok(Err(e)) => {
+                    if from_speculative && attempt < MAX_RETRIES {
+                        attempt += 1;
+                        continue;
+                    }
                     self.advisor.report_outcome(
                         dst,
                         sni.as_deref(),
@@ -422,7 +439,11 @@ async fn send_with_strategy_tcp(
     payload: &[u8],
     strategy: DpiStrategy,
 ) -> io::Result<()> {
-    if strategy == DpiStrategy::TcpOobAndTlsSplit && parse_client_hello(payload).is_some() {
+    if (strategy == DpiStrategy::TcpOobAndTlsSplit
+        && parse_client_hello(payload).is_some())
+        || (strategy == DpiStrategy::TcpOobAndTlsSplit
+            && parse_client_hello_prefix(payload).is_some())
+    {
         if let Some(frag) = fragment_tls_client_hello(payload, SplitStrategy::OffsetAndSniMid(2)) {
             let first_rec_len = (5 + u16::from_be_bytes([frag[3], frag[4]]) as usize).min(frag.len());
             stream.write_all(&frag[..1]).await?;
@@ -463,7 +484,7 @@ pub async fn send_with_strategy<W: AsyncWrite + Unpin>(
     payload: &[u8],
     strategy: DpiStrategy,
 ) -> io::Result<()> {
-    if parse_client_hello(payload).is_some() {
+    if parse_client_hello(payload).is_some() || parse_client_hello_prefix(payload).is_some() {
         match strategy {
             DpiStrategy::Passthrough => {
                 writer.write_all(payload).await?;
@@ -476,11 +497,13 @@ pub async fn send_with_strategy<W: AsyncWrite + Unpin>(
                     writer.flush().await?;
                     return Ok(());
                 }
+                return write_tcp_split(writer, payload, 2.min(payload.len().saturating_sub(1))).await;
             }
             DpiStrategy::TcpSniSplit => {
                 if let Some(plan) = plan_tcp_splits(payload) {
                     return write_tcp_split(writer, payload, plan.split_at).await;
                 }
+                return write_tcp_split(writer, payload, 2.min(payload.len().saturating_sub(1))).await;
             }
             DpiStrategy::TlsMultiRecordAndTcpSplit => {
                 // ByeDPI-Turkey `-r1+s -s1` equivalent: 3 valid TLS records (offset 2 + mid-SNI)
@@ -520,6 +543,10 @@ pub async fn send_with_strategy<W: AsyncWrite + Unpin>(
                     let split_at = first_rec_len.clamp(1, frag.len().saturating_sub(1));
                     return write_tcp_split(writer, &frag, split_at).await;
                 }
+                if let Some(plan) = plan_tcp_splits(payload) {
+                    return write_tcp_split(writer, payload, plan.split_at).await;
+                }
+                return write_tcp_split(writer, payload, 2.min(payload.len().saturating_sub(1))).await;
             }
         }
     } else if parse_http_host(payload).is_some() && strategy != DpiStrategy::Passthrough {

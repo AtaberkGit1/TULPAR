@@ -6,7 +6,7 @@
 
 **İnternet özgür olmalı.**
 
-TULPAR; **Android** ve **Windows (PC)** üzerinde çalışan, kullanıcıları DPI tabanlı internet sansüründen, DNS/SNI engellerinden, bant daraltmalarından, reklamlardan, takip sistemlerinden ve DNS/IPv6 bağlantı sızıntılarından **tamamen cihaz üzerinde** koruyan, aynı zamanda gerçek DNS/bağlantı hızlandırma ve ağ tanılama araçları sunan **%100 ücretsiz, açık kaynaklı (MIT) ve sıfır sunucu bağımlılığına sahip** bir ağ koruma uygulamasıdır.
+TULPAR; **Windows (PC)**, **Android** ve **Linux** üzerinde çalışan, kullanıcıları DPI tabanlı internet sansüründen, DNS/SNI engellerinden, bant daraltmalarından, reklamlardan, takip sistemlerinden ve DNS/IPv6 bağlantı sızıntılarından **tamamen cihaz üzerinde** koruyan, aynı zamanda gerçek DNS/bağlantı hızlandırma ve ağ tanılama araçları sunan **%100 ücretsiz, açık kaynaklı (MIT) ve sıfır sunucu bağımlılığına sahip** bir ağ koruma uygulamasıdır.
 
 ---
 
@@ -62,10 +62,19 @@ Ayrıntılar için:
 | **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.4.0`) | Windows ve Android tarafından paylaşılır |
 | **Windows (`platforms/windows`)** | `tulpar.exe` / `tulpar-windows-x64.zip` | Tamamlandı (PerMonitorV2 HiDPI `#000000` UI, Sistem Tepsisi, İsviçre Çakısı Ayarlar, WinDivert 2.2.2 in-kernel filtre + SHA-256 & Authenticode doğrulama, TCP/MTU Onarıcı) | Tek dosya `tulpar.exe` (imzalı WinDivert gömülü & doğrulamalı) veya `.zip` paketi |
 | **Android (`platforms/android`)** | `tulpar.apk` | Tamamlandı (Kotlin `VpnService`, Split-Tunneling, Canlı Hız Testi, Hızlı Ayarlar Kutucuğu, Always-On VPN, Atomik IPv4↔IPv6 TUN, Android 15 Edge-to-Edge, JNI) | Android 8.0+ (API 26+, `arm64-v8a` & `x86_64`) |
+| **Linux (`platforms/linux`)** | `tulpar-linux-x64` / `.tar.gz` | Tamamlandı (Saf Rust Netlink `NFQUEUE` + `IPPROTO_RAW`, sıfır C `.so` bağımlılığı, `nftables` + `iptables` fallback, `fail-open` bypass, şeffaf DNS `:5354`, Zapret/nfqws çakışma onarımı, `systemd`) | Statik ikili dosya — tüm 64-bit Linux dağıtımları (Ubuntu, Debian, Arch, Fedora, Mint, SteamOS, Alpine vb.) |
 
 ---
 
 ## Hızlı Test & Derleme
+
+### Linux (Tek Komutla Zapret Alternatifi)
+```bash
+curl -fsSLO https://github.com/AtaberkGit1/TULPAR/releases/latest/download/tulpar-linux-x64
+chmod +x tulpar-linux-x64
+./tulpar-linux-x64 test            # Canlı şifreli DNS gecikmesi (ms) ve IPv6 testi
+sudo ./tulpar-linux-x64 install    # /usr/local/bin/tulpar + systemd servisi (Zapret çakışmalarını temizler)
+```
 
 ### Rust Çekirdeği (Linux / Windows)
 ```bash

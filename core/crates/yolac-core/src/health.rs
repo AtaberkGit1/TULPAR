@@ -294,9 +294,13 @@ impl HealthMonitor {
         let dpi_ok = *DPI_SELF_CHECK_OK.get_or_init(verify_dpi_transform_self_check);
         let dpi_report = if dpi_ok {
             let msg = if capabilities.supports_raw_packets {
-                "Çekirdek seviyesi DPI atlatma (%99.95 sıfır gecikmeli WinDivert bytecode filtresi + UDP desync) aktif."
+                if cfg!(target_os = "linux") {
+                    "Çekirdek seviyesi DPI atlatma (Netlink NFQUEUE + Raw Soket + UDP desync) aktif."
+                } else {
+                    "Çekirdek seviyesi DPI atlatma (%99.95 sıfır gecikmeli WinDivert bytecode filtresi + UDP desync) aktif."
+                }
             } else {
-                "256 KB hızlı TUN motoru, çoklu TLS parçalama ve UDP desync aktif."
+                "Yüksek verimli TUN motoru, çoklu TLS parçalama ve UDP desync aktif."
             };
             ModuleHealthReport {
                 id: ModuleId::AdvancedDpiCircumvention,

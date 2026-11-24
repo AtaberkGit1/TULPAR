@@ -33,10 +33,14 @@ pub struct UdpDesyncPacket {
 }
 
 /// Identifies initial handshake packets of UDP protocols frequently disrupted by Turkish ISP DPI
-/// (Discord Voice STUN/IP-Discovery and Roblox RakNet game-server handshakes).
+/// (Discord Voice STUN/IP-Discovery, WhatsApp/Telegram/WebRTC voice STUN, and Roblox RakNet).
 /// Returns `None` for normal steady-state media/game packets so zero per-packet overhead is added.
 pub fn detect_udp_desync_target(udp_payload: &[u8], dst_port: u16) -> Option<UdpDesyncKind> {
-    if dst_port < 1024 || udp_payload.len() < 16 {
+    if udp_payload.len() < 16 {
+        return None;
+    }
+    // Never touch DNS (53), DHCP (67/68), NTP (123), QUIC (443), or WireGuard (51820)
+    if matches!(dst_port, 53 | 67 | 68 | 123 | 443 | 51820) {
         return None;
     }
 
@@ -48,8 +52,14 @@ pub fn detect_udp_desync_target(udp_payload: &[u8], dst_port: u16) -> Option<Udp
         return Some(UdpDesyncKind::DiscordVoiceDiscovery);
     }
 
-    // 2. RFC 5389 STUN Binding Request (type 0x0001, magic cookie at 4..8, exact message length match)
-    if udp_payload.len() >= 20
+    // 2. RFC 5389 STUN Binding Request (Discord Voice, WhatsApp/Telegram/WebRTC Voice & Video)
+    let is_stun_port = dst_port >= 10_000
+        || dst_port == 3478
+        || dst_port == 5349
+        || dst_port == 1400
+        || (596..=599).contains(&dst_port);
+    if is_stun_port
+        && udp_payload.len() >= 20
         && udp_payload[0] == 0x00
         && udp_payload[1] == 0x01
         && udp_payload[4..8] == STUN_MAGIC_COOKIE
@@ -123,13 +133,12 @@ pub fn build_udp_desync_decoys(raw_udp_packet: &[u8], fake_ttl: u8) -> Option<Ve
     ])
 }
 
-/// Sensitive, non-censored essential services (WhatsApp, Turkish e-Devlet, universities, banks)
+/// Sensitive, non-censored essential services (Turkish e-Devlet, universities, banks, payment rails)
 /// whose strict L4 load balancers / WAFs can reject unnecessary out-of-order TLS splits.
-/// These start in clean Passthrough and ONLY escalate to DPI desync if an ISP actually blocks them!
+/// Note: WhatsApp TLS media/CDN hosts (`mmg.whatsapp.net`, `media.whatsapp.net`) are intentionally
+/// NOT exempted here so SNI-based bandwidth throttling can be bypassed, while WhatsApp's binary
+/// `WA\x06` messaging socket (non-TLS) passes through untouched automatically.
 const SENSITIVE_UNBLOCKED_SUFFIXES: &[&str] = &[
-    "whatsapp.com",
-    "whatsapp.net",
-    "wa.me",
     "gov.tr",
     "edu.tr",
     "k12.tr",
@@ -157,6 +166,11 @@ const SENSITIVE_UNBLOCKED_SUFFIXES: &[&str] = &[
     "teb.com.tr",
     "kuveytturk.com.tr",
     "albaraka.com.tr",
+    "hsbc.com.tr",
+    "fibabanka.com.tr",
+    "odeabank.com.tr",
+    "turkiyefinans.com.tr",
+    "sekerbank.com.tr",
     "bkm.com.tr",
     "troy.com.tr",
     "iyzico.com",
@@ -217,6 +231,17 @@ mod tests {
             Some(UdpDesyncKind::RobloxRakNet)
         );
 
+        // WhatsApp/Telegram STUN on port 3478 & 596 also detected; QUIC UDP 443 never matched
+        assert_eq!(
+            detect_udp_desync_target(&stun, 3478),
+            Some(UdpDesyncKind::StunBinding)
+        );
+        assert_eq!(
+            detect_udp_desync_target(&stun, 596),
+            Some(UdpDesyncKind::StunBinding)
+        );
+        assert_eq!(detect_udp_desync_target(&stun, 443), None);
+
         // Normal UDP payload -> ignored
         assert_eq!(detect_udp_desync_target(b"ordinary_game_tick_data_1234", 53120), None);
     }
@@ -245,8 +270,10 @@ mod tests {
 
     #[test]
     fn recognizes_whatsapp_edevlet_and_banks_without_matching_censored_sites() {
-        assert!(is_sensitive_unblocked_domain("web.whatsapp.com"));
-        assert!(is_sensitive_unblocked_domain("g.whatsapp.net"));
+        assert!(!is_sensitive_unblocked_domain("mmg.whatsapp.net"));
+        assert!(!is_sensitive_unblocked_domain("web.whatsapp.com"));
+        assert!(!is_sensitive_unblocked_domain("rr1---sn-example.googlevideo.com"));
+        assert!(!is_sensitive_unblocked_domain("scontent.cdninstagram.com"));
         assert!(is_sensitive_unblocked_domain("www.turkiye.gov.tr"));
         assert!(is_sensitive_unblocked_domain("sube.garantibbva.com.tr"));
         assert!(!is_sensitive_unblocked_domain("www.roblox.com"));

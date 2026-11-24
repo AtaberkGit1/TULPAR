@@ -162,7 +162,20 @@ impl AppController {
 
     pub fn notify_network_resume(&self) {
         if self.current_state() == EngineState::Active {
-            self.engine.notify_network_change();
+            self.engine.adaptive().on_network_change();
+            self.engine.captive_portal().reset();
+            let dns = Arc::clone(self.engine.dns_engine());
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async {
+                        dns.on_network_change().await;
+                        let _ = dns.probe_fastest_upstream().await;
+                    });
+                }
+            });
         }
     }
 

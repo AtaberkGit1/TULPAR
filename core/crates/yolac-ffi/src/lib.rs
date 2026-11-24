@@ -274,13 +274,13 @@ pub extern "C" fn yolac_start_tun_fd(
                 return -2;
             };
             let fd_dev = Arc::new(fd_dev);
+            let prev = h.engine.lock().ok().map(|mut g| std::mem::replace(&mut *g, Arc::clone(&engine)));
+            if let Some(old_engine) = prev {
+                h.rt.block_on(old_engine.stop());
+            }
             let res = h.rt.block_on(engine.start_tun(fd_dev));
             if res.is_err() {
                 return -2;
-            }
-            let prev = h.engine.lock().ok().map(|mut g| std::mem::replace(&mut *g, engine));
-            if let Some(old_engine) = prev {
-                h.rt.block_on(old_engine.stop());
             }
             0
         }))

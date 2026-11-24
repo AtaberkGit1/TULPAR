@@ -13,7 +13,6 @@ import android.net.IpPrefix
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -24,6 +23,7 @@ import java.net.Inet6Address
 import java.net.InetAddress
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 class YolacVpnService : VpnService() {
 
@@ -106,6 +106,7 @@ class YolacVpnService : VpnService() {
 
     private val worker = Executors.newSingleThreadExecutor()
     private val failedWithError = AtomicBoolean(false)
+    private val serviceGen = AtomicLong(0L)
     @Volatile
     private var currentTunHasIpv6: Boolean = false
     @Volatile
@@ -118,17 +119,24 @@ class YolacVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                stopProtectionAsync()
+                val gen = serviceGen.incrementAndGet()
+                stopProtectionAsync(gen)
                 return START_NOT_STICKY
             }
             ACTION_REAPPLY -> {
+                val gen = serviceGen.get()
                 if (isRunningProtection) {
-                    worker.execute { reapplyTunLocked() }
+                    worker.execute {
+                        if (serviceGen.get() == gen) {
+                            reapplyTunLocked()
+                        }
+                    }
                 }
                 return START_STICKY
             }
             // Supports both explicit user start and Android Always-On VPN system start
             ACTION_START, SERVICE_INTERFACE, null -> {
+                val gen = serviceGen.incrementAndGet()
                 failedWithError.set(false)
                 updateState(YolacNative.STATE_ACTIVATING)
                 ensureNotificationChannel()
@@ -147,15 +155,15 @@ class YolacVpnService : VpnService() {
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                worker.execute { startProtectionLocked() }
+                worker.execute { startProtectionLocked(gen) }
             }
         }
         return START_STICKY
     }
 
     /**
-     * Called directly from Rust JNI (`jni_bridge.rs`) whenever the native TUN engine transitions state
-     * (including unexpected TUN failure/close so Android UI never lies about active protection!).
+     * Called directly from Rust JNI (`jni_bridge.rs`) whenever the active TUN engine transitions
+     * state (guards against unexpected TUN EOF/error leaving a stuck foreground notification).
      */
     fun onNativeStateChanged(nativeState: Int) {
         if (nativeState == YolacNative.STATE_ERROR) {
@@ -168,10 +176,17 @@ class YolacVpnService : VpnService() {
             } catch (_: Throwable) {
             }
             stopSelf()
-        } else if (nativeState == YolacNative.STATE_ACTIVE || nativeState == YolacNative.STATE_INACTIVE) {
-            if (!failedWithError.get()) {
-                updateState(nativeState)
+        } else if (nativeState == YolacNative.STATE_INACTIVE && isRunningProtection) {
+            isRunningProtection = false
+            updateState(YolacNative.STATE_INACTIVE)
+            unregisterNetworkObserver()
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
             }
+            stopSelf()
+        } else if (nativeState == YolacNative.STATE_ACTIVE && !failedWithError.get()) {
+            updateState(nativeState)
         }
     }
 
@@ -332,7 +347,8 @@ class YolacVpnService : VpnService() {
         }
     }
 
-    private fun startProtectionLocked() {
+    private fun startProtectionLocked(expectedGen: Long) {
+        if (serviceGen.get() != expectedGen) return
         if (isRunningProtection && YolacNative.nativeGetState() == YolacNative.STATE_ACTIVE) {
             updateState(YolacNative.STATE_ACTIVE)
             return
@@ -345,6 +361,13 @@ class YolacVpnService : VpnService() {
         if (established == null && usedIpv6) {
             usedIpv6 = false
             established = establishTun(includeIpv6 = false)
+        }
+        if (serviceGen.get() != expectedGen) {
+            try {
+                established?.pfd?.close()
+            } catch (_: Throwable) {
+            }
+            return
         }
         if (established == null) {
             failedWithError.set(true)
@@ -364,6 +387,10 @@ class YolacVpnService : VpnService() {
             established.selfAppExcluded,
             isLockdown,
         )
+        if (serviceGen.get() != expectedGen) {
+            YolacNative.nativeStop()
+            return
+        }
         if (!ok) {
             failedWithError.set(true)
             YolacNative.nativeReportPlatformError(YolacNative.ERROR_TUN_SETUP_FAILED)
@@ -385,6 +412,7 @@ class YolacVpnService : VpnService() {
      */
     private fun reapplyTunLocked(forcedIpv6: Boolean? = null) {
         if (!isRunningProtection) return
+        val genAtStart = serviceGen.get()
         val lp = activeUnderlyingLinkProperties()
         inspectPrivateDnsStatus(lp)
         var targetIpv6 = forcedIpv6 ?: hasGlobalIpv6OnLink(lp)
@@ -392,6 +420,13 @@ class YolacVpnService : VpnService() {
         if (established == null && targetIpv6) {
             targetIpv6 = false
             established = establishTun(includeIpv6 = false)
+        }
+        if (serviceGen.get() != genAtStart) {
+            try {
+                established?.pfd?.close()
+            } catch (_: Throwable) {
+            }
+            return
         }
         if (established == null) {
             YolacNative.nativeSetDynamicIpv6Block(!targetIpv6)
@@ -408,6 +443,10 @@ class YolacVpnService : VpnService() {
             established.selfAppExcluded,
             isLockdown,
         )
+        if (serviceGen.get() != genAtStart) {
+            YolacNative.nativeStop()
+            return
+        }
         if (ok) {
             currentTunHasIpv6 = targetIpv6
             updateState(YolacNative.STATE_ACTIVE)
@@ -422,13 +461,15 @@ class YolacVpnService : VpnService() {
         }
     }
 
-    private fun stopProtectionAsync() {
+    private fun stopProtectionAsync(expectedGen: Long) {
         isRunningProtection = false
         failedWithError.set(false)
         updateState(YolacNative.STATE_DEACTIVATING)
         unregisterNetworkObserver()
         worker.execute {
             YolacNative.nativeStop()
+            // Do NOT strip notification or stopSelf if a rapid ACTION_START superseded this stop!
+            if (serviceGen.get() != expectedGen) return@execute
             updateState(YolacNative.STATE_INACTIVE)
             try {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -441,20 +482,16 @@ class YolacVpnService : VpnService() {
     private fun registerNetworkObserver() {
         unregisterNetworkObserver()
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
-        val req = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-            .build()
         observerRegisteredAtMs = System.currentTimeMillis()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (System.currentTimeMillis() - observerRegisteredAtMs < 600L) return
-                worker.execute { handleUnderlyingNetworkChange(cm.getLinkProperties(network)) }
+                worker.execute { handleUnderlyingNetworkChange(cm.getLinkProperties(network), networkChanged = true) }
             }
 
             override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
                 if (System.currentTimeMillis() - observerRegisteredAtMs < 600L) return
-                worker.execute { handleUnderlyingNetworkChange(linkProperties) }
+                worker.execute { handleUnderlyingNetworkChange(linkProperties, networkChanged = false) }
             }
 
             override fun onLost(network: Network) {
@@ -466,19 +503,19 @@ class YolacVpnService : VpnService() {
             }
         }
         try {
-            cm.registerNetworkCallback(req, cb)
+            cm.registerDefaultNetworkCallback(cb)
             networkCallback = cb
         } catch (_: Exception) {
         }
     }
 
-    private fun handleUnderlyingNetworkChange(lp: LinkProperties?) {
+    private fun handleUnderlyingNetworkChange(lp: LinkProperties?, networkChanged: Boolean) {
         if (!isRunningProtection) return
         inspectPrivateDnsStatus(lp)
         val newHasIpv6 = hasGlobalIpv6OnLink(lp)
         if (newHasIpv6 != currentTunHasIpv6) {
             reapplyTunLocked(forcedIpv6 = newHasIpv6)
-        } else {
+        } else if (networkChanged) {
             YolacNative.nativeNotifyNetworkChange()
         }
     }
@@ -494,7 +531,8 @@ class YolacVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        stopProtectionAsync()
+        val gen = serviceGen.incrementAndGet()
+        stopProtectionAsync(gen)
         super.onRevoke()
     }
 

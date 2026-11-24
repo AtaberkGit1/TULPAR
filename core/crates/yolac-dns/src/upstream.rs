@@ -269,6 +269,9 @@ impl AsyncWrite for DpiEvasiveTlsStream {
                         cx.waker().wake_by_ref();
                         return Poll::Pending;
                     }
+                    this.pending_tail.clear();
+                    this.tail_pos = 0;
+                    this.reported_first_len = 0;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,

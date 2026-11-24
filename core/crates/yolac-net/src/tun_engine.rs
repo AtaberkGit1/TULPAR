@@ -583,8 +583,7 @@ impl TunEngine {
                 };
                 if udp.dst_port == 443
                     && self.config.quic_policy == QuicPolicy::BlockFallbackToTcp
-                    && (detect_quic_initial(udp.payload).is_some()
-                        || (!udp.payload.is_empty() && !crate::captive_portal::is_local_lan_ip(ip.dst_ip)))
+                    && detect_quic_initial(udp.payload).is_some()
                 {
                     return false;
                 }
@@ -1003,14 +1002,17 @@ impl TunEngine {
         tokio::spawn(async move {
             let _permit = permit;
             let qname = parse_dns_query(&query_bytes).map(|q| q.qname);
-            let resolved = tokio::select! {
-                res = shutdown_rx.changed() => {
-                    if res.is_err() || *shutdown_rx.borrow() {
-                        return;
+            let resolve_fut = dns.resolve_with_swr(&query_bytes);
+            tokio::pin!(resolve_fut);
+            let resolved = loop {
+                tokio::select! {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
                     }
-                    dns.resolve_with_swr(&query_bytes).await
+                    r = &mut resolve_fut => break r,
                 }
-                r = dns.resolve_with_swr(&query_bytes) => r,
             };
             let (resp_opt, outcome) = resolved;
             match outcome {

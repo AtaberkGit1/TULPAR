@@ -178,7 +178,8 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
         pos += 4;
         if pos + ext_len > ext_end {
             if allow_truncated {
-                // Chrome 131+ PQ extension permutation: if SNI straddles MSS boundary, extract partial SNI range
+                // Chrome 131+ PQ extension permutation: if SNI straddles MSS boundary, extract partial
+                // SNI byte range for splitting, and ONLY populate `sni` when the full hostname arrived.
                 if ext_type == 0x0000 && pos + 5 < ext_end {
                     let avail = &body[pos..ext_end];
                     let name_type = avail[2];
@@ -188,8 +189,10 @@ fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<Client
                         let abs_start = BODY_BASE + pos + 5;
                         let abs_end = abs_start + avail_name_len;
                         sni_range = Some((abs_start, abs_end));
-                        if let Ok(partial) = std::str::from_utf8(&avail[5..5 + avail_name_len]) {
-                            sni = Some(partial.to_ascii_lowercase());
+                        if avail_name_len == declared_name_len {
+                            if let Ok(full_sni) = std::str::from_utf8(&avail[5..5 + avail_name_len]) {
+                                sni = Some(full_sni.to_ascii_lowercase());
+                            }
                         }
                     }
                 }

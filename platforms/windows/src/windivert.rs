@@ -512,12 +512,22 @@ impl WindowsPacketEngine {
     where
         F: Fn(EngineState) + Send + Sync + 'static,
     {
-        // Guard against accidental double-start overwriting an active worker
-        if self.worker.lock().ok().and_then(|g| g.as_ref().map(|_| ())).is_some() {
-            return Err((
-                ErrorCode::AlreadyRunning,
-                "TULPAR paket motoru zaten çalışıyor.".into(),
-            ));
+        // Guard against accidental double-start overwriting a live worker, while cleaning up dead threads
+        if let Ok(mut w) = self.worker.lock() {
+            if let Some(ref jh) = *w {
+                if !jh.is_finished() {
+                    return Err((
+                        ErrorCode::AlreadyRunning,
+                        "TULPAR paket motoru zaten çalışıyor.".into(),
+                    ));
+                }
+            }
+            if let Some(dead) = w.take() {
+                let _ = dead.join();
+            }
+        }
+        if let Ok(mut g) = self.active_api.lock() {
+            *g = None;
         }
 
         let api = Arc::new(loader::WinDivertApi::load().map_err(|(code, os_err)| {
@@ -539,11 +549,11 @@ impl WindowsPacketEngine {
         // inside Windows kernel bytecode — >99.95% of gaming, Discord RTP voice, bulk HTTPS uploads,
         // and Gigabit download ACKs NEVER leave the Windows kernel!
         let kernel_fast_filter = CString::new(
-            "not loopback and ((outbound and ((tcp.DstPort == 443 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 9 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01))) or (tcp.DstPort == 80 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 16 and (tcp.Payload[0] == 0x47 or tcp.Payload[0] == 0x50 or tcp.Payload[0] == 0x48 or tcp.Payload[0] == 0x44 or tcp.Payload[0] == 0x4F)))) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443 or (udp.DstPort >= 10000 and udp.PayloadLength == 74 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[2] == 0x00 and udp.Payload[3] == 0x46) or (udp.DstPort >= 1024 and udp.PayloadLength >= 20 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[4] == 0x21 and udp.Payload[5] == 0x12 and udp.Payload[6] == 0xA4 and udp.Payload[7] == 0x42) or (udp.DstPort >= 49152 and udp.PayloadLength >= 17 and udp.Payload[0] == 0x05 and udp.Payload[1] == 0x00 and udp.Payload[2] == 0xFF and udp.Payload[3] == 0xFF and udp.Payload[4] == 0x00 and udp.Payload[5] == 0xFE))) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 6 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x02))) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50 and tcp.Payload[9] == 0x33))))))",
+            "not loopback and ((outbound and ((tcp.DstPort == 443 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 9 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01))) or (tcp.DstPort == 80 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 16 and (tcp.Payload[0] == 0x47 or tcp.Payload[0] == 0x50 or tcp.Payload[0] == 0x48 or tcp.Payload[0] == 0x44 or tcp.Payload[0] == 0x4F)))) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443 or (udp.DstPort >= 10000 and udp.PayloadLength == 74 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[2] == 0x00 and udp.Payload[3] == 0x46) or ((udp.DstPort >= 10000 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599)) and udp.PayloadLength >= 20 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[4] == 0x21 and udp.Payload[5] == 0x12 and udp.Payload[6] == 0xA4 and udp.Payload[7] == 0x42) or (udp.DstPort >= 49152 and udp.PayloadLength >= 17 and udp.Payload[0] == 0x05 and udp.Payload[1] == 0x00 and udp.Payload[2] == 0xFF and udp.Payload[3] == 0xFF and udp.Payload[4] == 0x00 and udp.Payload[5] == 0xFE))) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 6 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x02))) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50 and tcp.Payload[9] == 0x33))))))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert filtre derleme hatası.".into()))?;
         let fallback_filter = CString::new(
-            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and (tcp.Syn or tcp.Rst or tcp.Fin)))",
+            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599))) or (inbound and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and (tcp.Syn or tcp.Rst or tcp.Fin)))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert yedek filtre derleme hatası.".into()))?;
 
@@ -1137,9 +1147,8 @@ fn process_outbound_inner(
                 return vec![];
             }
 
-            // 3. Single-shot Zapret-style UDP desync for Discord Voice STUN/IP-Discovery & Roblox RakNet
-            if udp.dst_port >= 1024
-                && !is_local_lan_ip(ip.dst_ip)
+            // 3. Single-shot UDP desync for Discord Voice STUN/IP-Discovery, WhatsApp/Telegram STUN & Roblox RakNet
+            if !is_local_lan_ip(ip.dst_ip)
                 && detect_udp_desync_target(udp.payload, udp.dst_port).is_some()
                 && flows.should_desync_udp_flow(udp.src_port, ip.dst_ip, udp.dst_port)
             {
@@ -1868,11 +1877,12 @@ mod tests {
         let mut out_addr = WinDivertAddress::default();
         out_addr.set_outbound();
 
-        // 1. WhatsApp Web & e-Devlet start in clean Passthrough (never broken by unnecessary splits!)
-        let wa_ch = sample_tls_client_hello("web.whatsapp.com");
-        let wa_pkt = build_ipv4_tcp_packet(
+        // 1. WhatsApp TLS media/CDN gets anti-throttling DPI desync (while non-TLS WA\x06 messaging
+        //    stays untouched), whereas Turkish e-Devlet/banks start in clean Passthrough!
+        let edevlet_ch = sample_tls_client_hello("www.turkiye.gov.tr");
+        let edevlet_pkt = build_ipv4_tcp_packet(
             Ipv4Addr::new(192, 168, 1, 10),
-            Ipv4Addr::new(157, 240, 22, 60),
+            Ipv4Addr::new(212, 174, 15, 20),
             56100,
             443,
             1000,
@@ -1882,11 +1892,29 @@ mod tests {
             64,
             1,
             &[],
-            &wa_ch,
+            &edevlet_ch,
         );
-        let wa_out = process_packet_with_tracker(&wa_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
-        assert_eq!(wa_out.len(), 1);
-        assert_eq!(wa_out[0].checksum, ChecksumAction::Passthrough);
+        let edevlet_out = process_packet_with_tracker(&edevlet_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(edevlet_out.len(), 1);
+        assert_eq!(edevlet_out[0].checksum, ChecksumAction::Passthrough);
+
+        let wa_media_ch = sample_tls_client_hello("mmg.whatsapp.net");
+        let wa_media_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(157, 240, 22, 60),
+            56105,
+            443,
+            1000,
+            2000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            2,
+            &[],
+            &wa_media_ch,
+        );
+        let wa_out = process_packet_with_tracker(&wa_media_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert!(wa_out.len() > 1, "WhatsApp CDN TLS must get anti-throttling DPI desync");
 
         // 2. Local LAN .local DNS query to home router passes through directly to local router
         let local_q = build_dns_query(0x4444, "printer.local", QType::A);

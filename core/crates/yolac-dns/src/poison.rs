@@ -54,10 +54,10 @@ pub fn detect_poisoning(query: &DnsQuery, resp: &DnsResponse) -> Option<PoisonRe
     if resp.id != query.id {
         return Some(PoisonReason::TransactionIdMismatch);
     }
-    if resp.qname.is_empty() || resp.qname != query.qname {
+    if resp.qname != query.qname {
         return Some(PoisonReason::QuestionMismatch);
     }
-    if is_local_lan_hostname(&query.qname) || query.qname.ends_with(".localhost") {
+    if query.qname.is_empty() || is_local_lan_hostname(&query.qname) || query.qname.ends_with(".localhost") {
         return None;
     }
 
@@ -88,7 +88,7 @@ pub fn detect_poisoning_tls(query: &DnsQuery, resp: &DnsResponse) -> Option<Pois
     if resp.id != query.id {
         return Some(PoisonReason::TransactionIdMismatch);
     }
-    if resp.qname.is_empty() || resp.qname != query.qname {
+    if resp.qname != query.qname {
         return Some(PoisonReason::QuestionMismatch);
     }
     for ans in &resp.answers {

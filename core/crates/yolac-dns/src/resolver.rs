@@ -171,10 +171,17 @@ impl DnsEngine {
         }
 
         if let Ok(mut cache) = self.cache.try_lock() {
-            if let CacheLookup::Fresh(cached) = cache.lookup(&query.qname, query.qtype, query.id) {
-                self.total_queries.fetch_add(1, Ordering::Relaxed);
-                self.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return Some((Some(cached), DnsOutcome::CacheHit));
+            match cache.lookup(&query.qname, query.qtype, query.id) {
+                CacheLookup::Fresh(cached) => {
+                    self.total_queries.fetch_add(1, Ordering::Relaxed);
+                    self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    return Some((Some(cached), DnsOutcome::CacheHit));
+                }
+                CacheLookup::StaleNeedsRefresh(_) => {
+                    // Undo the `refreshing` flag so async `resolve_with_swr` spawns background refresh!
+                    cache.clear_refreshing(&query.qname, query.qtype);
+                }
+                CacheLookup::Miss => {}
             }
         }
 
@@ -227,12 +234,14 @@ impl DnsEngine {
                 if let Ok(rt) = tokio::runtime::Handle::try_current() {
                     rt.spawn(async move {
                         let (_, outcome) = this.resolve_upstream_only(&bg_query, &query).await;
-                        if outcome == DnsOutcome::Failed {
+                        if outcome != DnsOutcome::UpstreamResolved {
                             if let Ok(mut c) = this.cache.lock() {
                                 c.clear_refreshing(&qname, qtype);
                             }
                         }
                     });
+                } else if let Ok(mut c) = self.cache.lock() {
+                    c.clear_refreshing(&qname, qtype);
                 }
                 return (Some(stale_pkt), DnsOutcome::CacheHit);
             }
@@ -276,9 +285,19 @@ impl DnsEngine {
             .lock()
             .map(|mut c| c.lookup(&query.qname, query.qtype, query.id))
             .unwrap_or(CacheLookup::Miss);
-        if let CacheLookup::Fresh(cached) = cache_lookup {
-            self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return (Some(cached), DnsOutcome::CacheHit);
+        match cache_lookup {
+            CacheLookup::Fresh(cached) => {
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return (Some(cached), DnsOutcome::CacheHit);
+            }
+            CacheLookup::StaleNeedsRefresh(stale_pkt) => {
+                if let Ok(mut c) = self.cache.lock() {
+                    c.clear_refreshing(&query.qname, query.qtype);
+                }
+                self.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return (Some(stale_pkt), DnsOutcome::CacheHit);
+            }
+            CacheLookup::Miss => {}
         }
 
         self.resolve_singleflight(query_wire, &query).await
@@ -289,19 +308,39 @@ impl DnsEngine {
         query_wire: &[u8],
         query: &DnsQuery,
     ) -> (Option<Vec<u8>>, DnsOutcome) {
+        struct InflightGuard<'a> {
+            inflight: &'a std::sync::Mutex<HashMap<(String, QType), Arc<Notify>>>,
+            key: Option<(String, QType)>,
+        }
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(key) = self.key.take() {
+                    if let Ok(mut guard) = self.inflight.lock() {
+                        if let Some(notify) = guard.remove(&key) {
+                            notify.notify_waiters();
+                        }
+                    }
+                }
+            }
+        }
+
         let sf_key = (query.qname.clone(), query.qtype);
-        let existing_notify = {
+        let existing_fut = {
             let mut guard = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(n) = guard.get(&sf_key) {
-                Some(Arc::clone(n))
+                let n = Arc::clone(n);
+                // Register waiter BEFORE releasing the lock so we never miss `notify_waiters()`!
+                Some(async move {
+                    n.notified().await;
+                })
             } else {
                 guard.insert(sf_key.clone(), Arc::new(Notify::new()));
                 None
             }
         };
 
-        if let Some(notify) = existing_notify {
-            let _ = tokio::time::timeout(self.config.upstream_timeout, notify.notified()).await;
+        if let Some(wait_fut) = existing_fut {
+            let _ = tokio::time::timeout(self.config.upstream_timeout, wait_fut).await;
             if let Ok(mut cache) = self.cache.lock() {
                 if let CacheLookup::Fresh(cached) = cache.lookup(&query.qname, query.qtype, query.id) {
                     self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -312,14 +351,11 @@ impl DnsEngine {
             return self.resolve_upstream_only(query_wire, query).await;
         }
 
-        let result = self.resolve_upstream_only(query_wire, query).await;
-
-        if let Ok(mut guard) = self.inflight.lock() {
-            if let Some(notify) = guard.remove(&sf_key) {
-                notify.notify_waiters();
-            }
-        }
-        result
+        let _inflight_guard = InflightGuard {
+            inflight: &self.inflight,
+            key: Some(sf_key),
+        };
+        self.resolve_upstream_only(query_wire, query).await
     }
 
     async fn resolve_upstream_only(

@@ -79,11 +79,27 @@ pub fn inspect_and_repair_windows_network() -> String {
     {
         let mut notes: Vec<String> = Vec::new();
         let before = run_hidden_cmd("netsh", &["interface", "tcp", "show", "global"]).unwrap_or_default();
-        let lower = before.to_ascii_lowercase();
 
-        // Detect crippled TCP Auto-Tuning (disabled / highlyrestricted / restricted) and restore normal
-        let autotuning_crippled = lower.contains("autotuning")
-            && (lower.contains("disabled") || lower.contains("restricted"));
+        // Line-by-line check supporting both English and Turkish Windows locales
+        let find_line_val = |keys: &[&str]| -> Option<String> {
+            before.lines().find_map(|line| {
+                let low = line.to_ascii_lowercase();
+                if keys.iter().any(|k| low.contains(k)) {
+                    Some(low)
+                } else {
+                    None
+                }
+            })
+        };
+
+        let autotune_line = find_line_val(&["auto-tuning level", "autotuninglevel", "otomatik ayarlama"]);
+        let autotuning_crippled = autotune_line.as_deref().is_some_and(|l| {
+            l.contains("disabled")
+                || l.contains("restricted")
+                || l.contains("devre")
+                || l.contains("kısıt")
+                || l.contains("kisit")
+        });
         if autotuning_crippled {
             let _ = run_hidden_cmd("netsh", &["int", "tcp", "set", "global", "autotuninglevel=normal"]);
             notes.push("TCP Auto-Tuning onarıldı (normal)".into());
@@ -91,8 +107,11 @@ pub fn inspect_and_repair_windows_network() -> String {
             notes.push("TCP Auto-Tuning: normal".into());
         }
 
-        // Detect disabled RSS and enable it
-        if lower.contains("receive-side scaling state") && lower.contains("disabled") {
+        let rss_line = find_line_val(&["receive-side scaling", "ölçekleme", "olcekleme"]);
+        let rss_disabled = rss_line
+            .as_deref()
+            .is_some_and(|l| l.contains("disabled") || l.contains("devre"));
+        if rss_disabled {
             let _ = run_hidden_cmd("netsh", &["int", "tcp", "set", "global", "rss=enabled"]);
             notes.push("RSS etkinleştirildi".into());
         } else {

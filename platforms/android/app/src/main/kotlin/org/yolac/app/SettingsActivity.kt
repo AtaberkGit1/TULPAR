@@ -45,6 +45,7 @@ class SettingsActivity : ComponentActivity() {
     private var selectedModuleId: Int? = null
     private var checkingUpdates = false
     private var runningDiagnostics = false
+    private var activeDialog: AlertDialog? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -346,6 +347,12 @@ class SettingsActivity : ComponentActivity() {
         refreshHealth()
     }
 
+    override fun onDestroy() {
+        activeDialog?.dismiss()
+        activeDialog = null
+        super.onDestroy()
+    }
+
     private fun getExcludedPackages(): MutableSet<String> {
         val saved = getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
             .getStringSet(YolacVpnService.KEY_EXCLUDED_PACKAGES, emptySet())
@@ -405,7 +412,8 @@ class SettingsActivity : ComponentActivity() {
             val labels = apps.map { it.second }.toTypedArray()
             val checked = BooleanArray(apps.size) { idx -> excluded.contains(apps[idx].first) }
 
-            AlertDialog.Builder(this@SettingsActivity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            activeDialog?.dismiss()
+            activeDialog = AlertDialog.Builder(this@SettingsActivity, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("Hariç Tutulacak Uygulamalar")
                 .setMultiChoiceItems(labels, checked) { _, which, isChecked ->
                     val pkg = apps[which].first

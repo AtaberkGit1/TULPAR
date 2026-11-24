@@ -64,6 +64,17 @@ impl YolacConfig {
             mtu: 1500,
         }
     }
+
+    pub fn linux_desktop() -> Self {
+        Self {
+            profile: MemoryProfile::Standard,
+            capabilities: PlatformCapabilities::LINUX_NFQUEUE,
+            initial_strategy: DpiStrategy::TurkeyDesyncAuto,
+            ipv6_mode: Ipv6LeakMode::DualStackProtected,
+            quic_policy: QuicPolicy::BlockFallbackToTcp,
+            mtu: 1500,
+        }
+    }
 }
 
 struct RunningTask {
@@ -222,11 +233,17 @@ impl YolacEngine {
     /// upstreams concurrently (promoting the fastest one), tests real IPv6 reachability,
     /// and compiles live ad-blocking & cache hit-rate stats.
     pub async fn run_live_diagnostics(&self) -> DiagnosticReport {
+        let forced_v4_only = self.block_ipv6_dynamic.load(Ordering::Relaxed)
+            || self.config.ipv6_mode == Ipv6LeakMode::BlockUnprotectedIpv6;
         let (benchmarks, ipv6_mode) = tokio::join!(
             self.dns.benchmark_all_upstreams(),
             probe_ipv6_leak_mode(self.protector.as_ref(), None, Duration::from_millis(600))
         );
-        let ipv6_ok = ipv6_mode == Ipv6LeakMode::DualStackProtected;
+        let ipv6_ok = !forced_v4_only && ipv6_mode == Ipv6LeakMode::DualStackProtected;
+        if self.config.ipv6_mode == Ipv6LeakMode::DualStackProtected && !ipv6_ok {
+            self.block_ipv6_dynamic.store(true, Ordering::Relaxed);
+            self.dns.set_suppress_aaaa(true);
+        }
         let stats = self.dns.stats_snapshot();
         DiagnosticReport::build(
             benchmarks,

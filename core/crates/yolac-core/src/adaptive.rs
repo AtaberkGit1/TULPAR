@@ -205,6 +205,7 @@ impl StrategyAdvisor for AdaptiveController {
                 entry.last_updated = now;
                 if let Some(next) = self.capabilities.escalate(entry.strategy) {
                     entry.strategy = next;
+                    entry.consecutive_failures = 0;
                 } else if entry.strategy == DpiStrategy::TcpOobAndTlsSplit
                     && entry.consecutive_failures >= 3
                 {
