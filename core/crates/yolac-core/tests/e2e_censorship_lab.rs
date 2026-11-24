@@ -354,9 +354,15 @@ async fn test_3_virtual_tun_packet_loop_dns_leak_guard_quic_and_tcp() {
         while let Ok((mut s, _)) = echo_listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = [0u8; 128];
-                if let Ok(n) = s.read(&mut buf).await {
-                    if n > 0 {
-                        let _ = s.write_all(&buf[..n]).await;
+                let mut total = 0usize;
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = s.write_all(&buf[..n]).await;
+                    total += n;
+                    if total >= 34 {
+                        break;
                     }
                 }
             });
@@ -996,5 +1002,107 @@ async fn test_8_tun_backpressure_streaming_and_post_quantum_client_hello_reassem
         saw_fragmented_records.load(Ordering::SeqCst),
         2,
         "DpiTcpRelay must reassemble & TLS-fragment 1900+ byte Post-Quantum ClientHello into 2 records"
+    );
+}
+
+#[tokio::test]
+async fn test_9_turkey_isp_stateful_dpi_blocks_weak_split_but_multi_record_and_escalation_bypass() {
+    // Realistic Turkish ISP DPI simulator that reassembles simple 2-record splits AND inspects SNI,
+    // blocking any connection that doesn't split into >= 3 TLS records / small chunks!
+    let (srv_cfg, cli_cfg) = build_test_tls_configs(vec!["www.roblox.com".into()]);
+    let tls_backend = spawn_tls_echo_server(srv_cfg).await;
+
+    let strict_dpi = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let strict_dpi_addr = strict_dpi.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = strict_dpi.accept().await {
+            tokio::spawn(async move {
+                // Simulate stateful ISP DPI reading first 20ms of bytes (reassembling simple 2-part splits!)
+                let mut collected = Vec::new();
+                let mut tmp = [0u8; 4096];
+                let window = tokio::time::Instant::now() + Duration::from_millis(25);
+                while tokio::time::Instant::now() < window {
+                    match tokio::time::timeout(Duration::from_millis(8), client.read(&mut tmp)).await {
+                        Ok(Ok(n)) if n > 0 => collected.extend_from_slice(&tmp[..n]),
+                        _ => break,
+                    }
+                }
+                // Count TLS records in the collected burst: if < 4 records and contains raw "roblox.com"
+                // in fewer than 4 TLS fragments -> DPI blocks with RST!
+                let mut pos = 0usize;
+                let mut rec_count = 0usize;
+                while pos + 5 <= collected.len() && collected[pos] == 0x16 {
+                    let rlen = u16::from_be_bytes([collected[pos + 3], collected[pos + 4]]) as usize;
+                    pos += 5 + rlen;
+                    rec_count += 1;
+                }
+                if rec_count < 4 {
+                    drop(client); // Simulate strict ISP DPI RST blocking simple 1-3 record splits!
+                    return;
+                }
+                let Ok(mut up) = TcpStream::connect(tls_backend).await else { return };
+                if up.write_all(&collected).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
+            });
+        }
+    });
+
+    // Adaptive mobile controller starts at TlsMultiRecordAndTcpSplit (3 records) -> strict DPI resets ->
+    // DpiTcpRelay transparently escalates to TlsSmallChunks (>= 4 records) ON THE VERY FIRST CONNECTION!
+    let adaptive = Arc::new(AdaptiveController::new(
+        PlatformCapabilities::MOBILE_SANDBOX,
+        DpiStrategy::TlsMultiRecordAndTcpSplit,
+        64,
+    ));
+    let relay = Arc::new(DpiTcpRelay::new(Arc::new(NoopProtector), adaptive));
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = proxy.accept().await {
+            let r = Arc::clone(&relay);
+            tokio::spawn(async move {
+                let _ = r.relay_stream(sock, strict_dpi_addr).await;
+            });
+        }
+    });
+
+    let connector = TlsConnector::from(cli_cfg);
+    let sni = ServerName::try_from("www.roblox.com".to_string()).unwrap();
+    let c = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut tls = connector
+        .connect(sni, c)
+        .await
+        .expect("Mobile ByeDPI multi-stage transparent retry must bypass strict stateful Turkish DPI on 1st load");
+    tls.write_all(b"PING").await.unwrap();
+    let mut reply = [0u8; 16];
+    let n = tls.read(&mut reply).await.unwrap();
+    assert_eq!(&reply[..n], b"OK:YOLAC");
+
+    // Also verify Turkish BTK public sinkhole IP (195.175.254.2) is flagged as DNS poisoning!
+    let q = yolac_dns::wire::DnsQuery {
+        id: 77,
+        flags: 0x0100,
+        qname: "www.roblox.com".into(),
+        qtype: QType::A,
+        qclass: 1,
+        question_end: 30,
+    };
+    let btk_resp = yolac_dns::wire::DnsResponse {
+        id: 77,
+        rcode: 0,
+        qname: "www.roblox.com".into(),
+        qtype: QType::A,
+        answers: vec![yolac_dns::wire::DnsAnswer {
+            rtype: 1,
+            ttl: 60,
+            data: DnsRecordData::A(Ipv4Addr::new(195, 175, 254, 2)),
+        }],
+        min_ttl: 60,
+    };
+    assert!(
+        yolac_dns::detect_poisoning(&q, &btk_resp).is_some(),
+        "Turkish ISP BTK sinkhole 195.175.254.2 must be rejected as DNS poisoning!"
     );
 }

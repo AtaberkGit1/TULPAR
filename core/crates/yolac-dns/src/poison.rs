@@ -10,6 +10,7 @@ pub enum PoisonReason {
     QuestionMismatch,
     LoopbackOrUnspecifiedHijack(IpAddr),
     PrivateRangeHijack(IpAddr),
+    KnownCensorshipSinkhole(IpAddr),
 }
 
 fn is_local_or_special_domain(domain: &str) -> bool {
@@ -27,6 +28,10 @@ fn is_bogon_v4(ip: Ipv4Addr) -> Option<PoisonReason> {
     }
     if ip.is_private() || ip.is_link_local() {
         return Some(PoisonReason::PrivateRangeHijack(IpAddr::V4(ip)));
+    }
+    // Known public ISP censorship sinkhole / BTK block page IPs
+    if matches!(ip.octets(), [195, 175, 254, 2] | [195, 175, 254, 3]) {
+        return Some(PoisonReason::KnownCensorshipSinkhole(IpAddr::V4(ip)));
     }
     None
 }

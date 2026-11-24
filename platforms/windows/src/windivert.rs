@@ -1,20 +1,35 @@
 #![allow(dead_code)]
-//! Real WinDivert 2.2 dynamic FFI packet interception & DPI circumvention engine.
+//! Real WinDivert 2.2 dynamic FFI packet interception & Turkey-ISP-grade DPI circumvention engine.
+//!
+//! Features:
+//! - Valid benign decoy ClientHello (`www.iana.org`) with calibrated Auto-TTL + `--wrong-seq` + `--wrong-chksum`
+//! - Multi-point reverse-order (disorder) TCP segmentation (`-e 2` / `-e 1` + mid-SNI)
+//! - Passive optical-splitter DPI forged `TCP RST` & BTK `HTTP 302` redirect dropping
+//! - Real `FlowTracker` (salted 64-bit hash, zero plaintext IP logging) detecting active DPI RSTs &
+//!   silent-blackhole TCP retransmissions to auto-escalate Stage 1 -> Stage 2 -> Stage 3 in real time
+//! - Default QUIC UDP/443 blocking (`-q`) forcing browsers immediately onto DPI-protected TCP/443
+//! - Asynchronous encrypted DoH/DoT UDP/53 interception with `WinDivertHelperCalcChecksums`
 
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 #[cfg(windows)]
 use std::ffi::{c_char, c_void, CString};
+use std::hash::BuildHasher;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
 use yolac_core::{AdaptiveController, EngineState, ErrorCode};
 use yolac_dns::{parse_dns_query, DnsEngine, DnsOutcome};
 use yolac_dpi::{
-    build_disorder_and_fake_packets, build_ipv4_tcp_packet, build_ipv6_tcp_packet, clamp_syn_mss,
-    detect_quic_initial, evade_http_request, parse_client_hello_prefix, parse_http_host,
-    parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet, DpiStrategy,
-    FakePacketMode, HttpEvasionOptions, IpProtocol, QuicPolicy, TtlCalibrator,
+    build_benign_fake_client_hello, build_benign_fake_http_request,
+    build_disorder_and_fake_packets, build_ipv4_tcp_packet, build_ipv6_tcp_packet,
+    build_turkey_desync_packets, clamp_syn_mss, detect_quic_initial, evade_http_request,
+    is_forged_dpi_http_redirect, is_forged_passive_dpi_rst, parse_client_hello_prefix,
+    parse_http_host, parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet,
+    DpiStrategy, FakePacketMode, HttpEvasionOptions, IpProtocol, QuicPolicy, TtlCalibrator,
 };
 use yolac_net::{is_local_lan_ip, CaptivePortalMonitor, FlowOutcome, StrategyAdvisor};
 
@@ -43,7 +58,6 @@ impl Default for WinDivertAddress {
 impl WinDivertAddress {
     /// Marks packet direction as Inbound (bit 17 in WinDivert 2.2 `WINDIVERT_ADDRESS` flags).
     pub fn set_inbound(&mut self) {
-        // Outbound bit is bit 17 (`0x0002_0000` in little-endian bitfield: Layer(8), Event(8), Sniffed(1), Outbound(1))
         self.layer_flags &= !(1 << 17);
     }
 
@@ -56,19 +70,19 @@ impl WinDivertAddress {
     }
 
     /// Marks IP/TCP/UDP checksums as already computed so Windows NIC checksum offload
-    /// preserves our software-calculated (or intentionally corrupted BadChecksum decoy) values.
+    /// preserves software-calculated (or intentionally corrupted BadChecksum decoy) values.
     /// WinDivert 2.2 bit layout: IPv6=bit 20, IPChecksum=bit 21, TCPChecksum=bit 22, UDPChecksum=bit 23.
     pub fn mark_checksums_valid(&mut self, is_v6: bool, is_tcp: bool) {
         if is_v6 {
             self.layer_flags |= 1 << 20;
         } else {
             self.layer_flags &= !(1 << 20);
-            self.layer_flags |= 1 << 21; // IPChecksum valid
+            self.layer_flags |= 1 << 21;
         }
         if is_tcp {
-            self.layer_flags |= 1 << 22; // TCPChecksum valid
+            self.layer_flags |= 1 << 22;
         } else {
-            self.layer_flags |= 1 << 23; // UDPChecksum valid
+            self.layer_flags |= 1 << 23;
         }
     }
 }
@@ -90,6 +104,190 @@ pub struct OutgoingPacket {
     pub bytes: Vec<u8>,
     pub addr: WinDivertAddress,
     pub checksum: ChecksumAction,
+}
+
+/// Ephemeral RAM-only TCP handshake tracker keyed by per-session salted 64-bit hashes.
+/// Never stores plaintext IP addresses or domain names. Detects:
+/// 1. Real `SYN-ACK` TTL per flow (for passive DPI forged `RST` detection & hop calibration)
+/// 2. Silent-blackhole DPI drops via outbound `ClientHello` TCP retransmissions (same `seq`)
+/// 3. Active DPI `RST`/`FIN` during handshake before `ServerHello`
+/// 4. Genuine `FlowOutcome::Success` when the client advances past `ClientHello` (`seq >= ch_seq_end`)
+#[derive(Debug, Clone)]
+struct PendingFlow {
+    dst: SocketAddr,
+    strategy: DpiStrategy,
+    ch_seq: u32,
+    ch_seq_end: u32,
+    syn_ack_ttl: Option<u8>,
+    sent_at: Instant,
+    retransmit_count: u8,
+}
+
+pub struct FlowTracker {
+    hash_builder: RandomState,
+    max_entries: usize,
+    syn_ack_ttls: Mutex<HashMap<u64, u8>>,
+    pending: Mutex<HashMap<u64, PendingFlow>>,
+}
+
+impl FlowTracker {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            hash_builder: RandomState::new(),
+            max_entries: max_entries.max(128),
+            syn_ack_ttls: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn flow_key(&self, local_port: u16, remote_ip: IpAddr, remote_port: u16) -> u64 {
+        self.hash_builder.hash_one((local_port, remote_ip, remote_port))
+    }
+
+    pub fn observe_syn_ack(&self, local_port: u16, remote_ip: IpAddr, remote_port: u16, ttl: u8) {
+        if ttl == 0 {
+            return;
+        }
+        let key = self.flow_key(local_port, remote_ip, remote_port);
+        if let Ok(mut guard) = self.syn_ack_ttls.lock() {
+            if guard.len() >= self.max_entries && !guard.contains_key(&key) {
+                if let Some(&evict) = guard.keys().next() {
+                    guard.remove(&evict);
+                }
+            }
+            guard.insert(key, ttl);
+        }
+    }
+
+    pub fn syn_ack_ttl(&self, local_port: u16, remote_ip: IpAddr, remote_port: u16) -> Option<u8> {
+        let key = self.flow_key(local_port, remote_ip, remote_port);
+        self.syn_ack_ttls.lock().ok()?.get(&key).copied()
+    }
+
+    /// Registers an outbound `ClientHello`. Returns `Some(previous_strategy)` if this exact
+    /// TCP sequence is a retransmission (meaning the previous strategy was silently blackholed by DPI!).
+    pub fn record_client_hello(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        seq: u32,
+        payload_len: usize,
+        strategy: DpiStrategy,
+    ) -> Option<DpiStrategy> {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        let syn_ttl = self.syn_ack_ttl(local_port, dst.ip(), dst.port());
+        let mut guard = self.pending.lock().ok()?;
+
+        // Check if this is a TCP retransmission of a blackholed ClientHello
+        if let Some(prev) = guard.get_mut(&key) {
+            if prev.ch_seq == seq && prev.sent_at.elapsed() >= Duration::from_millis(40) {
+                let failed_strategy = prev.strategy;
+                prev.strategy = strategy;
+                prev.sent_at = Instant::now();
+                prev.retransmit_count = prev.retransmit_count.saturating_add(1);
+                return Some(failed_strategy);
+            }
+        }
+
+        if guard.len() >= self.max_entries && !guard.contains_key(&key) {
+            let now = Instant::now();
+            guard.retain(|_, v| now.duration_since(v.sent_at) < Duration::from_secs(15));
+            if guard.len() >= self.max_entries {
+                if let Some(&evict) = guard.keys().next() {
+                    guard.remove(&evict);
+                }
+            }
+        }
+
+        guard.insert(
+            key,
+            PendingFlow {
+                dst,
+                strategy,
+                ch_seq: seq,
+                ch_seq_end: seq.wrapping_add(payload_len as u32),
+                syn_ack_ttl: syn_ttl,
+                sent_at: Instant::now(),
+                retransmit_count: 0,
+            },
+        );
+        None
+    }
+
+    /// Updates pending flow strategy after an immediate retransmission escalation.
+    pub fn update_pending_strategy(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        new_strategy: DpiStrategy,
+    ) {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        if let Ok(mut guard) = self.pending.lock() {
+            if let Some(entry) = guard.get_mut(&key) {
+                entry.strategy = new_strategy;
+                entry.sent_at = Instant::now();
+            }
+        }
+    }
+
+    /// Checks whether a follow-up outbound TLS payload (`seq >= ch_seq_end`) proves that the
+    /// server's `ServerHello` arrived and the handshake succeeded!
+    pub fn on_outbound_followup(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        seq: u32,
+    ) -> Option<DpiStrategy> {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        let mut guard = self.pending.lock().ok()?;
+        let entry = guard.get(&key)?;
+        // Sequence strictly past ClientHello bytes -> client moved to CCS/Finished/AppData!
+        let advanced = seq.wrapping_sub(entry.ch_seq_end) < 0x8000_0000;
+        if advanced {
+            let used = entry.strategy;
+            guard.remove(&key);
+            return Some(used);
+        }
+        None
+    }
+
+    /// Handles an inbound `RST` or premature `FIN` on a tracked flow.
+    /// Returns `(syn_ack_ttl, Option<(dst, failed_strategy)>)`.
+    pub fn on_inbound_reset_or_fin(
+        &self,
+        local_port: u16,
+        remote_ip: IpAddr,
+        remote_port: u16,
+        is_forged_rst: bool,
+    ) -> Option<(SocketAddr, DpiStrategy)> {
+        let key = self.flow_key(local_port, remote_ip, remote_port);
+        let mut guard = self.pending.lock().ok()?;
+        if is_forged_rst {
+            // Forged passive DPI RST was dropped: keep flow alive, do NOT remove pending entry yet!
+            return None;
+        }
+        if let Some(entry) = guard.remove(&key) {
+            if entry.sent_at.elapsed() < Duration::from_secs(6) {
+                return Some((entry.dst, entry.strategy));
+            }
+        }
+        None
+    }
+
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.syn_ack_ttls.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pending.lock() {
+            g.clear();
+        }
+    }
+}
+
+impl Default for FlowTracker {
+    fn default() -> Self {
+        Self::new(1024)
+    }
 }
 
 #[cfg(windows)]
@@ -153,7 +351,6 @@ mod loader {
                     .encode_utf16()
                     .chain(Some(0))
                     .collect();
-                // Load strictly from the verified directory + System32 (prevents Windows DLL hijacking)
                 let module = LoadLibraryExW(
                     dll.as_mut_ptr(),
                     std::ptr::null_mut(),
@@ -203,22 +400,24 @@ mod loader {
 
 pub struct WindowsPacketEngine {
     stop_flag: Arc<AtomicBool>,
-    handle_ptr: Arc<std::sync::Mutex<usize>>,
+    handle_ptr: Arc<Mutex<usize>>,
     #[cfg(windows)]
-    active_api: std::sync::Mutex<Option<Arc<loader::WinDivertApi>>>,
-    worker: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    active_api: Mutex<Option<Arc<loader::WinDivertApi>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     calibrator: Arc<TtlCalibrator>,
+    flows: Arc<FlowTracker>,
 }
 
 impl WindowsPacketEngine {
     pub fn new() -> Self {
         Self {
             stop_flag: Arc::new(AtomicBool::new(false)),
-            handle_ptr: Arc::new(std::sync::Mutex::new(0)),
+            handle_ptr: Arc::new(Mutex::new(0)),
             #[cfg(windows)]
-            active_api: std::sync::Mutex::new(None),
-            worker: std::sync::Mutex::new(None),
+            active_api: Mutex::new(None),
+            worker: Mutex::new(None),
             calibrator: Arc::new(TtlCalibrator::default()),
+            flows: Arc::new(FlowTracker::default()),
         }
     }
 
@@ -246,12 +445,15 @@ impl WindowsPacketEngine {
             };
             (code, detail)
         })?);
+
+        // Zero overhead on HTTPS bulk downloads: inbound port 443 captures ONLY Syn/Rst/Fin control
+        // packets (for hop TTL calibration, forged passive-DPI RST drop & real active escalation!).
         let full_filter = CString::new(
-            "not loopback and ((outbound and ((tcp.DstPort == 443 or tcp.DstPort == 80) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and tcp.Syn and tcp.Ack and (tcp.SrcPort == 443 or tcp.SrcPort == 80)))",
+            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin)) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength > 0)))))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert filtre derleme hatası.".into()))?;
         let fallback_filter = CString::new(
-            "not loopback and outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)",
+            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443)) or (inbound and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and (tcp.Syn or tcp.Rst or tcp.Fin)))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert yedek filtre derleme hatası.".into()))?;
 
@@ -296,12 +498,13 @@ impl WindowsPacketEngine {
         let handle_ptr = Arc::clone(&self.handle_ptr);
         let thread_api = Arc::clone(&api);
         let calibrator = Arc::clone(&self.calibrator);
+        let flows = Arc::clone(&self.flows);
         let raw_handle_addr = raw_handle as usize;
 
         let jh = std::thread::spawn(move || {
             let raw_handle = raw_handle_addr as *mut c_void;
             let rt = Runtime::new().expect("tokio runtime");
-            let send_handle = Arc::new(std::sync::Mutex::new(raw_handle_addr));
+            let send_handle = Arc::new(Mutex::new(raw_handle_addr));
             let dns_sem = Arc::new(tokio::sync::Semaphore::new(64));
             let mut buf = vec![0u8; 65536];
             let mut addr = WinDivertAddress::default();
@@ -322,8 +525,8 @@ impl WindowsPacketEngine {
                 }
                 let pkt = &buf[..recv_len as usize];
 
-                // CRITICAL: Handle outbound UDP/53 DNS asynchronously so the WinDivertRecv thread
-                // NEVER deadlocks waiting for its own DoH/DoT TCP/443 upstream handshake!
+                // Handle outbound UDP/53 DNS asynchronously so WinDivertRecv NEVER deadlocks
+                // waiting for its own DoH/DoT TCP/443 upstream handshake.
                 if addr.is_outbound() {
                     if let Some(ip) = parse_ip_packet(pkt) {
                         if ip.protocol == IpProtocol::Udp {
@@ -366,9 +569,6 @@ impl WindowsPacketEngine {
                                                 if let Some(mut reply_pkt) = build_dns_reply_l3(
                                                     src_ip, dst_ip, src_port, dst_port, &resp_wire,
                                                 ) {
-                                                    // CRITICAL: Recalculate & mark IP/UDP checksum flags valid on
-                                                    // synthesized inbound DNS replies so Windows NIC checksum offload
-                                                    // never drops the reply!
                                                     reply_addr.mark_checksums_valid(dst_ip.is_ipv6(), false);
                                                     unsafe {
                                                         let _ = (api_c.calc_checksums)(
@@ -404,13 +604,14 @@ impl WindowsPacketEngine {
                     }
                 }
 
-                let processed = process_packet(
+                let processed = process_packet_with_tracker(
                     pkt,
                     addr,
                     &rt,
                     &dns,
                     &adaptive,
                     &calibrator,
+                    &flows,
                     &portal,
                 );
 
@@ -460,6 +661,7 @@ impl WindowsPacketEngine {
                 let _ = (thread_api.close)(raw_handle);
             }
             calibrator.clear();
+            flows.clear();
             flush_windows_dns_cache();
             on_state(EngineState::Inactive);
         });
@@ -510,6 +712,7 @@ impl WindowsPacketEngine {
             }
         }
         self.calibrator.clear();
+        self.flows.clear();
         flush_windows_dns_cache();
     }
 }
@@ -520,15 +723,17 @@ impl Drop for WindowsPacketEngine {
     }
 }
 
-/// Pure, cross-platform testable WinDivert packet processor supporting inbound SYN-ACK
-/// hop calibration, smart SYN MSS clamping, Captive Portal local-LAN allowance, and DPI transforms.
-pub fn process_packet(
+/// Pure, cross-platform testable WinDivert packet processor with full FlowTracker feedback,
+/// passive DPI RST dropping, BTK HTTP 302 redirect dropping, and real Turkey DPI escalation.
+#[allow(clippy::too_many_arguments)]
+pub fn process_packet_with_tracker(
     pkt: &[u8],
     addr: WinDivertAddress,
     rt: &Runtime,
     dns: &Arc<DnsEngine>,
     adaptive: &Arc<AdaptiveController>,
     calibrator: &TtlCalibrator,
+    flows: &FlowTracker,
     portal: &CaptivePortalMonitor,
 ) -> Vec<OutgoingPacket> {
     let Some(ip) = parse_ip_packet(pkt) else {
@@ -539,28 +744,28 @@ pub fn process_packet(
         }];
     };
 
-    // Observe inbound SYN-ACK TTL/HopLimit to dynamically calibrate per-destination fake TTL
     if !addr.is_outbound() {
-        if ip.protocol == IpProtocol::Tcp {
-            if let Some(tcp) = parse_tcp(ip.payload) {
-                if (tcp.flags & (yolac_dpi::ParsedTcp::SYN | yolac_dpi::ParsedTcp::ACK))
-                    == (yolac_dpi::ParsedTcp::SYN | yolac_dpi::ParsedTcp::ACK)
-                {
-                    calibrator.observe_syn_ack(ip.src_ip, ip.ttl);
-                }
-            }
-        }
-        return vec![OutgoingPacket {
-            bytes: pkt.to_vec(),
-            addr,
-            checksum: ChecksumAction::Passthrough,
-        }];
+        return process_inbound_inner(pkt, &ip, addr, adaptive, calibrator, flows);
     }
 
-    process_outbound_inner(pkt, &ip, addr, rt, dns, adaptive, calibrator, portal)
+    process_outbound_inner(pkt, &ip, addr, rt, dns, adaptive, calibrator, flows, portal)
 }
 
-/// Convenience wrapper for outbound-only tests and callers.
+/// Convenience wrapper for callers without an external FlowTracker.
+pub fn process_packet(
+    pkt: &[u8],
+    addr: WinDivertAddress,
+    rt: &Runtime,
+    dns: &Arc<DnsEngine>,
+    adaptive: &Arc<AdaptiveController>,
+    calibrator: &TtlCalibrator,
+    portal: &CaptivePortalMonitor,
+) -> Vec<OutgoingPacket> {
+    let flows = FlowTracker::default();
+    process_packet_with_tracker(pkt, addr, rt, dns, adaptive, calibrator, &flows, portal)
+}
+
+/// Convenience wrapper for outbound-only tests.
 pub fn process_outbound_packet(
     pkt: &[u8],
     addr: WinDivertAddress,
@@ -569,6 +774,7 @@ pub fn process_outbound_packet(
     adaptive: &Arc<AdaptiveController>,
 ) -> Vec<OutgoingPacket> {
     let calibrator = TtlCalibrator::default();
+    let flows = FlowTracker::default();
     let portal = CaptivePortalMonitor::new();
     let Some(ip) = parse_ip_packet(pkt) else {
         return vec![OutgoingPacket {
@@ -577,7 +783,71 @@ pub fn process_outbound_packet(
             checksum: ChecksumAction::Passthrough,
         }];
     };
-    process_outbound_inner(pkt, &ip, addr, rt, dns, adaptive, &calibrator, &portal)
+    process_outbound_inner(pkt, &ip, addr, rt, dns, adaptive, &calibrator, &flows, &portal)
+}
+
+fn process_inbound_inner(
+    pkt: &[u8],
+    ip: &yolac_dpi::ParsedIpPacket<'_>,
+    addr: WinDivertAddress,
+    adaptive: &Arc<AdaptiveController>,
+    calibrator: &TtlCalibrator,
+    flows: &FlowTracker,
+) -> Vec<OutgoingPacket> {
+    if ip.protocol == IpProtocol::Tcp {
+        if let Some(tcp) = parse_tcp(ip.payload) {
+            let local_port = tcp.dst_port;
+            let remote_port = tcp.src_port;
+
+            // 1. Observe inbound SYN-ACK TTL/HopLimit for dynamic hop calibration & forged-RST baseline
+            if (tcp.flags & (yolac_dpi::ParsedTcp::SYN | yolac_dpi::ParsedTcp::ACK))
+                == (yolac_dpi::ParsedTcp::SYN | yolac_dpi::ParsedTcp::ACK)
+            {
+                calibrator.observe_syn_ack(ip.src_ip, ip.ttl);
+                flows.observe_syn_ack(local_port, ip.src_ip, remote_port, ip.ttl);
+            }
+
+            // 2. Inspect inbound TCP RST: drop forged passive-DPI RSTs and escalate on active DPI RSTs
+            if (tcp.flags & yolac_dpi::ParsedTcp::RST) != 0 {
+                let expected_ttl = flows.syn_ack_ttl(local_port, ip.src_ip, remote_port);
+                let forged = is_forged_passive_dpi_rst(pkt, expected_ttl);
+                if forged {
+                    // Drop passive DPI forged RST before Windows TCP stack kills the connection!
+                    return vec![];
+                }
+                if let Some((dst, failed_strategy)) =
+                    flows.on_inbound_reset_or_fin(local_port, ip.src_ip, remote_port, false)
+                {
+                    adaptive.report_outcome(
+                        dst,
+                        None,
+                        failed_strategy,
+                        FlowOutcome::ResetOrEofDuringHandshake,
+                    );
+                }
+            } else if (tcp.flags & yolac_dpi::ParsedTcp::FIN) != 0 {
+                if let Some((dst, failed_strategy)) =
+                    flows.on_inbound_reset_or_fin(local_port, ip.src_ip, remote_port, false)
+                {
+                    adaptive.report_outcome(
+                        dst,
+                        None,
+                        failed_strategy,
+                        FlowOutcome::ResetOrEofDuringHandshake,
+                    );
+                }
+            } else if remote_port == 80 && !tcp.payload.is_empty() && is_forged_dpi_http_redirect(pkt) {
+                // 3. Drop forged plaintext BTK / ISP HTTP 302 censorship redirect!
+                return vec![];
+            }
+        }
+    }
+
+    vec![OutgoingPacket {
+        bytes: pkt.to_vec(),
+        addr,
+        checksum: ChecksumAction::Passthrough,
+    }]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -589,6 +859,7 @@ fn process_outbound_inner(
     dns: &Arc<DnsEngine>,
     adaptive: &Arc<AdaptiveController>,
     calibrator: &TtlCalibrator,
+    flows: &FlowTracker,
     portal: &CaptivePortalMonitor,
 ) -> Vec<OutgoingPacket> {
     let passthrough = |bytes: Vec<u8>, a: WinDivertAddress| OutgoingPacket {
@@ -609,7 +880,6 @@ fn process_outbound_inner(
             };
 
             // 1. Intercept ALL UDP/53 DNS queries locally via DoH/DoT + blocklist -> zero ISP DNS leak
-            //    (except direct local LAN gateway DNS during a bounded Captive Portal login window)
             if udp.dst_port == 53 {
                 if portal.is_bypass_active() && is_local_lan_ip(ip.dst_ip) {
                     return vec![passthrough(pkt.to_vec(), addr)];
@@ -642,10 +912,12 @@ fn process_outbound_inner(
                 return vec![];
             }
 
-            // 2. QUIC UDP/443 fallback policy when QUIC throttling is active
+            // 2. QUIC UDP/443 fallback policy (ENABLED BY DEFAULT on Windows -> equivalent to GoodbyeDPI `-q`)
+            //    Forces Chrome/Edge/Brave/Opera immediately onto DPI-protected TCP/443!
             if udp.dst_port == 443
                 && adaptive.recommended_quic_policy() == QuicPolicy::BlockFallbackToTcp
-                && detect_quic_initial(udp.payload).is_some()
+                && !is_local_lan_ip(ip.dst_ip)
+                && (detect_quic_initial(udp.payload).is_some() || !udp.payload.is_empty())
             {
                 return vec![];
             }
@@ -665,110 +937,238 @@ fn process_outbound_inner(
                 return vec![passthrough(pkt.to_vec(), addr)];
             }
 
-            // Smart SYN MSS clamping on outbound 443/80 handshakes (disrupts server-response DPI)
-            if tcp.is_syn_only() && (tcp.dst_port == 443 || tcp.dst_port == 80) && !is_local_lan_ip(ip.dst_ip) {
+            let dst = SocketAddr::new(ip.dst_ip, tcp.dst_port);
+
+            // Apply aggressive SYN MSS clamp ONLY for destinations that escalated to Stage 3
+            if tcp.is_syn_only()
+                && (tcp.dst_port == 443 || tcp.dst_port == 80)
+                && !is_local_lan_ip(ip.dst_ip)
+                && adaptive.select_strategy(dst, None) == DpiStrategy::TurkeyDesyncAggressive
+            {
                 if let Some(clamped) = clamp_syn_mss(pkt, 536) {
                     return vec![recalc(clamped, addr)];
                 }
             }
 
             if !tcp.payload.is_empty() {
-                let dst = SocketAddr::new(ip.dst_ip, tcp.dst_port);
                 if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
-                    let strategy = adaptive.select_strategy(dst, ch.sni.as_deref());
-                    adaptive.report_outcome(dst, ch.sni.as_deref(), strategy, FlowOutcome::Success);
+                    let mut strategy = adaptive.select_strategy(dst, None);
+
+                    // Real silent-blackhole detection: if Windows TCP retransmitted the EXACT same
+                    // ClientHello seq, our previous strategy was blackholed by ISP DPI -> ESCALATE IMMEDIATELY!
+                    if let Some(failed_strategy) = flows.record_client_hello(
+                        tcp.src_port,
+                        dst,
+                        tcp.seq,
+                        tcp.payload.len(),
+                        strategy,
+                    ) {
+                        adaptive.report_outcome(
+                            dst,
+                            None,
+                            failed_strategy,
+                            FlowOutcome::HandshakeTimeout,
+                        );
+                        strategy = adaptive.select_strategy(dst, None);
+                        flows.update_pending_strategy(tcp.src_port, dst, strategy);
+                    }
+
+                    let sni_mid = plan_tcp_splits(tcp.payload)
+                        .map(|s| s.split_at)
+                        .unwrap_or_else(|| (tcp.payload.len() / 2).max(2));
+                    let decoy = build_benign_fake_client_hello("www.iana.org");
+
+                    let emit_desync = |desync: Vec<yolac_dpi::DesyncPacket>| -> Vec<OutgoingPacket> {
+                        desync
+                            .into_iter()
+                            .map(|d| {
+                                if d.preserve_bad_tcp_checksum {
+                                    let mut bad_addr = addr;
+                                    bad_addr.mark_checksums_valid(ip.version == 6, true);
+                                    OutgoingPacket {
+                                        bytes: d.bytes,
+                                        addr: bad_addr,
+                                        checksum: ChecksumAction::PreserveBadTcpChecksum,
+                                    }
+                                } else {
+                                    recalc(d.bytes, addr)
+                                }
+                            })
+                            .collect()
+                    };
 
                     match strategy {
                         DpiStrategy::Passthrough => {}
-                        // Raw L3 WinDivert preserves exact TCP sequence length via TCP SNI segmentation,
-                        // Disorder, auto-calibrated Low-TTL fake, and Bad-Checksum fake packets.
-                        DpiStrategy::TlsRecordSplit | DpiStrategy::TcpSniSplit | DpiStrategy::TlsAndTcpSplit => {
-                            if let Some(split) = plan_tcp_splits(tcp.payload) {
-                                if let Some((p1, p2)) = segment_tcp_packet(pkt, split.split_at) {
-                                    return vec![recalc(p1, addr), recalc(p2, addr)];
-                                }
+                        DpiStrategy::TurkeyDesyncAuto => {
+                            // Stage 1 Default (All Turkish ISPs: Vodafone / Türk Telekom / Superonline / Kablonet / TurkNet):
+                            // - When hop distance >= 4: exact-seq LowTtl(hops/2) that expires >= 2 hops before server
+                            //   + exact-seq BadChecksum + WrongSeq+BadChecksum (defeats Sandvine/Procera/Huawei/Allot)
+                            // - When hop <= 3 or unknown: safe exact-seq BadChecksum + LowTtlWrongSeq(2) + BadChecksumWrongSeq
+                            // - Real ClientHello: 3-segment reverse-order split at offset 2 (`-e 2`) and mid-SNI!
+                            let fakes: [FakePacketMode; 3] =
+                                if let Some(hops) = calibrator.estimated_hops(ip.dst_ip) {
+                                    if hops >= 4 {
+                                        let safe_ttl = (hops / 2).clamp(2, hops.saturating_sub(2).min(5));
+                                        [
+                                            FakePacketMode::LowTtl(safe_ttl),
+                                            FakePacketMode::BadChecksum,
+                                            FakePacketMode::BadChecksumWrongSeq,
+                                        ]
+                                    } else {
+                                        [
+                                            FakePacketMode::BadChecksum,
+                                            FakePacketMode::LowTtlWrongSeq(2),
+                                            FakePacketMode::BadChecksumWrongSeq,
+                                        ]
+                                    }
+                                } else {
+                                    [
+                                        FakePacketMode::BadChecksum,
+                                        FakePacketMode::LowTtlWrongSeq(3),
+                                        FakePacketMode::BadChecksumWrongSeq,
+                                    ]
+                                };
+                            if let Some(desync) = build_turkey_desync_packets(
+                                pkt,
+                                &[2, sni_mid],
+                                &fakes,
+                                &decoy,
+                                true,
+                            ) {
+                                return emit_desync(desync);
                             }
                         }
-                        DpiStrategy::RawDisorder => {
-                            if let Some(split) = plan_tcp_splits(tcp.payload) {
-                                if let Some(plan) = build_disorder_and_fake_packets(pkt, split.split_at, None) {
-                                    return plan.packets.into_iter().map(|p| recalc(p, addr)).collect();
-                                }
+                        DpiStrategy::TurkeyDesyncSuperonline => {
+                            // Stage 2 (Vodafone / Superonline strict escalation):
+                            // Quad decoy (LowTtlWrongSeq(2), LowTtlWrongSeq(5), exact-seq BadChecksum, BadChecksumWrongSeq)
+                            // + 1-byte leading reverse-frag split (`-e 1` + mid-SNI)!
+                            let fakes = [
+                                FakePacketMode::LowTtlWrongSeq(2),
+                                FakePacketMode::LowTtlWrongSeq(5),
+                                FakePacketMode::BadChecksum,
+                                FakePacketMode::BadChecksumWrongSeq,
+                            ];
+                            if let Some(desync) = build_turkey_desync_packets(
+                                pkt,
+                                &[1, sni_mid],
+                                &fakes,
+                                &decoy,
+                                true,
+                            ) {
+                                return emit_desync(desync);
                             }
                         }
-                        DpiStrategy::RawFakeTtl { ttl } => {
-                            if let Some(split) = plan_tcp_splits(tcp.payload) {
-                                let mode = calibrator.recommended_fake_mode(ip.dst_ip, ttl);
-                                if let Some(plan) = build_disorder_and_fake_packets(
-                                    pkt,
-                                    split.split_at,
-                                    Some(mode),
-                                ) {
-                                    let is_bad_csum = matches!(mode, FakePacketMode::BadChecksum);
-                                    return plan
-                                        .packets
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(idx, p)| {
-                                            if idx == 0 && is_bad_csum {
-                                                let mut bad_addr = addr;
-                                                bad_addr.mark_checksums_valid(ip.version == 6, true);
-                                                OutgoingPacket {
-                                                    bytes: p,
-                                                    addr: bad_addr,
-                                                    checksum: ChecksumAction::PreserveBadTcpChecksum,
-                                                }
-                                            } else {
-                                                recalc(p, addr)
-                                            }
-                                        })
-                                        .collect();
-                                }
+                        DpiStrategy::TurkeyDesyncAggressive => {
+                            // Stage 3 (Ultra-strict fallback):
+                            // LowTtl(3) + LowTtlWrongSeq(6) + BadChecksum + BadChecksumWrongSeq + 4-piece disordered split!
+                            let fakes = [
+                                FakePacketMode::LowTtl(3),
+                                FakePacketMode::LowTtlWrongSeq(6),
+                                FakePacketMode::BadChecksum,
+                                FakePacketMode::BadChecksumWrongSeq,
+                            ];
+                            if let Some(desync) = build_turkey_desync_packets(
+                                pkt,
+                                &[1, 2, sni_mid],
+                                &fakes,
+                                &decoy,
+                                true,
+                            ) {
+                                return emit_desync(desync);
                             }
                         }
-                        DpiStrategy::RawBadChecksum => {
-                            if let Some(split) = plan_tcp_splits(tcp.payload) {
-                                if let Some(plan) = build_disorder_and_fake_packets(
-                                    pkt,
-                                    split.split_at,
-                                    Some(FakePacketMode::BadChecksum),
-                                ) {
-                                    return plan
-                                        .packets
-                                        .into_iter()
-                                        .enumerate()
-                                        .map(|(idx, p)| {
-                                            if idx == 0 {
-                                                let mut bad_addr = addr;
-                                                bad_addr.mark_checksums_valid(ip.version == 6, true);
-                                                OutgoingPacket {
-                                                    bytes: p,
-                                                    addr: bad_addr,
-                                                    checksum: ChecksumAction::PreserveBadTcpChecksum,
-                                                }
-                                            } else {
-                                                recalc(p, addr)
-                                            }
-                                        })
-                                        .collect();
-                                }
-                            }
-                        }
-                    }
-                } else if parse_http_host(tcp.payload).is_some() {
-                    if let Some(evaded) = evade_http_request(tcp.payload, HttpEvasionOptions::default()) {
-                        let source_pkt = if evaded.len() == tcp.payload.len() {
-                            rebuild_tcp_payload_packet(ip, &tcp, &evaded).unwrap_or_else(|| pkt.to_vec())
-                        } else {
-                            pkt.to_vec()
-                        };
-                        if let Some(split) = plan_tcp_splits(&evaded) {
-                            if let Some((p1, p2)) = segment_tcp_packet(&source_pkt, split.split_at) {
+                        DpiStrategy::TlsRecordSplit
+                        | DpiStrategy::TcpSniSplit
+                        | DpiStrategy::TlsAndTcpSplit
+                        | DpiStrategy::TlsMultiRecordAndTcpSplit
+                        | DpiStrategy::TcpOobAndTlsSplit
+                        | DpiStrategy::TlsSmallChunks => {
+                            if let Some((p1, p2)) = segment_tcp_packet(pkt, sni_mid) {
                                 return vec![recalc(p1, addr), recalc(p2, addr)];
                             }
                         }
-                        return vec![recalc(source_pkt, addr)];
+                        DpiStrategy::RawDisorder => {
+                            if let Some(plan) = build_disorder_and_fake_packets(pkt, sni_mid, None) {
+                                return plan.packets.into_iter().map(|p| recalc(p, addr)).collect();
+                            }
+                        }
+                        DpiStrategy::RawFakeTtl { ttl } => {
+                            let mode = calibrator.recommended_fake_mode(ip.dst_ip, ttl);
+                            if let Some(desync) = build_turkey_desync_packets(
+                                pkt,
+                                &[sni_mid],
+                                &[mode],
+                                &decoy,
+                                true,
+                            ) {
+                                return emit_desync(desync);
+                            }
+                        }
+                        DpiStrategy::RawBadChecksum => {
+                            if let Some(desync) = build_turkey_desync_packets(
+                                pkt,
+                                &[sni_mid],
+                                &[FakePacketMode::BadChecksum],
+                                &decoy,
+                                true,
+                            ) {
+                                return emit_desync(desync);
+                            }
+                        }
                     }
+                    let _ = ch;
+                } else if parse_http_host(tcp.payload).is_some() {
+                    // Plaintext HTTP port 80: mix Host case + benign fake HTTP decoy + reverse-frag `-f 2` split
+                    let source_pkt = if let Some(evaded) =
+                        evade_http_request(tcp.payload, HttpEvasionOptions::default())
+                    {
+                        if evaded.len() == tcp.payload.len() {
+                            rebuild_tcp_payload_packet(ip, &tcp, &evaded)
+                                .unwrap_or_else(|| pkt.to_vec())
+                        } else {
+                            pkt.to_vec()
+                        }
+                    } else {
+                        pkt.to_vec()
+                    };
+                    let split_mid = plan_tcp_splits(tcp.payload)
+                        .map(|s| s.split_at)
+                        .unwrap_or(2);
+                    let fake_http = build_benign_fake_http_request("www.iana.org");
+                    let fakes = [
+                        FakePacketMode::LowTtlWrongSeq(3),
+                        FakePacketMode::BadChecksumWrongSeq,
+                    ];
+                    if let Some(desync) = build_turkey_desync_packets(
+                        &source_pkt,
+                        &[2, split_mid],
+                        &fakes,
+                        &fake_http,
+                        true,
+                    ) {
+                        return desync
+                            .into_iter()
+                            .map(|d| {
+                                if d.preserve_bad_tcp_checksum {
+                                    let mut bad_addr = addr;
+                                    bad_addr.mark_checksums_valid(ip.version == 6, true);
+                                    OutgoingPacket {
+                                        bytes: d.bytes,
+                                        addr: bad_addr,
+                                        checksum: ChecksumAction::PreserveBadTcpChecksum,
+                                    }
+                                } else {
+                                    recalc(d.bytes, addr)
+                                }
+                            })
+                            .collect();
+                    }
+                    return vec![recalc(source_pkt, addr)];
+                } else if let Some(verified_strategy) =
+                    flows.on_outbound_followup(tcp.src_port, dst, tcp.seq)
+                {
+                    // Client moved past ClientHello (CCS/Finished/AppData) -> GENUINE handshake success!
+                    adaptive.report_outcome(dst, None, verified_strategy, FlowOutcome::Success);
                 }
             }
         }
@@ -850,7 +1250,10 @@ mod tests {
     use yolac_blocklist::Blocklist;
     use yolac_dns::wire::{build_dns_query, parse_dns_response, DnsRecordData, QType};
     use yolac_dns::DnsConfig;
-    use yolac_dpi::{build_ipv4_udp_packet, ipv4_header_checksum, tcp_checksum_ipv4, ParsedTcp, PlatformCapabilities};
+    use yolac_dpi::{
+        build_ipv4_udp_packet, ipv4_header_checksum, parse_client_hello, tcp_checksum_ipv4,
+        ParsedTcp, PlatformCapabilities,
+    };
 
     fn sample_tls_client_hello(sni: &str) -> Vec<u8> {
         let sni_bytes = sni.as_bytes();
@@ -904,7 +1307,7 @@ mod tests {
 
     #[test]
     fn intercepts_blocked_dns_locally_with_inbound_reply() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TlsAndTcpSplit);
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
         let q = build_dns_query(0x9001, "doubleclick.net", QType::A);
         let pkt = build_ipv4_udp_packet(
             Ipv4Addr::new(192, 168, 1, 10),
@@ -933,7 +1336,7 @@ mod tests {
 
     #[test]
     fn drops_tcp_port_53_dns_bypass() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TlsAndTcpSplit);
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
         let pkt = build_ipv4_tcp_packet(
             Ipv4Addr::new(192, 168, 1, 10),
             Ipv4Addr::new(8, 8, 8, 8),
@@ -953,18 +1356,38 @@ mod tests {
     }
 
     #[test]
-    fn splits_tls_client_hello_with_valid_checksums() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TlsAndTcpSplit);
-        let ch = sample_tls_client_hello("blocked.example.com");
+    fn default_windows_config_blocks_quic_udp_443_without_manual_trigger() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
+        let mut quic = vec![0u8; 1200];
+        quic[0] = 0xC3;
+        quic[1..5].copy_from_slice(&1u32.to_be_bytes());
+        let pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(128, 116, 114, 3), // roblox edge IP
+            55004,
+            443,
+            64,
+            &quic,
+        );
+        let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
+        assert!(out.is_empty(), "Windows default must block QUIC UDP/443 for TCP fallback");
+    }
+
+    #[test]
+    fn turkey_desync_auto_emits_valid_benign_fakes_and_reassembles_identically_at_server() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
+        let ch = sample_tls_client_hello("www.roblox.com");
         let src = Ipv4Addr::new(192, 168, 1, 10);
-        let dst = Ipv4Addr::new(93, 184, 216, 34);
+        let dst = Ipv4Addr::new(128, 116, 114, 3);
+        let orig_seq = 50_000u32;
+        let orig_ack = 90_000u32;
         let pkt = build_ipv4_tcp_packet(
             src,
             dst,
             55002,
             443,
-            1000,
-            2000,
+            orig_seq,
+            orig_ack,
             ParsedTcp::ACK | ParsedTcp::PSH,
             65535,
             64,
@@ -973,74 +1396,196 @@ mod tests {
             &ch,
         );
         let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
-        assert_eq!(out.len(), 2);
-        for seg in &out {
+        // 3 valid benign decoys (BadChecksum, LowTtlWrongSeq(3), BadChecksumWrongSeq) + 3 disordered real segments = 6 packets
+        assert_eq!(out.len(), 6);
+
+        // Decoy 0: exact-seq BadChecksum with PreserveBadTcpChecksum flag + valid benign www.iana.org TLS ClientHello!
+        assert_eq!(out[0].checksum, ChecksumAction::PreserveBadTcpChecksum);
+        assert_ne!(out[0].addr.layer_flags & (1 << 22), 0); // TCPChecksum valid bit stops NIC overwrite
+        let d0_ip = parse_ip_packet(&out[0].bytes).unwrap();
+        let d0_tcp = parse_tcp(d0_ip.payload).unwrap();
+        assert_eq!(d0_tcp.seq, orig_seq);
+        assert_eq!(
+            parse_client_hello(d0_tcp.payload).and_then(|c| c.sni).as_deref(),
+            Some("www.iana.org")
+        );
+
+        // Decoy 1: LowTtl(3) + WrongSeq with valid checksum (passes home NAT routers!)
+        let d1_ip = parse_ip_packet(&out[1].bytes).unwrap();
+        let d1_tcp = parse_tcp(d1_ip.payload).unwrap();
+        assert_eq!(d1_ip.ttl, 3);
+        assert_eq!(d1_tcp.seq, orig_seq.wrapping_sub(10_000));
+
+        // Decoy 2: BadChecksum + WrongSeq
+        assert_eq!(out[2].checksum, ChecksumAction::PreserveBadTcpChecksum);
+
+        // Real segments (indices 3, 4, 5): sent out-of-order (seg[1], seg[2], seg[0]=2 bytes!)
+        // Simulate real server TCP reassembly by sorting real valid-checksum packets by seq:
+        let mut real_segs: Vec<(u32, Vec<u8>)> = Vec::new();
+        for seg in &out[3..] {
             assert_eq!(seg.checksum, ChecksumAction::Recalculate);
             let ip = parse_ip_packet(&seg.bytes).unwrap();
-            assert_eq!(
-                ipv4_header_checksum(&seg.bytes[0..20]),
-                u16::from_be_bytes([seg.bytes[10], seg.bytes[11]])
-            );
-            assert_eq!(
-                tcp_checksum_ipv4(src, dst, ip.payload),
-                u16::from_be_bytes([ip.payload[16], ip.payload[17]])
-            );
+            let tcp = parse_tcp(ip.payload).unwrap();
+            assert_eq!(ipv4_header_checksum(&seg.bytes[0..20]), u16::from_be_bytes([seg.bytes[10], seg.bytes[11]]));
+            assert_eq!(tcp_checksum_ipv4(src, dst, ip.payload), u16::from_be_bytes([ip.payload[16], ip.payload[17]]));
+            real_segs.push((tcp.seq, tcp.payload.to_vec()));
         }
+        // First transmitted real segment starts at orig_seq + 2 (reverse-frag!), last is orig_seq (2 bytes!)
+        assert_eq!(real_segs[0].0, orig_seq + 2);
+        assert_eq!(real_segs[2].0, orig_seq);
+        assert_eq!(real_segs[2].1.len(), 2);
+
+        real_segs.sort_by_key(|(seq, _)| *seq);
+        let reassembled: Vec<u8> = real_segs.into_iter().flat_map(|(_, p)| p).collect();
+        assert_eq!(reassembled, ch, "Destination server must reassemble exact byte-identical ClientHello");
     }
 
     #[test]
-    fn raw_fake_ttl_emits_decoy_and_disordered_segments() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::RawFakeTtl { ttl: 3 });
-        let ch = sample_tls_client_hello("blocked.example.com");
-        let pkt = build_ipv4_tcp_packet(
-            Ipv4Addr::new(192, 168, 1, 10),
-            Ipv4Addr::new(93, 184, 216, 34),
-            55003,
+    fn drops_passive_dpi_forged_rst_and_escalates_on_active_dpi_rst_and_retransmit() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+        let portal = CaptivePortalMonitor::new();
+
+        let client_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let server_ip = Ipv4Addr::new(66, 254, 114, 41);
+        let dst = SocketAddr::new(IpAddr::V4(server_ip), 443);
+
+        // 1. Real server SYN-ACK arrives with TTL=54
+        let syn_ack = build_ipv4_tcp_packet(
+            server_ip,
+            client_ip,
+            443,
+            56000,
+            9000,
+            1000,
+            ParsedTcp::SYN | ParsedTcp::ACK,
+            65535,
+            54,
+            42,
+            &[],
+            &[],
+        );
+        let mut in_addr = WinDivertAddress::default();
+        in_addr.set_inbound();
+        let r_syn = process_packet_with_tracker(&syn_ack, in_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(r_syn.len(), 1);
+
+        // 2. Client sends ClientHello under Stage 1 (TurkeyDesyncAuto)
+        let ch = sample_tls_client_hello("www.pornhub.com");
+        let ch_pkt = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            56000,
             443,
             1000,
-            2000,
+            9001,
             ParsedTcp::ACK | ParsedTcp::PSH,
             65535,
             64,
-            1,
+            10,
             &[],
             &ch,
         );
-        let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
-        assert_eq!(out.len(), 3);
-        assert_eq!(parse_ip_packet(&out[0].bytes).unwrap().ttl, 3);
-        let seq1 = parse_tcp(parse_ip_packet(&out[1].bytes).unwrap().payload).unwrap().seq;
-        let seq2 = parse_tcp(parse_ip_packet(&out[2].bytes).unwrap().payload).unwrap().seq;
-        assert!(seq1 > seq2);
+        let mut out_addr = WinDivertAddress::default();
+        out_addr.set_outbound();
+        let out1 = process_packet_with_tracker(&ch_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(out1.len(), 6); // Stage 1: 3 decoys (Auto-TTL=5, BadChecksum, BadChecksumWrongSeq) + 3 real segments
+        assert_eq!(parse_ip_packet(&out1[0].bytes).unwrap().ttl, 5); // Calibrated from SYN-ACK TTL=54 (10 hops -> 5)
+        assert_eq!(adaptive.select_strategy(dst, None), DpiStrategy::TurkeyDesyncAuto);
+
+        // 3. Passive DPI injects forged RST with IP.ID=0 and TTL=60 (diff 6 from SYN-ACK TTL 54) -> MUST BE DROPPED!
+        let forged_rst = build_ipv4_tcp_packet(
+            server_ip,
+            client_ip,
+            443,
+            56000,
+            9001,
+            1000,
+            ParsedTcp::RST | ParsedTcp::ACK,
+            0,
+            60,
+            0,
+            &[],
+            &[],
+        );
+        let r_forged = process_packet_with_tracker(&forged_rst, in_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert!(r_forged.is_empty(), "Forged passive DPI RST must be dropped!");
+
+        // 4. Active inline DPI sends matching-TTL RST with non-zero IP.ID -> triggers immediate escalation to Stage 2!
+        let active_rst = build_ipv4_tcp_packet(
+            server_ip,
+            client_ip,
+            443,
+            56000,
+            9001,
+            1000,
+            ParsedTcp::RST,
+            0,
+            54,
+            555,
+            &[],
+            &[],
+        );
+        let _ = process_packet_with_tracker(&active_rst, in_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(
+            adaptive.select_strategy(dst, None),
+            DpiStrategy::TurkeyDesyncSuperonline,
+            "Active DPI RST must immediately escalate to TurkeyDesyncSuperonline!"
+        );
+
+        // 5. Silent blackhole retransmission on a new flow escalates Stage 2 -> Stage 3 automatically!
+        let ch_pkt2 = build_ipv4_tcp_packet(
+            client_ip,
+            server_ip,
+            56001,
+            443,
+            2000,
+            8001,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            11,
+            &[],
+            &ch,
+        );
+        let out_s2 = process_packet_with_tracker(&ch_pkt2, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(out_s2.len(), 7); // Stage 2: 4 decoys + 3 real segments
+        std::thread::sleep(Duration::from_millis(50));
+        let out_retrans = process_packet_with_tracker(&ch_pkt2, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(adaptive.select_strategy(dst, None), DpiStrategy::TurkeyDesyncAggressive);
+        assert_eq!(out_retrans.len(), 8); // Stage 3: 4 decoys + 4 real segments
     }
 
     #[test]
-    fn bad_checksum_fake_packet_preserves_bad_checksum_flag_and_mullvad_dns_passes_through() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::RawBadChecksum);
-        let ch = sample_tls_client_hello("blocked.example.com");
-        let pkt = build_ipv4_tcp_packet(
-            Ipv4Addr::new(192, 168, 1, 10),
+    fn drops_forged_btk_http_302_redirect_and_passes_mullvad_bootstrap() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+        let portal = CaptivePortalMonitor::new();
+
+        let btk_resp = b"HTTP/1.1 302 Found\r\nLocation: http://195.175.254.2/engelli\r\nConnection: close\r\n\r\n";
+        let redirect_pkt = build_ipv4_tcp_packet(
             Ipv4Addr::new(93, 184, 216, 34),
-            55009,
-            443,
-            1000,
-            2000,
+            Ipv4Addr::new(192, 168, 1, 10),
+            80,
+            56050,
+            9001,
+            1001,
             ParsedTcp::ACK | ParsedTcp::PSH,
             65535,
-            64,
-            1,
+            55,
+            0,
             &[],
-            &ch,
+            btk_resp,
         );
-        let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
-        assert_eq!(out.len(), 3);
-        assert_eq!(out[0].checksum, ChecksumAction::PreserveBadTcpChecksum);
-        assert_ne!(out[0].addr.layer_flags & (1 << 21), 0); // IPChecksum valid
-        assert_ne!(out[0].addr.layer_flags & (1 << 22), 0); // TCPChecksum valid (prevent NIC overwrite!)
-        assert_eq!(out[1].checksum, ChecksumAction::Recalculate);
-        assert_eq!(out[2].checksum, ChecksumAction::Recalculate);
+        let mut in_addr = WinDivertAddress::default();
+        in_addr.set_inbound();
+        let res = process_packet_with_tracker(&redirect_pkt, in_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert!(res.is_empty(), "Forged BTK HTTP 302 redirect must be dropped!");
 
-        // Mullvad DoH bootstrap IP 194.242.2.2 passes through without double-fragmentation
+        // Mullvad DoH/DoT bootstrap IP passes through unmodified
+        let ch = sample_tls_client_hello("dns.mullvad.net");
         let mullvad_pkt = build_ipv4_tcp_packet(
             Ipv4Addr::new(192, 168, 1, 10),
             Ipv4Addr::new(194, 242, 2, 2),
@@ -1055,80 +1600,10 @@ mod tests {
             &[],
             &ch,
         );
-        let m_out = process_outbound_packet(&mullvad_pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
-        assert_eq!(m_out.len(), 1);
-        assert_eq!(m_out[0].checksum, ChecksumAction::Passthrough);
-    }
-
-    #[test]
-    fn drops_quic_initial_when_throttled_for_tcp_fallback() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TlsAndTcpSplit);
-        adaptive.report_quic_throttled();
-        let mut quic = vec![0u8; 1200];
-        quic[0] = 0xC3;
-        quic[1..5].copy_from_slice(&1u32.to_be_bytes());
-        let pkt = build_ipv4_udp_packet(
-            Ipv4Addr::new(192, 168, 1, 10),
-            Ipv4Addr::new(93, 184, 216, 34),
-            55004,
-            443,
-            64,
-            &quic,
-        );
-        let out = process_outbound_packet(&pkt, WinDivertAddress::default(), &rt, &dns, &adaptive);
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn calibrates_fake_ttl_dynamically_from_inbound_syn_ack() {
-        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::RawFakeTtl { ttl: 3 });
-        let calibrator = TtlCalibrator::default();
-        let portal = CaptivePortalMonitor::new();
-
-        let client_ip = Ipv4Addr::new(192, 168, 1, 10);
-        let server_ip = Ipv4Addr::new(93, 184, 216, 34);
-
-        // Inbound SYN-ACK with TTL=52 (12 hops from Linux initial 64 -> calibrated fake TTL = 6)
-        let syn_ack = build_ipv4_tcp_packet(
-            server_ip,
-            client_ip,
-            443,
-            55100,
-            9000,
-            1000,
-            ParsedTcp::SYN | ParsedTcp::ACK,
-            65535,
-            52,
-            1,
-            &[],
-            &[],
-        );
-        let mut in_addr = WinDivertAddress::default();
-        in_addr.set_inbound();
-        let in_out = process_packet(&syn_ack, in_addr, &rt, &dns, &adaptive, &calibrator, &portal);
-        assert_eq!(in_out.len(), 1);
-        assert_eq!(calibrator.estimated_hops(IpAddr::V4(server_ip)), Some(12));
-
-        // Outbound ClientHello -> decoy packet MUST use calibrated TTL=6 instead of static 3
-        let ch = sample_tls_client_hello("blocked.example.com");
-        let ch_pkt = build_ipv4_tcp_packet(
-            client_ip,
-            server_ip,
-            55100,
-            443,
-            1000,
-            9001,
-            ParsedTcp::ACK | ParsedTcp::PSH,
-            65535,
-            64,
-            2,
-            &[],
-            &ch,
-        );
         let mut out_addr = WinDivertAddress::default();
         out_addr.set_outbound();
-        let out = process_packet(&ch_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &portal);
-        assert_eq!(out.len(), 3);
-        assert_eq!(parse_ip_packet(&out[0].bytes).unwrap().ttl, 6);
+        let m_out = process_outbound_packet(&mullvad_pkt, out_addr, &rt, &dns, &adaptive);
+        assert_eq!(m_out.len(), 1);
+        assert_eq!(m_out[0].checksum, ChecksumAction::Passthrough);
     }
 }

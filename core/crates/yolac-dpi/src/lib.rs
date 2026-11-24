@@ -9,6 +9,7 @@
 //! - QUIC Initial packet detection & TCP fallback policy
 //! - Adaptive strategy selection constrained by platform capabilities
 
+pub mod fake_hello;
 pub mod http;
 pub mod packet;
 pub mod quic;
@@ -17,6 +18,7 @@ pub mod tcp;
 pub mod tls;
 pub mod ttl;
 
+pub use fake_hello::{build_benign_fake_client_hello, build_benign_fake_http_request};
 pub use http::{evade_http_request, parse_http_host, HttpEvasionOptions, HttpHostInfo};
 pub use packet::{
     build_ipv4_tcp_packet, build_ipv4_udp_packet, build_ipv6_tcp_packet, build_ipv6_udp_packet,
@@ -27,8 +29,9 @@ pub use packet::{
 pub use quic::{detect_quic_initial, QuicInitialInfo, QuicPolicy};
 pub use strategy::{DpiStrategy, PlatformCapabilities};
 pub use tcp::{
-    build_disorder_and_fake_packets, clamp_syn_mss, clamp_tcp_window, plan_tcp_splits,
-    segment_tcp_packet, FakePacketMode, RawPacketPlan, TcpSplitPlan,
+    build_disorder_and_fake_packets, build_turkey_desync_packets, clamp_syn_mss, clamp_tcp_window,
+    is_forged_dpi_http_redirect, is_forged_passive_dpi_rst, plan_tcp_splits, segment_tcp_packet,
+    segment_tcp_packet_multi, DesyncPacket, FakePacketMode, RawPacketPlan, TcpSplitPlan,
 };
 pub use tls::{
     fragment_tls_client_hello, parse_client_hello, parse_client_hello_prefix, ClientHelloInfo,

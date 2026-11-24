@@ -2,6 +2,7 @@
 
 use std::net::IpAddr;
 
+use crate::fake_hello::build_benign_fake_client_hello;
 use crate::http::parse_http_host;
 use crate::packet::{
     build_ipv4_tcp_packet, build_ipv6_tcp_packet, parse_ip_packet, parse_tcp, IpProtocol, ParsedTcp,
@@ -20,6 +21,19 @@ pub enum FakePacketMode {
     LowTtl(u8),
     /// Fake packet with intentionally corrupted TCP checksum so server kernel discards it.
     BadChecksum,
+    /// Fake packet with shifted TCP SEQ (-10000) and ACK (-66000) (`--wrong-seq`).
+    WrongSeq,
+    /// Combines Low-TTL with `--wrong-seq` so both home NAT and real servers safely reject it while DPI desyncs.
+    LowTtlWrongSeq(u8),
+    /// Combines intentionally corrupted TCP checksum with `--wrong-seq`.
+    BadChecksumWrongSeq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesyncPacket {
+    pub bytes: Vec<u8>,
+    /// True when TCP checksum is intentionally corrupted and OS NIC offload must NOT repair it.
+    pub preserve_bad_tcp_checksum: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,68 +160,293 @@ pub fn segment_tcp_packet(raw_packet: &[u8], split_at: usize) -> Option<(Vec<u8>
     Some((pkt1, pkt2))
 }
 
-/// Builds an out-of-order (disorder) + optional fake packet transmission plan for raw packet engines (Windows).
-pub fn build_disorder_and_fake_packets(
-    raw_packet: &[u8],
-    split_at: usize,
-    fake: Option<FakePacketMode>,
-) -> Option<RawPacketPlan> {
-    let (seg1, seg2) = segment_tcp_packet(raw_packet, split_at)?;
-    let mut packets = Vec::with_capacity(3);
+/// Segments a raw IPv4/IPv6 TCP packet into multiple valid L3 packets at sorted `split_points`.
+pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Option<Vec<Vec<u8>>> {
+    let ip = parse_ip_packet(raw_packet)?;
+    if ip.protocol != IpProtocol::Tcp {
+        return None;
+    }
+    let tcp = parse_tcp(ip.payload)?;
+    if tcp.payload.len() < 2 {
+        return None;
+    }
 
-    if let Some(mode) = fake {
-        let ip = parse_ip_packet(raw_packet)?;
-        let tcp = parse_tcp(ip.payload)?;
-        let decoy_payload = b"\x16\x03\x01\x00\x10\x01\x00\x00\x0c\x03\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        let ttl = match mode {
-            FakePacketMode::LowTtl(t) => t.max(1),
-            FakePacketMode::BadChecksum => ip.ttl,
+    let mut cuts: Vec<usize> = split_points
+        .iter()
+        .copied()
+        .filter(|&p| p > 0 && p < tcp.payload.len())
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    if cuts.is_empty() {
+        return None;
+    }
+
+    let tcp_options = if tcp.header_len > 20 {
+        &ip.payload[20..tcp.header_len]
+    } else {
+        &[]
+    };
+
+    let mut boundaries = Vec::with_capacity(cuts.len() + 2);
+    boundaries.push(0usize);
+    boundaries.extend_from_slice(&cuts);
+    boundaries.push(tcp.payload.len());
+
+    let seg_count = boundaries.len() - 1;
+    let mut out = Vec::with_capacity(seg_count);
+
+    for i in 0..seg_count {
+        let start = boundaries[i];
+        let end = boundaries[i + 1];
+        let part = &tcp.payload[start..end];
+        let is_last = i + 1 == seg_count;
+        let flags = if is_last {
+            tcp.flags
+        } else {
+            tcp.flags & !ParsedTcp::FIN
         };
-        let mut fake_pkt = match (ip.src_ip, ip.dst_ip) {
+        let seq = tcp.seq.wrapping_add(start as u32);
+        let ip_id = 10u16.wrapping_add(i as u16);
+
+        let pkt = match (ip.src_ip, ip.dst_ip) {
             (IpAddr::V4(s), IpAddr::V4(d)) => build_ipv4_tcp_packet(
                 s,
                 d,
                 tcp.src_port,
                 tcp.dst_port,
-                tcp.seq,
+                seq,
                 tcp.ack,
-                tcp.flags,
+                flags,
                 tcp.window,
-                ttl,
-                99,
-                &[],
-                decoy_payload,
+                ip.ttl,
+                ip_id,
+                tcp_options,
+                part,
             ),
             (IpAddr::V6(s), IpAddr::V6(d)) => build_ipv6_tcp_packet(
                 s,
                 d,
                 tcp.src_port,
                 tcp.dst_port,
-                tcp.seq,
+                seq,
                 tcp.ack,
-                tcp.flags,
+                flags,
                 tcp.window,
-                ttl,
-                &[],
-                decoy_payload,
+                ip.ttl,
+                tcp_options,
+                part,
             ),
             _ => return None,
         };
-
-        if matches!(mode, FakePacketMode::BadChecksum) {
-            let l4_off = if ip.version == 4 { 20 } else { 40 };
-            // Corrupt TCP checksum (bytes +16..+18 in TCP header)
-            fake_pkt[l4_off + 16] ^= 0xFF;
-            fake_pkt[l4_off + 17] ^= 0x5A;
-        }
-        packets.push(fake_pkt);
+        out.push(pkt);
     }
 
-    // Disorder: transmit seg2 BEFORE seg1 so stateless/shallow DPI fails to reassemble SNI
-    packets.push(seg2);
-    packets.push(seg1);
+    Some(out)
+}
 
-    Some(RawPacketPlan { packets })
+fn build_single_fake_packet(
+    ip: &crate::packet::ParsedIpPacket<'_>,
+    tcp: &ParsedTcp<'_>,
+    mode: FakePacketMode,
+    decoy_payload: &[u8],
+    ip_id: u16,
+) -> Option<DesyncPacket> {
+    let ttl = match mode {
+        FakePacketMode::LowTtl(t) | FakePacketMode::LowTtlWrongSeq(t) => t.max(1),
+        FakePacketMode::BadChecksum | FakePacketMode::WrongSeq | FakePacketMode::BadChecksumWrongSeq => {
+            ip.ttl
+        }
+    };
+    let (seq, ack) = match mode {
+        FakePacketMode::WrongSeq
+        | FakePacketMode::LowTtlWrongSeq(_)
+        | FakePacketMode::BadChecksumWrongSeq => (
+            tcp.seq.wrapping_sub(10_000),
+            tcp.ack.wrapping_sub(66_000),
+        ),
+        FakePacketMode::LowTtl(_) | FakePacketMode::BadChecksum => (tcp.seq, tcp.ack),
+    };
+
+    let mut fake_pkt = match (ip.src_ip, ip.dst_ip) {
+        (IpAddr::V4(s), IpAddr::V4(d)) => build_ipv4_tcp_packet(
+            s,
+            d,
+            tcp.src_port,
+            tcp.dst_port,
+            seq,
+            ack,
+            tcp.flags,
+            tcp.window,
+            ttl,
+            ip_id,
+            &[],
+            decoy_payload,
+        ),
+        (IpAddr::V6(s), IpAddr::V6(d)) => build_ipv6_tcp_packet(
+            s,
+            d,
+            tcp.src_port,
+            tcp.dst_port,
+            seq,
+            ack,
+            tcp.flags,
+            tcp.window,
+            ttl,
+            &[],
+            decoy_payload,
+        ),
+        _ => return None,
+    };
+
+    let bad_csum = matches!(
+        mode,
+        FakePacketMode::BadChecksum | FakePacketMode::BadChecksumWrongSeq
+    );
+    if bad_csum {
+        let l4_off = if ip.version == 4 { 20 } else { 40 };
+        fake_pkt[l4_off + 16] ^= 0xFF;
+        fake_pkt[l4_off + 17] ^= 0x5A;
+    }
+
+    Some(DesyncPacket {
+        bytes: fake_pkt,
+        preserve_bad_tcp_checksum: bad_csum,
+    })
+}
+
+/// Builds a full Turkey-ISP-grade DPI desynchronization burst:
+/// 1. One or more valid benign fake decoy packets (`LowTtl`, `WrongSeq`, `BadChecksum`)
+/// 2. Multi-point segmented real payload sent in reverse/disorder order (`seg[1..]`, then `seg[0]`)
+///    so stateful DPI fails to match SNI/Host while the destination server reassembles identically.
+pub fn build_turkey_desync_packets(
+    raw_packet: &[u8],
+    split_points: &[usize],
+    fake_modes: &[FakePacketMode],
+    fake_payload: &[u8],
+    reverse_first_segment: bool,
+) -> Option<Vec<DesyncPacket>> {
+    let ip = parse_ip_packet(raw_packet)?;
+    if ip.protocol != IpProtocol::Tcp {
+        return None;
+    }
+    let tcp = parse_tcp(ip.payload)?;
+    let mut segs = segment_tcp_packet_multi(raw_packet, split_points)?;
+
+    let mut out = Vec::with_capacity(fake_modes.len() + segs.len());
+    for (idx, &mode) in fake_modes.iter().enumerate() {
+        if let Some(fake) = build_single_fake_packet(
+            &ip,
+            &tcp,
+            mode,
+            fake_payload,
+            90u16.wrapping_add(idx as u16),
+        ) {
+            out.push(fake);
+        }
+    }
+
+    if reverse_first_segment && segs.len() >= 2 {
+        // Transmit tail segments BEFORE the 1-2 byte leading segment (`--reverse-frag` / disorder)
+        let first = segs.remove(0);
+        for seg in segs {
+            out.push(DesyncPacket {
+                bytes: seg,
+                preserve_bad_tcp_checksum: false,
+            });
+        }
+        out.push(DesyncPacket {
+            bytes: first,
+            preserve_bad_tcp_checksum: false,
+        });
+    } else {
+        for seg in segs {
+            out.push(DesyncPacket {
+                bytes: seg,
+                preserve_bad_tcp_checksum: false,
+            });
+        }
+    }
+
+    Some(out)
+}
+
+/// Detects forged inbound `TCP RST` packets injected by passive optical-splitter DPI boxes
+/// (e.g. Türk Telekom / Vodafone Procera / Sandvine):
+/// - IPv4 `IP.ID == 0x0000` or `0x0001` (classic passive DPI generator fingerprint)
+/// - OR inbound TTL differs by `>= 3` hops from the real server's observed `SYN-ACK` TTL.
+pub fn is_forged_passive_dpi_rst(raw_packet: &[u8], expected_syn_ack_ttl: Option<u8>) -> bool {
+    let Some(ip) = parse_ip_packet(raw_packet) else {
+        return false;
+    };
+    if ip.protocol != IpProtocol::Tcp {
+        return false;
+    }
+    let Some(tcp) = parse_tcp(ip.payload) else {
+        return false;
+    };
+    if (tcp.flags & ParsedTcp::RST) == 0 {
+        return false;
+    }
+
+    if ip.version == 4 && raw_packet.len() >= 6 {
+        let ip_id = u16::from_be_bytes([raw_packet[4], raw_packet[5]]);
+        if ip_id == 0 || ip_id == 1 {
+            return true;
+        }
+    }
+
+    if let Some(syn_ttl) = expected_syn_ack_ttl {
+        if syn_ttl > 0 && ip.ttl > 0 && syn_ttl.abs_diff(ip.ttl) >= 3 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Detects forged inbound plaintext HTTP 302/307 ISP censorship redirect responses (e.g. BTK block page).
+pub fn is_forged_dpi_http_redirect(raw_packet: &[u8]) -> bool {
+    let Some(ip) = parse_ip_packet(raw_packet) else {
+        return false;
+    };
+    if ip.protocol != IpProtocol::Tcp {
+        return false;
+    }
+    let Some(tcp) = parse_tcp(ip.payload) else {
+        return false;
+    };
+    if tcp.payload.len() < 16 || !tcp.payload.starts_with(b"HTTP/1.") {
+        return false;
+    }
+    let text = String::from_utf8_lossy(tcp.payload).to_ascii_lowercase();
+    let is_redirect = text.starts_with("http/1.1 302")
+        || text.starts_with("http/1.0 302")
+        || text.starts_with("http/1.1 307");
+    if !is_redirect {
+        return false;
+    }
+    text.contains("195.175.254.2")
+        || text.contains("btk.gov.tr")
+        || text.contains("tib.gov.tr")
+        || text.contains("turktelekom")
+        || text.contains("superonline")
+        || text.contains("vodafone")
+        || text.contains("engelliweb")
+}
+
+/// Builds an out-of-order (disorder) + optional fake packet transmission plan for raw packet engines (Windows).
+pub fn build_disorder_and_fake_packets(
+    raw_packet: &[u8],
+    split_at: usize,
+    fake: Option<FakePacketMode>,
+) -> Option<RawPacketPlan> {
+    let fake_slice: Vec<FakePacketMode> = fake.into_iter().collect();
+    let decoy = build_benign_fake_client_hello("www.iana.org");
+    let desync = build_turkey_desync_packets(raw_packet, &[split_at], &fake_slice, &decoy, true)?;
+    Some(RawPacketPlan {
+        packets: desync.into_iter().map(|d| d.bytes).collect(),
+    })
 }
 
 /// Clamps the TCP Maximum Segment Size (MSS, option kind 2) inside an outbound TCP `SYN`

@@ -414,9 +414,10 @@ impl TunEngine {
                 };
                 if udp.dst_port == 443
                     && self.config.quic_policy == QuicPolicy::BlockFallbackToTcp
-                    && detect_quic_initial(udp.payload).is_some()
+                    && (detect_quic_initial(udp.payload).is_some()
+                        || (!udp.payload.is_empty() && !crate::captive_portal::is_local_lan_ip(ip.dst_ip)))
                 {
-                    // Drop QUIC Initial cleanly to trigger Happy Eyeballs fallback to DPI-protected TCP/TLS
+                    // Drop QUIC UDP/443 cleanly to trigger instant Happy Eyeballs fallback to DPI-protected TCP/TLS
                     return;
                 }
 

@@ -18,6 +18,8 @@ pub struct ClientHelloInfo {
 pub enum SplitStrategy {
     /// Split directly at the midpoint of the SNI hostname.
     SniMid,
+    /// Split at an early fixed byte offset AND at the midpoint of SNI (ByeDPI `-r1+s`, 3 valid TLS records).
+    OffsetAndSniMid(usize),
     /// Split at a fixed offset within the handshake payload (clamped cleanly).
     FixedOffset(usize),
     /// Split handshake payload into chunks of at most `chunk_size` bytes.
@@ -237,6 +239,22 @@ pub fn fragment_tls_client_hello(data: &[u8], strategy: SplitStrategy) -> Option
                 (record_payload.len() / 2).clamp(1, record_payload.len() - 1)
             };
             vec![point]
+        }
+        SplitStrategy::OffsetAndSniMid(early) => {
+            let p1 = early.clamp(1, record_payload.len() - 1);
+            let p2 = if let Some((start, end)) = info.sni_range {
+                let rel_start = start.saturating_sub(5);
+                let rel_end = end.saturating_sub(5);
+                let mid = rel_start + (rel_end.saturating_sub(rel_start)) / 2;
+                mid.clamp(1, record_payload.len() - 1)
+            } else {
+                (record_payload.len() / 2).clamp(1, record_payload.len() - 1)
+            };
+            if p2 > p1 {
+                vec![p1, p2]
+            } else {
+                vec![p1]
+            }
         }
         SplitStrategy::FixedOffset(off) => {
             let point = off.clamp(1, record_payload.len() - 1);

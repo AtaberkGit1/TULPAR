@@ -8,14 +8,29 @@ pub enum DpiStrategy {
     TlsRecordSplit,
     /// Split the first TCP write right inside SNI / HTTP Host using TCP_NODELAY.
     TcpSniSplit,
-    /// Combine TLS Record Fragmentation + TCP Segmentation (default mobile & safe desktop strategy).
+    /// Combine TLS Record Fragmentation + TCP Segmentation.
     TlsAndTcpSplit,
+    /// Unrooted mobile/desktop ByeDPI-Turkey Stage 1 (`-r1+s -s1`): 3-record TLS split (offset 2 + SNI mid) + paced TCP writes.
+    TlsMultiRecordAndTcpSplit,
+    /// Unrooted mobile/desktop ByeDPI-Turkey Stage 2 (`-o1 -r1+s`): POSIX TCP Out-of-Band (`MSG_OOB`) byte + TLS SNI split.
+    TcpOobAndTlsSplit,
+    /// Unrooted mobile/desktop Stage 3: Multi-chunk small 32-byte TLS records sent over separate TCP segments.
+    TlsSmallChunks,
     /// Raw packet engine only: send segment 2 before segment 1 (out-of-order).
     RawDisorder,
     /// Raw packet engine only: inject decoy ClientHello with low TTL + out-of-order segments.
     RawFakeTtl { ttl: u8 },
     /// Raw packet engine only: inject decoy ClientHello with corrupted TCP checksum + disorder.
     RawBadChecksum,
+    /// Windows WinDivert Turkey Stage 1 (GoodbyeDPI-Turkey `-5` + `--wrong-seq` + `--wrong-chksum` + `-e 2` reverse-frag):
+    /// Valid benign fake ClientHello (Auto-TTL+WrongSeq AND BadChecksum+WrongSeq) + 3-segment disordered offset-2/SNI split.
+    TurkeyDesyncAuto,
+    /// Windows WinDivert Turkey Stage 2 (Vodafone / Superonline strict DPI escalation):
+    /// Triple decoy (`LowTtl(2)+WrongSeq`, `LowTtl(5)+WrongSeq`, `BadChecksum+WrongSeq`) + 1-byte reverse-frag 3-segment split.
+    TurkeyDesyncSuperonline,
+    /// Windows WinDivert Turkey Stage 3 (Ultra-strict DPI fallback):
+    /// `LowTtl(6)+WrongSeq` + `BadChecksum+WrongSeq` + 4-piece disordered tiny split (`[1..2]`, `[2..sni_mid]`, `[sni_mid..]`, `[0..1]`).
+    TurkeyDesyncAggressive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,10 +60,18 @@ impl PlatformCapabilities {
             DpiStrategy::Passthrough
             | DpiStrategy::TlsRecordSplit
             | DpiStrategy::TcpSniSplit
-            | DpiStrategy::TlsAndTcpSplit => true,
+            | DpiStrategy::TlsAndTcpSplit
+            | DpiStrategy::TlsMultiRecordAndTcpSplit
+            | DpiStrategy::TcpOobAndTlsSplit
+            | DpiStrategy::TlsSmallChunks => true,
             DpiStrategy::RawDisorder => self.supports_raw_packets,
             DpiStrategy::RawFakeTtl { .. } => self.supports_raw_packets && self.supports_ttl_fake,
             DpiStrategy::RawBadChecksum => self.supports_raw_packets && self.supports_bad_checksum,
+            DpiStrategy::TurkeyDesyncAuto
+            | DpiStrategy::TurkeyDesyncSuperonline
+            | DpiStrategy::TurkeyDesyncAggressive => {
+                self.supports_raw_packets && self.supports_ttl_fake && self.supports_bad_checksum
+            }
         }
     }
 
@@ -62,6 +85,9 @@ impl PlatformCapabilities {
                 DpiStrategy::RawDisorder,
                 DpiStrategy::RawFakeTtl { ttl: 3 },
                 DpiStrategy::RawBadChecksum,
+                DpiStrategy::TurkeyDesyncAuto,
+                DpiStrategy::TurkeyDesyncSuperonline,
+                DpiStrategy::TurkeyDesyncAggressive,
             ]
         } else {
             &[
@@ -69,6 +95,9 @@ impl PlatformCapabilities {
                 DpiStrategy::TlsRecordSplit,
                 DpiStrategy::TcpSniSplit,
                 DpiStrategy::TlsAndTcpSplit,
+                DpiStrategy::TlsMultiRecordAndTcpSplit,
+                DpiStrategy::TlsSmallChunks,
+                DpiStrategy::TcpOobAndTlsSplit,
             ]
         };
 

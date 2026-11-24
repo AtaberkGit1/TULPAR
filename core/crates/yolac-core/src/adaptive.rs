@@ -34,10 +34,19 @@ impl AdaptiveController {
         initial_strategy: DpiStrategy,
         max_entries: usize,
     ) -> Self {
+        Self::with_quic_policy(capabilities, initial_strategy, max_entries, QuicPolicy::BlockFallbackToTcp)
+    }
+
+    pub fn with_quic_policy(
+        capabilities: PlatformCapabilities,
+        initial_strategy: DpiStrategy,
+        max_entries: usize,
+        quic_policy: QuicPolicy,
+    ) -> Self {
         let effective_initial = if capabilities.supports(initial_strategy) {
             initial_strategy
         } else {
-            DpiStrategy::TlsAndTcpSplit
+            DpiStrategy::TlsMultiRecordAndTcpSplit
         };
         Self {
             capabilities,
@@ -45,7 +54,7 @@ impl AdaptiveController {
             salt: rand::random(),
             max_entries: max_entries.max(64),
             table: Mutex::new(HashMap::new()),
-            quic_throttled: AtomicBool::new(false),
+            quic_throttled: AtomicBool::new(quic_policy == QuicPolicy::BlockFallbackToTcp),
         }
     }
 
@@ -82,7 +91,6 @@ impl AdaptiveController {
         if let Ok(mut guard) = self.table.lock() {
             guard.clear();
         }
-        self.quic_throttled.store(false, Ordering::Relaxed);
     }
 }
 

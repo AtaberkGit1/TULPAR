@@ -34,7 +34,7 @@ impl YolacConfig {
         Self {
             profile: MemoryProfile::Standard,
             capabilities: PlatformCapabilities::MOBILE_SANDBOX,
-            initial_strategy: DpiStrategy::TlsAndTcpSplit,
+            initial_strategy: DpiStrategy::TlsMultiRecordAndTcpSplit,
             ipv6_mode: Ipv6LeakMode::DualStackProtected,
             quic_policy: QuicPolicy::BlockFallbackToTcp,
             mtu: 1500,
@@ -45,7 +45,7 @@ impl YolacConfig {
         Self {
             profile: MemoryProfile::LowMemoryIos,
             capabilities: PlatformCapabilities::MOBILE_SANDBOX,
-            initial_strategy: DpiStrategy::TlsAndTcpSplit,
+            initial_strategy: DpiStrategy::TlsMultiRecordAndTcpSplit,
             ipv6_mode: Ipv6LeakMode::DualStackProtected,
             quic_policy: QuicPolicy::BlockFallbackToTcp,
             mtu: 1500,
@@ -56,7 +56,7 @@ impl YolacConfig {
         Self {
             profile: MemoryProfile::Standard,
             capabilities: PlatformCapabilities::WINDOWS_WINDIVERT,
-            initial_strategy: DpiStrategy::TlsAndTcpSplit,
+            initial_strategy: DpiStrategy::TurkeyDesyncAuto,
             ipv6_mode: Ipv6LeakMode::DualStackProtected,
             quic_policy: QuicPolicy::BlockFallbackToTcp,
             mtu: 1500,
@@ -103,10 +103,11 @@ impl YolacEngine {
             MemoryProfile::Standard => 1024,
             MemoryProfile::LowMemoryIos => 256,
         };
-        let adaptive = Arc::new(AdaptiveController::new(
+        let adaptive = Arc::new(AdaptiveController::with_quic_policy(
             config.capabilities,
             config.initial_strategy,
             strategy_cap,
+            config.quic_policy,
         ));
 
         let (state_tx, state_rx) = watch::channel(EngineState::Inactive);
