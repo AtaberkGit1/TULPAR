@@ -13,11 +13,12 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use yolac_core::{
-    forge_status_to_json, health_reports_to_json, ErrorCode, YolacConfig, YolacEngine,
+    forge_status_to_json, health_reports_to_json, parse_user_rules_json, DnsProfile,
+    ErrorCode, QuicPolicy, YolacConfig, YolacEngine,
 };
 use yolac_net::SocketProtector;
 
@@ -172,9 +173,7 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
             .ok()
             .map(|mut g| std::mem::replace(&mut *g, Arc::clone(&engine)));
         if let Some(old) = prev_engine {
-            engine
-                .health_monitor()
-                .carry_update_state_from(old.health_monitor());
+            engine.carry_user_settings_from(&old);
             holder.rt.block_on(old.stop());
         }
 
@@ -231,9 +230,7 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStop(
         if let Some(holder) = try_get_holder() {
             let fresh_inactive = Arc::new(YolacEngine::new(YolacConfig::mobile_android(), None));
             let old_opt = holder.engine.lock().ok().map(|mut g| {
-                fresh_inactive
-                    .health_monitor()
-                    .carry_update_state_from(g.health_monitor());
+                fresh_inactive.carry_user_settings_from(&g);
                 std::mem::replace(&mut *g, fresh_inactive)
             });
             if let Some(old_engine) = old_opt {
@@ -435,6 +432,112 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeGetForgeStatusJson(
             }
         } else {
             "{\"status\":\"baseline\"}".into()
+        };
+        new_jstring_or_empty(&env, &json)
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeSetDnsProfileJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    spec: JString,
+) -> jstring {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Ok(jstr) = env.get_string(&spec) else {
+            return new_jstring_or_empty(&env, r#"{"ok":false,"error":"invalid_string"}"#);
+        };
+        let raw: String = jstr.into();
+        let profile = match DnsProfile::parse_spec(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                let esc = e.replace('\\', "\\\\").replace('"', "\\\"");
+                return new_jstring_or_empty(&env, &format!("{{\"ok\":false,\"error\":\"{esc}\"}}"));
+            }
+        };
+        let label = profile.label_tr();
+        let key = profile.key();
+        if let Some(holder) = get_or_init_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                guard.set_dns_profile(profile);
+            }
+        }
+        let esc_label = label.replace('\\', "\\\\").replace('"', "\\\"");
+        new_jstring_or_empty(
+            &env,
+            &format!("{{\"ok\":true,\"key\":\"{key}\",\"label\":\"{esc_label}\"}}"),
+        )
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeSetQuicPolicy(
+    _env: JNIEnv,
+    _class: JClass,
+    mode: jint,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let policy = match mode {
+            0 => QuicPolicy::Allow,
+            2 => QuicPolicy::DesyncFragment,
+            _ => QuicPolicy::BlockFallbackToTcp,
+        };
+        if let Some(holder) = get_or_init_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                guard.set_quic_policy(policy);
+            }
+        }
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeSetUserRulesJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    rules_json: JString,
+) -> jboolean {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Ok(jstr) = env.get_string(&rules_json) else {
+            return JNI_FALSE;
+        };
+        let raw: String = jstr.into();
+        let rules = parse_user_rules_json(&raw);
+        if let Some(holder) = get_or_init_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                guard.set_user_rules(rules);
+                return JNI_TRUE;
+            }
+        }
+        JNI_FALSE
+    }))
+    .unwrap_or(JNI_FALSE)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeDiagnoseDomainJson(
+    mut env: JNIEnv,
+    _class: JClass,
+    domain: JString,
+) -> jstring {
+    catch_unwind(AssertUnwindSafe(|| {
+        let Ok(jstr) = env.get_string(&domain) else {
+            return new_jstring_or_empty(
+                &env,
+                r#"{"verdict":"dns_failed","summary":"Geçersiz alan adı."}"#,
+            );
+        };
+        let dom: String = jstr.into();
+        let json = if let Some(holder) = get_or_init_holder() {
+            let eng = holder.engine.lock().ok().map(|g| Arc::clone(&g));
+            if let Some(engine) = eng {
+                holder.rt.block_on(engine.diagnose_domain(&dom)).to_json()
+            } else {
+                r#"{"verdict":"dns_failed","summary":"Motor hazır değil."}"#.into()
+            }
+        } else {
+            r#"{"verdict":"dns_failed","summary":"Çalışma zamanı başlatılamadı."}"#.into()
         };
         new_jstring_or_empty(&env, &json)
     }))

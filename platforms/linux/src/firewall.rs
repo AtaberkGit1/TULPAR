@@ -182,6 +182,16 @@ fn apply_iptables_fallback() -> io::Result<()> {
     let _ = run_ipt("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", "TULPAR_DNS"]);
     let _ = run_ipt("iptables", &["-t", "nat", "-I", "OUTPUT", "1", "-j", "TULPAR_DNS"]);
 
+    // Transparent IPv6 DNS redirect when kernel supports ip6table_nat (ignored gracefully otherwise)
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-N", "TULPAR_DNS"]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-F", "TULPAR_DNS"]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-A", "TULPAR_DNS", "-m", "mark", "--mark", &mark_hex, "-j", "RETURN"]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-A", "TULPAR_DNS", "-d", "::1", "-j", "RETURN"]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-A", "TULPAR_DNS", "-p", "udp", "--dport", "53", "-j", "REDIRECT", "--to-ports", &dns_str]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-A", "TULPAR_DNS", "-p", "tcp", "--dport", "53", "-j", "REDIRECT", "--to-ports", &dns_str]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-D", "OUTPUT", "-j", "TULPAR_DNS"]);
+    let _ = run_ipt("ip6tables", &["-t", "nat", "-I", "OUTPUT", "1", "-j", "TULPAR_DNS"]);
+
     Ok(())
 }
 
@@ -202,10 +212,19 @@ pub fn remove_firewall_rules() {
         let _ = run_ipt(bin, &["-t", "mangle", "-D", "INPUT", "-j", "TULPAR_IN"]);
         let _ = run_ipt(bin, &["-t", "mangle", "-F", "TULPAR_IN"]);
         let _ = run_ipt(bin, &["-t", "mangle", "-X", "TULPAR_IN"]);
+
+        let _ = run_ipt(bin, &["-t", "nat", "-D", "OUTPUT", "-j", "TULPAR_DNS"]);
+        let _ = run_ipt(bin, &["-t", "nat", "-F", "TULPAR_DNS"]);
+        let _ = run_ipt(bin, &["-t", "nat", "-X", "TULPAR_DNS"]);
     }
-    let _ = run_ipt("iptables", &["-t", "nat", "-D", "OUTPUT", "-j", "TULPAR_DNS"]);
-    let _ = run_ipt("iptables", &["-t", "nat", "-F", "TULPAR_DNS"]);
-    let _ = run_ipt("iptables", &["-t", "nat", "-X", "TULPAR_DNS"]);
+}
+
+pub fn is_systemd_resolved_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "systemd-resolved"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 pub fn flush_linux_dns_caches() {

@@ -5,17 +5,19 @@ TULPAR is an **on-device** censorship circumvention and encrypted-DNS engine tha
 ## 1. What TULPAR CAN Bypass / Protect Against (Verified On-Device)
 1. **DNS Poisoning, Hijacking & Transparent DNS Proxies**:
    - Bypassed via encrypted DoH (RFC 8484) and DoT (RFC 7858) using hardcoded bootstrap IPs + poisoning detection + automatic failover.
-2. **SNI-Based HTTPS DPI Inspection**:
-   - Bypassed via TLS Record Fragmentation (splitting `ClientHello` across multiple valid TLS records inside the SNI field) and TCP Segmentation (splitting TCP payload around SNI with `TCP_NODELAY`).
-   - On Windows (`WinDivert`) and Linux (`NFQUEUE` + `IPPROTO_RAW`), additionally supports Out-of-Order (Disorder) TCP segments, low-TTL decoy `ClientHello` injection, and bad-checksum decoy packets.
+2. **SNI-Based HTTPS DPI Inspection (Including Post-Quantum `X25519MLKEM768`)**:
+   - Bypassed via TLS Record Fragmentation and TCP Segmentation around the `SNI` field (`DpiTcpRelay` on Android/TUN), and on Windows (`WinDivert`) / Linux (`NFQUEUE`) additionally via Out-of-Order (Disorder) TCP segments, low-TTL decoy `ClientHello` injection, bad-checksum decoy packets, and RFC 7323 PAWS bad-timestamp decoys.
+   - Multi-segment Post-Quantum TLS 1.3 `ClientHello`s (~1.7 KB+) whose SNI appears in the second TCP segment are held briefly in RAM (`<= 120 ms`), reassembled, split mid-SNI, and emitted in MTU-safe (`<= 1380`-byte payload) TCP segments.
 3. **Plaintext HTTP `Host:` DPI**:
    - Bypassed via TCP split inside the `Host:` header value and case/whitespace normalization.
 4. **Protocol / QUIC / UDP-443 Blocking or Selective DPI Throttling**:
-   - Detected and mitigated via QUIC Initial UDP desync or clean fallback (`QuicPolicy::BlockFallbackToTcp`) to DPI-protected TLS/TCP.
-5. **Ads, Trackers, CNAME Cloaking & Malware Domains**:
-   - Blocked locally in RAM via `yolac-blocklist` + CNAME uncloaking in `yolac-dns` before any connection is opened.
-6. **DNS & IPv6 Leaks**:
-   - Plain port-53 traffic is intercepted locally; IPv6 traffic is either protected identically or blocked (`BlockUnprotectedIpv6` / `AAAA` suppression) so packets never bypass protection.
+   - Controlled via configurable `QuicPolicy`: default `BlockFallbackToTcp` (forces HTTP/3 clients cleanly onto DPI-protected TCP/443), `DesyncFragment` (emits Low-TTL and corrupted-UDP-checksum QUIC Initial decoys before the real packet on Windows/Linux), or `Allow`.
+5. **Ads, Trackers, CNAME Cloaking & User Overlay Filtering**:
+   - Blocked locally in RAM via `yolac-blocklist` + CNAME uncloaking in `yolac-dns`, plus user-defined allowlist, blocklist, and DPI-exclusion domain rules.
+6. **DNS, HTTPS-RR (`ipv6hint`) & IPv6 Leaks**:
+   - Plain port-53 and unauthorized third-party DoT (`port 853`) traffic is intercepted or dropped locally; when IPv6 is unguarded (`BlockUnprotectedIpv6`), TULPAR suppresses `AAAA` queries AND strips `ipv6hint` (`SvcParamKey 6`) from RFC 9460 `HTTPS` (`Type 65`) answers while preserving `ech` (`SvcParamKey 5`).
+7. **On-Device Domain Censorship Doctor (`diagnose_domain` / `tulpar doctor`)**:
+   - Tests DNS resolution (DoH/DoT + ECH), direct TCP+TLS handshake, and DPI-split TLS handshake against the target domain to report whether the site is reachable directly, bypassed via DPI evasion, or unreachable due to a hard IP/link block (subject to single-device network conditions).
 
 ## 2. Protocol-Based DPI Throttling vs. Physical Line / ISP Speed Limits
 TULPAR does **not** magically increase physical internet speed:

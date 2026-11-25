@@ -1,6 +1,6 @@
 [package]
 name = "yolac-windows"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 description = "TULPAR Native Windows Application (Win32 HiDPI UI + System Tray + WinDivert Packet Engine + Network Optimizer)"
@@ -28,6 +28,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Dwm",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Services",
     "Win32_System_Threading",

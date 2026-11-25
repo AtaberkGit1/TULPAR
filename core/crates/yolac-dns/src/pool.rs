@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 use crate::upstream::EncryptedTlsStream;
 
@@ -26,7 +26,7 @@ impl UpstreamPool {
 
     /// LIFO take: hands out the freshest warm TLS stream first while discarding expired sockets.
     pub async fn take(&self, upstream_idx: usize) -> Option<EncryptedTlsStream> {
-        let mut guard = self.pools.lock().await;
+        let mut guard = self.pools.lock().ok()?;
         let queue = guard.get_mut(&upstream_idx)?;
         let now = Instant::now();
         while let Some((stream, saved_at)) = queue.pop_back() {
@@ -38,16 +38,23 @@ impl UpstreamPool {
     }
 
     pub async fn put(&self, upstream_idx: usize, stream: EncryptedTlsStream) {
-        let mut guard = self.pools.lock().await;
-        let queue = guard.entry(upstream_idx).or_default();
-        while queue.len() >= MAX_IDLE_PER_UPSTREAM {
-            queue.pop_front(); // evict oldest
+        if let Ok(mut guard) = self.pools.lock() {
+            let queue = guard.entry(upstream_idx).or_default();
+            while queue.len() >= MAX_IDLE_PER_UPSTREAM {
+                queue.pop_front(); // evict oldest
+            }
+            queue.push_back((stream, Instant::now()));
         }
-        queue.push_back((stream, Instant::now()));
     }
 
     pub async fn clear(&self) {
-        self.pools.lock().await.clear();
+        self.clear_sync();
+    }
+
+    pub fn clear_sync(&self) {
+        if let Ok(mut guard) = self.pools.lock() {
+            guard.clear();
+        }
     }
 }
 

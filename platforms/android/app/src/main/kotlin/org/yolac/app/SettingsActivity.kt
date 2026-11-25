@@ -15,6 +15,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -35,8 +36,11 @@ class SettingsActivity : ComponentActivity() {
     private lateinit var errorTextView: TextView
     private lateinit var selectedTextView: TextView
     private lateinit var privateDnsBanner: TextView
+    private lateinit var dnsButton: Button
+    private lateinit var domainDoctorButton: Button
     private lateinit var diagButton: Button
     private lateinit var diagStatusText: TextView
+    private lateinit var rulesButton: Button
     private lateinit var splitTunnelButton: Button
     private lateinit var batteryButton: Button
     private lateinit var updateButton: Button
@@ -204,6 +208,20 @@ class SettingsActivity : ComponentActivity() {
             }
         }
 
+        // DNS Provider selection (Auto, Cloudflare, Quad9, Mullvad Adblock, AdGuard, Custom DoH/DoT)
+        dnsButton = makeOutlineButton(dnsButtonLabel(), "#4A7A5A").apply {
+            setOnClickListener { openDnsProviderDialog() }
+        }
+        root.addView(
+            dnsButton,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (46 * density).toInt(),
+            ).apply {
+                topMargin = (18 * density).toInt()
+            },
+        )
+
         // Swiss Army Knife #1: Live Encrypted DNS & IPv6 Diagnostic
         diagButton = makeOutlineButton("Ağ ve DNS Tanılama (DoH / IPv6)", "#4A7A5A").apply {
             setOnClickListener { runLiveDiagnostics() }
@@ -214,7 +232,21 @@ class SettingsActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 (46 * density).toInt(),
             ).apply {
-                topMargin = (18 * density).toInt()
+                topMargin = (12 * density).toInt()
+            },
+        )
+
+        // Site Access Diagnostic (Domain Doctor)
+        domainDoctorButton = makeOutlineButton("Site Erişim Testi (Domain Doctor)").apply {
+            setOnClickListener { openDomainDoctorDialog() }
+        }
+        root.addView(
+            domainDoctorButton,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (46 * density).toInt(),
+            ).apply {
+                topMargin = (12 * density).toInt()
             },
         )
 
@@ -230,6 +262,20 @@ class SettingsActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             ).apply {
                 topMargin = (8 * density).toInt()
+            },
+        )
+
+        // Custom Domain Rules (Allowlist / Blocklist / DPI Bypass Exclusion)
+        rulesButton = makeOutlineButton(rulesButtonLabel()).apply {
+            setOnClickListener { openUserRulesDialog() }
+        }
+        root.addView(
+            rulesButton,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                (46 * density).toInt(),
+            ).apply {
+                topMargin = (12 * density).toInt()
             },
         )
 
@@ -343,6 +389,8 @@ class SettingsActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         YolacVpnService.syncStateFromNative()
+        dnsButton.text = dnsButtonLabel()
+        rulesButton.text = rulesButtonLabel()
         splitTunnelButton.text = splitTunnelButtonLabel()
         refreshHealth()
     }
@@ -351,6 +399,176 @@ class SettingsActivity : ComponentActivity() {
         activeDialog?.dismiss()
         activeDialog = null
         super.onDestroy()
+    }
+
+    private fun dnsButtonLabel(): String {
+        val label = getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(YolacVpnService.KEY_DNS_LABEL, "Otomatik (En Hızlı)")
+            ?: "Otomatik (En Hızlı)"
+        return "Şifreli DNS: $label"
+    }
+
+    private fun rulesButtonLabel(): String {
+        val prefs = getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
+        val allow = prefs.getString(YolacVpnService.KEY_RULES_ALLOW, "")?.trim().orEmpty()
+        val block = prefs.getString(YolacVpnService.KEY_RULES_BLOCK, "")?.trim().orEmpty()
+        val exclude = prefs.getString(YolacVpnService.KEY_RULES_EXCLUDE, "")?.trim().orEmpty()
+        val active = listOf(allow, block, exclude).count { it.isNotEmpty() }
+        return if (active > 0) {
+            "Alan Adı Kuralları ($active liste aktif)"
+        } else {
+            "Alan Adı Kuralları (İzin / Engel / DPI Hariç)"
+        }
+    }
+
+    private fun openDnsProviderDialog() {
+        val keys = arrayOf("auto", "cloudflare", "quad9", "mullvad_adblock", "adguard", "custom")
+        val labels = arrayOf(
+            "Otomatik (En Hızlı)",
+            "Cloudflare (1.1.1.1)",
+            "Quad9 Güvenlik (9.9.9.9)",
+            "Mullvad Reklam Engelli",
+            "AdGuard DNS",
+            "Özel DoH / DoT Adresi Gir...",
+        )
+        val current = getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(YolacVpnService.KEY_DNS_PROFILE, "auto")
+            ?: "auto"
+        val curIdx = keys.indexOf(current).let { if (it >= 0) it else if (current.contains("://")) 5 else 0 }
+
+        activeDialog?.dismiss()
+        activeDialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Şifreli DNS Sağlayıcısı")
+            .setSingleChoiceItems(labels, curIdx) { dlg, which ->
+                val chosen = keys[which]
+                dlg.dismiss()
+                if (chosen == "custom") {
+                    openCustomDnsDialog(current)
+                } else {
+                    applyDnsSpec(chosen)
+                }
+            }
+            .setNegativeButton("İptal", null)
+            .show()
+    }
+
+    private fun openCustomDnsDialog(current: String) {
+        val input = EditText(this).apply {
+            hint = "https://1.1.1.1/dns-query veya tls://9.9.9.9#dns.quad9.net"
+            if (current.contains("://")) setText(current)
+            setSingleLine(true)
+        }
+        activeDialog?.dismiss()
+        activeDialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Özel DoH / DoT Adresi")
+            .setView(input)
+            .setPositiveButton("Uygula") { _, _ ->
+                val spec = input.text?.toString()?.trim().orEmpty()
+                if (spec.isNotEmpty()) applyDnsSpec(spec)
+            }
+            .setNegativeButton("İptal", null)
+            .show()
+    }
+
+    private fun applyDnsSpec(spec: String) {
+        lifecycleScope.launch {
+            val raw = withContext(Dispatchers.IO) {
+                YolacNative.nativeSetDnsProfileJson(spec)
+            }
+            val parsed = HealthParser.parseDnsProfileSetResult(raw)
+            if (parsed.ok) {
+                getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
+                    .edit()
+                    .putString(YolacVpnService.KEY_DNS_PROFILE, spec)
+                    .putString(YolacVpnService.KEY_DNS_LABEL, parsed.label)
+                    .apply()
+                dnsButton.text = dnsButtonLabel()
+                diagStatusText.text = "Şifreli DNS güncellendi: ${parsed.label}"
+                diagStatusText.setTextColor(Color.parseColor("#2ECC71"))
+                diagStatusText.visibility = View.VISIBLE
+                refreshHealth()
+            } else {
+                diagStatusText.text = parsed.error.ifEmpty { "Geçersiz DNS adresi." }
+                diagStatusText.setTextColor(Color.parseColor("#E74C3C"))
+                diagStatusText.visibility = View.VISIBLE
+            }
+        }
+    }
+
+    private fun openDomainDoctorDialog() {
+        val input = EditText(this).apply {
+            hint = "Örn: discord.com"
+            setSingleLine(true)
+        }
+        activeDialog?.dismiss()
+        activeDialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Site Erişim Testi (Domain Doctor)")
+            .setView(input)
+            .setPositiveButton("Test Et") { _, _ ->
+                val dom = input.text?.toString()?.trim().orEmpty()
+                if (dom.isEmpty()) return@setPositiveButton
+                diagStatusText.text = "$dom için canlı erişim ve DPI testi çalışıyor..."
+                diagStatusText.setTextColor(Color.parseColor("#BDBDBD"))
+                diagStatusText.visibility = View.VISIBLE
+                lifecycleScope.launch {
+                    val raw = withContext(Dispatchers.IO) {
+                        YolacNative.nativeDiagnoseDomainJson(dom)
+                    }
+                    val parsed = HealthParser.parseDomainDoctorResult(raw)
+                    diagStatusText.text = parsed.summary
+                    diagStatusText.setTextColor(
+                        if (parsed.ok) Color.parseColor("#2ECC71")
+                        else Color.parseColor("#E74C3C"),
+                    )
+                }
+            }
+            .setNegativeButton("İptal", null)
+            .show()
+    }
+
+    private fun openUserRulesDialog() {
+        val prefs = getSharedPreferences(YolacVpnService.PREFS_NAME, Context.MODE_PRIVATE)
+        val allowEdit = EditText(this).apply {
+            hint = "İzin Listesi (reklam engel muaf, virgül/satır)"
+            setText(prefs.getString(YolacVpnService.KEY_RULES_ALLOW, ""))
+        }
+        val blockEdit = EditText(this).apply {
+            hint = "Özel Engel Listesi (virgül/satır)"
+            setText(prefs.getString(YolacVpnService.KEY_RULES_BLOCK, ""))
+        }
+        val excludeEdit = EditText(this).apply {
+            hint = "DPI Hariç Tutma (doğrudan bağlantı, virgül/satır)"
+            setText(prefs.getString(YolacVpnService.KEY_RULES_EXCLUDE, ""))
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            val p = (16 * resources.displayMetrics.density).toInt()
+            setPadding(p, p / 2, p, p / 2)
+            addView(allowEdit)
+            addView(blockEdit)
+            addView(excludeEdit)
+        }
+        activeDialog?.dismiss()
+        activeDialog = AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle("Alan Adı Kuralları")
+            .setView(container)
+            .setPositiveButton("Kaydet") { _, _ ->
+                val allow = allowEdit.text?.toString().orEmpty()
+                val block = blockEdit.text?.toString().orEmpty()
+                val exclude = excludeEdit.text?.toString().orEmpty()
+                prefs.edit()
+                    .putString(YolacVpnService.KEY_RULES_ALLOW, allow)
+                    .putString(YolacVpnService.KEY_RULES_BLOCK, block)
+                    .putString(YolacVpnService.KEY_RULES_EXCLUDE, exclude)
+                    .apply()
+                rulesButton.text = rulesButtonLabel()
+                val rulesJson = HealthParser.buildUserRulesJson(allow, block, exclude)
+                lifecycleScope.launch(Dispatchers.IO) {
+                    YolacNative.nativeSetUserRulesJson(rulesJson)
+                }
+            }
+            .setNegativeButton("İptal", null)
+            .show()
     }
 
     private fun getExcludedPackages(): MutableSet<String> {

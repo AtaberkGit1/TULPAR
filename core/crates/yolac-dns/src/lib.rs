@@ -19,8 +19,11 @@ pub mod wire;
 pub use cache::{CacheLookup, DnsCache};
 pub use poison::{detect_poisoning, detect_poisoning_tls, PoisonReason};
 pub use resolver::{DnsConfig, DnsEngine, DnsOutcome, DnsStatsSnapshot, UpstreamBenchmark};
-pub use upstream::{default_public_upstreams, UpstreamConfig, UpstreamProtocol};
+pub use upstream::{
+    default_public_upstreams, parse_custom_dns_endpoint, upstreams_for_profile, DnsProfile,
+    UpstreamConfig, UpstreamProtocol,
+};
 pub use wire::{
-    build_blocked_response, build_empty_noerror_response, parse_dns_query, parse_dns_response,
-    DnsQuery, DnsRecordData, DnsResponse, QType,
+    build_blocked_response, build_dns_query, build_empty_noerror_response, parse_dns_query,
+    parse_dns_response, strip_https_ipv6_hints, DnsQuery, DnsRecordData, DnsResponse, QType,
 };

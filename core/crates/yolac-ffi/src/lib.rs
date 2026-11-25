@@ -1,7 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 //! Panic-safe C-ABI and optional Android JNI bindings for `yolac-core`.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{c_char, c_void, CStr};
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use yolac_core::{
-    forge_status_to_json, health_reports_to_json, EngineState, ErrorCode, YolacConfig, YolacEngine,
+    forge_status_to_json, health_reports_to_json, parse_user_rules_json, DnsProfile, EngineState,
+    ErrorCode, QuicPolicy, YolacConfig, YolacEngine,
 };
 use yolac_net::{ChannelPacketDevice, Ipv6LeakMode, MemoryProfile, PacketDevice, SocketProtector};
 
@@ -204,7 +205,10 @@ pub extern "C" fn yolac_start_packet_flow(
         if let Ok(mut g) = h.inbound_tx.lock() {
             *g = Some(in_tx);
         }
-        let prev = h.engine.lock().ok().map(|mut g| std::mem::replace(&mut *g, engine));
+        let prev = h.engine.lock().ok().map(|mut g| {
+            engine.carry_user_settings_from(&g);
+            std::mem::replace(&mut *g, engine)
+        });
         if let Some(old_engine) = prev {
             h.rt.block_on(old_engine.stop());
         }
@@ -274,7 +278,10 @@ pub extern "C" fn yolac_start_tun_fd(
                 return -2;
             };
             let fd_dev = Arc::new(fd_dev);
-            let prev = h.engine.lock().ok().map(|mut g| std::mem::replace(&mut *g, Arc::clone(&engine)));
+            let prev = h.engine.lock().ok().map(|mut g| {
+                engine.carry_user_settings_from(&g);
+                std::mem::replace(&mut *g, Arc::clone(&engine))
+            });
             if let Some(old_engine) = prev {
                 h.rt.block_on(old_engine.stop());
             }
@@ -446,6 +453,100 @@ pub extern "C" fn yolac_get_forge_status_json(
     .unwrap_or(-1)
 }
 
+#[no_mangle]
+pub extern "C" fn yolac_set_dns_profile_json(
+    handle: *mut YolacHandle,
+    profile_spec: *const c_char,
+) -> i32 {
+    if handle.is_null() || profile_spec.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let Ok(spec_str) = unsafe { CStr::from_ptr(profile_spec) }.to_str() else {
+            return -2;
+        };
+        let Ok(profile) = DnsProfile::parse_spec(spec_str) else {
+            return -2;
+        };
+        let Ok(guard) = h.engine.lock() else {
+            return -1;
+        };
+        guard.set_dns_profile(profile);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn yolac_set_quic_policy(handle: *mut YolacHandle, mode: u8) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let policy = match mode {
+            0 => QuicPolicy::Allow,
+            2 => QuicPolicy::DesyncFragment,
+            _ => QuicPolicy::BlockFallbackToTcp,
+        };
+        let Ok(guard) = h.engine.lock() else {
+            return -1;
+        };
+        guard.set_quic_policy(policy);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn yolac_set_user_rules_json(
+    handle: *mut YolacHandle,
+    rules_json: *const c_char,
+) -> i32 {
+    if handle.is_null() || rules_json.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let Ok(json) = unsafe { CStr::from_ptr(rules_json) }.to_str() else {
+            return -2;
+        };
+        let parsed = parse_user_rules_json(json);
+        let Ok(guard) = h.engine.lock() else {
+            return -1;
+        };
+        guard.set_user_rules(parsed);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn yolac_diagnose_domain_json(
+    handle: *mut YolacHandle,
+    domain: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if handle.is_null() || domain.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let Ok(dom_str) = unsafe { CStr::from_ptr(domain) }.to_str() else {
+            return -2;
+        };
+        let eng = match h.engine.lock() {
+            Ok(g) => Arc::clone(&g),
+            Err(_) => return -1,
+        };
+        let rep = h.rt.block_on(eng.diagnose_domain(dom_str));
+        write_c_string(&rep.to_json(), out_buf, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
 /// Non-blocking epoll/kqueue `AsyncFd`-backed Unix/Android TUN device:
 /// - ZERO dedicated OS reader threads (eliminates Drop::drop() ANR deadlock!)
 /// - ZERO 200ms idle polling wakeups during Android Doze (432,000 -> 0 wakeups/day!)
@@ -486,6 +587,57 @@ impl UnixTunFdDevice {
 
 #[cfg(unix)]
 impl PacketDevice for UnixTunFdDevice {
+    async fn recv_packet_batch(&self, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let limit = max.max(1);
+        loop {
+            let mut guard = self.async_fd.readable().await?;
+            let start_len = out.len();
+            let mut fatal_err: Option<io::Error> = None;
+            while out.len().saturating_sub(start_len) < limit {
+                let mut buf = vec![0u8; 4096];
+                match guard.try_io(|inner| {
+                    let fd = inner.as_raw_fd();
+                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                    if n < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                }) {
+                    Ok(Ok(0)) => {
+                        if out.len() == start_len {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "TUN fd closed",
+                            ));
+                        }
+                        break;
+                    }
+                    Ok(Ok(n)) => {
+                        buf.truncate(n);
+                        out.push(buf);
+                    }
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Ok(Err(e)) => {
+                        fatal_err = Some(e);
+                        break;
+                    }
+                    Err(_would_block) => break,
+                }
+            }
+            if let Some(e) = fatal_err {
+                if out.len() > start_len {
+                    return Ok(());
+                }
+                return Err(e);
+            }
+            if out.len() > start_len {
+                return Ok(());
+            }
+        }
+    }
+
     async fn recv_packet(&self) -> io::Result<Vec<u8>> {
         use std::os::fd::AsRawFd;
         let mut buf = vec![0u8; 4096];
@@ -626,6 +778,22 @@ mod tests {
         assert_eq!(yolac_load_forge_package(handle, corrupt.as_ptr(), corrupt.len()), -2);
 
         assert_eq!(yolac_unload_forge_package(handle), 0);
+
+        // Verify v0.5 DNS profile, QUIC mode, and user rules C-ABI setters
+        assert_eq!(
+            yolac_set_dns_profile_json(handle, c"mullvad_adblock".as_ptr()),
+            0
+        );
+        assert_eq!(yolac_set_quic_policy(handle, 0), 0);
+        assert_eq!(
+            yolac_set_user_rules_json(
+                handle,
+                c"{\"allowlist\":[\"doubleclick.net\"],\"blocklist\":[\"ads.custom.test\"],\"excluded_dpi\":[\"bank.local.tr\"],\"aggressive_dpi\":[]}".as_ptr()
+            ),
+            0
+        );
+        assert_eq!(yolac_set_dns_profile_json(handle, c"https://127.0.0.1/dns-query#localhost".as_ptr()), -2);
+
         yolac_destroy(handle);
     }
 

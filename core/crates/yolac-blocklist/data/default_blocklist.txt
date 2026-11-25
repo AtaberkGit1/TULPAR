@@ -2,7 +2,7 @@
 # Includes curated baseline + MIT-licensed StevenBlack unified hosts subset (zero false positives on core services).
 # Strictly RAM-only contiguous arena (< 400 KB RAM).
 
-# Curated v0.4.0: zero-false-positive apex-pruned ads/trackers/malware + Turkish ad networks
+# Curated v0.5.0: zero-false-positive apex-pruned ads/trackers/malware + Turkish/mobile ad networks
 ads 010sec.com
 ads 01mspmd5yalky8.com
 ads 0202.com.tw

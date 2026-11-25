@@ -77,6 +77,12 @@ int32_t yolac_load_forge_package(YolacHandle *handle, const uint8_t *data, size_
 int32_t yolac_unload_forge_package(YolacHandle *handle);
 int32_t yolac_get_forge_status_json(YolacHandle *handle, char *out_buf, size_t out_len);
 
+/* TULPAR v0.5 dynamic controls: DNS profile, QUIC mode (0=allow,1=fallback,2=desync), user rules & domain doctor */
+int32_t yolac_set_dns_profile_json(YolacHandle *handle, const char *profile_spec);
+int32_t yolac_set_quic_policy(YolacHandle *handle, uint8_t mode);
+int32_t yolac_set_user_rules_json(YolacHandle *handle, const char *rules_json);
+int32_t yolac_diagnose_domain_json(YolacHandle *handle, const char *domain, char *out_buf, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

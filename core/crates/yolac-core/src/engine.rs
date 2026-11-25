@@ -3,22 +3,23 @@
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::Duration;
 
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tulpar_forge::{ForgeRuntime, ForgeStatusSnapshot, VerifyReport};
 use yolac_blocklist::Blocklist;
-use yolac_dns::{default_public_upstreams, DnsConfig, DnsEngine};
+use yolac_dns::{default_public_upstreams, DnsConfig, DnsEngine, DnsProfile};
 use yolac_dpi::{DpiStrategy, PlatformCapabilities, QuicPolicy};
 use yolac_net::{
     probe_ipv6_leak_mode, CaptivePortalMonitor, Ipv6LeakMode, MemoryProfile, NoopProtector,
     PacketDevice, ProtectedDialer, SocketProtector, TunConfig, TunEngine,
 };
 
-use crate::adaptive::AdaptiveController;
+use crate::adaptive::{AdaptiveController, UserRulesConfig};
 use crate::diagnostics::DiagnosticReport;
+use crate::doctor::{diagnose_domain_live, DomainDiagnosticReport};
 use crate::health::{HealthMonitor, ModuleHealthReport};
 use crate::state::{EngineState, EphemeralMetrics, ErrorCode};
 use crate::updater::{check_github_release_with_protector, UpdateCheckResult};
@@ -86,7 +87,9 @@ struct RunningTask {
 
 pub struct YolacEngine {
     config: YolacConfig,
-    blocklist: Arc<Blocklist>,
+    base_blocklist: Arc<Blocklist>,
+    blocklist: StdRwLock<Arc<Blocklist>>,
+    user_rules: StdMutex<UserRulesConfig>,
     dns: Arc<DnsEngine>,
     adaptive: Arc<AdaptiveController>,
     captive_portal: Arc<CaptivePortalMonitor>,
@@ -97,7 +100,7 @@ pub struct YolacEngine {
     health: Arc<HealthMonitor>,
     state_tx: watch::Sender<EngineState>,
     _state_rx: watch::Receiver<EngineState>,
-    running: Mutex<Option<RunningTask>>,
+    running: tokio::sync::Mutex<Option<RunningTask>>,
 }
 
 impl YolacEngine {
@@ -136,7 +139,9 @@ impl YolacEngine {
 
         Self {
             config,
-            blocklist,
+            base_blocklist: Arc::clone(&blocklist),
+            blocklist: StdRwLock::new(blocklist),
+            user_rules: StdMutex::new(UserRulesConfig::default()),
             dns,
             adaptive,
             captive_portal: Arc::new(CaptivePortalMonitor::new()),
@@ -147,7 +152,7 @@ impl YolacEngine {
             health: Arc::new(HealthMonitor::new()),
             state_tx,
             _state_rx: state_rx,
-            running: Mutex::new(None),
+            running: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -171,8 +176,62 @@ impl YolacEngine {
         &self.captive_portal
     }
 
-    pub fn blocklist(&self) -> &Arc<Blocklist> {
-        &self.blocklist
+    pub fn blocklist(&self) -> Arc<Blocklist> {
+        self.blocklist
+            .read()
+            .map(|b| Arc::clone(&b))
+            .unwrap_or_else(|_| Arc::clone(&self.base_blocklist))
+    }
+
+    pub fn set_dns_profile(&self, profile: DnsProfile) {
+        self.dns.reconfigure_profile(profile);
+    }
+
+    pub fn active_dns_profile(&self) -> DnsProfile {
+        self.dns.active_profile()
+    }
+
+    pub fn set_quic_policy(&self, policy: QuicPolicy) {
+        self.adaptive.set_quic_policy(policy);
+    }
+
+    pub fn quic_policy(&self) -> QuicPolicy {
+        self.adaptive.user_quic_policy()
+    }
+
+    pub fn set_user_rules(&self, rules: UserRulesConfig) {
+        let overlaid = Arc::new(
+            self.base_blocklist
+                .with_user_rules(&rules.allowlist, &rules.blocklist),
+        );
+        if let Ok(mut b) = self.blocklist.write() {
+            *b = Arc::clone(&overlaid);
+        }
+        self.dns.set_blocklist(overlaid);
+        self.adaptive
+            .set_user_domain_rules(&rules.excluded_dpi, &rules.aggressive_dpi);
+        if let Ok(mut g) = self.user_rules.lock() {
+            *g = rules;
+        }
+    }
+
+    pub fn user_rules(&self) -> UserRulesConfig {
+        self.user_rules
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Carries user DNS profile, QUIC policy, user rules & update status across engine restarts.
+    pub fn carry_user_settings_from(&self, prev: &YolacEngine) {
+        self.health.carry_update_state_from(prev.health_monitor());
+        self.set_dns_profile(prev.active_dns_profile());
+        self.set_quic_policy(prev.quic_policy());
+        self.set_user_rules(prev.user_rules());
+    }
+
+    pub async fn diagnose_domain(&self, domain: &str) -> DomainDiagnosticReport {
+        diagnose_domain_live(domain, &self.blocklist(), &self.dns, self.protector.as_ref()).await
     }
 
     pub fn metrics(&self) -> &Arc<EphemeralMetrics> {
@@ -237,7 +296,7 @@ impl YolacEngine {
         self.health.evaluate_all_with_forge(
             self.state(),
             self.config.capabilities,
-            &self.blocklist,
+            &self.blocklist(),
             &self.dns,
             &self.captive_portal,
             Some(&self.adaptive.forge_status()),
@@ -436,7 +495,7 @@ mod tests {
         use crate::health::{ModuleHealthStatus, ModuleId};
         use crate::updater::{APP_VERSION, SECURITY_WARNING_TR};
 
-        assert_eq!(APP_VERSION, "0.4.0");
+        assert_eq!(APP_VERSION, "0.5.0");
         assert!(SECURITY_WARNING_TR.contains("TULPAR'ı"));
 
         let engine = YolacEngine::new(YolacConfig::mobile_android(), None);

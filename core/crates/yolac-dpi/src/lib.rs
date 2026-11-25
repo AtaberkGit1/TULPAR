@@ -27,16 +27,17 @@ pub use packet::{
     tcp_checksum_ipv6, udp_checksum_ipv4, udp_checksum_ipv6, IpProtocol, ParsedIpPacket,
     ParsedTcp, ParsedUdp,
 };
-pub use quic::{detect_quic_initial, QuicInitialInfo, QuicPolicy};
+pub use quic::{build_quic_desync_decoys, detect_quic_initial, QuicDesyncPacket, QuicInitialInfo, QuicPolicy};
 pub use strategy::{DpiStrategy, PlatformCapabilities};
 pub use tcp::{
-    build_disorder_and_fake_packets, build_turkey_desync_packets, clamp_syn_mss, clamp_tcp_window,
-    is_forged_dpi_http_redirect, is_forged_passive_dpi_rst, plan_tcp_splits, segment_tcp_packet,
-    segment_tcp_packet_multi, DesyncPacket, FakePacketMode, RawPacketPlan, TcpSplitPlan,
+    build_disorder_and_fake_packets, build_reassembled_desync_packets, build_turkey_desync_packets,
+    clamp_syn_mss, clamp_tcp_window, is_forged_dpi_http_redirect, is_forged_passive_dpi_rst,
+    plan_tcp_splits, segment_tcp_packet, segment_tcp_packet_multi, DesyncPacket, FakePacketMode,
+    RawPacketPlan, TcpSplitPlan,
 };
 pub use tls::{
-    fragment_tls_client_hello, parse_client_hello, parse_client_hello_prefix, ClientHelloInfo,
-    SplitStrategy,
+    fragment_tls_client_hello, inspect_client_hello_needs_reassembly, parse_client_hello,
+    parse_client_hello_prefix, ClientHelloInfo, SplitStrategy,
 };
 pub use ttl::{estimate_hop_count, recommend_fake_mode, TtlCalibrator};
 pub use udp_desync::{

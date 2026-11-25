@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -41,14 +41,107 @@ struct DestinationState {
     last_updated: Instant,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserRulesConfig {
+    pub allowlist: Vec<String>,
+    pub blocklist: Vec<String>,
+    pub excluded_dpi: Vec<String>,
+    pub aggressive_dpi: Vec<String>,
+}
+
+fn normalize_domain_list(items: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in items {
+        let norm = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !norm.is_empty() && norm.len() <= 253 && norm.contains('.') && !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    out
+}
+
+fn extract_json_string_array(json: &str, key: &str) -> Vec<String> {
+    let pat = format!("\"{key}\"");
+    let Some(idx) = json.find(&pat) else {
+        return Vec::new();
+    };
+    let after = &json[idx + pat.len()..];
+    let Some(lb) = after.find('[') else {
+        return Vec::new();
+    };
+    let rest = &after[lb + 1..];
+    let Some(rb) = rest.find(']') else {
+        return Vec::new();
+    };
+    let body = &rest[..rb];
+    let mut out = Vec::new();
+    let mut cur = body;
+    while let Some(q1) = cur.find('"') {
+        let rem = &cur[q1 + 1..];
+        let Some(q2) = rem.find('"') else {
+            break;
+        };
+        let item = rem[..q2].trim().trim_end_matches('.').to_ascii_lowercase();
+        if !item.is_empty() && item.len() <= 253 && item.contains('.') && !out.contains(&item) {
+            out.push(item);
+        }
+        cur = &rem[q2 + 1..];
+    }
+    out
+}
+
+pub fn parse_user_rules_json(json: &str) -> UserRulesConfig {
+    UserRulesConfig {
+        allowlist: extract_json_string_array(json, "allowlist"),
+        blocklist: extract_json_string_array(json, "blocklist"),
+        excluded_dpi: extract_json_string_array(json, "excluded_dpi"),
+        aggressive_dpi: extract_json_string_array(json, "aggressive_dpi"),
+    }
+}
+
+fn match_domain_suffix(rules: &[String], sni: Option<&str>) -> bool {
+    let Some(raw) = sni else {
+        return false;
+    };
+    let norm = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if norm.is_empty() {
+        return false;
+    }
+    rules.iter().any(|rule| {
+        norm == *rule
+            || (norm.len() > rule.len()
+                && norm.ends_with(rule.as_str())
+                && norm.as_bytes()[norm.len() - rule.len() - 1] == b'.')
+    })
+}
+
+fn encode_quic_policy(p: QuicPolicy) -> u8 {
+    match p {
+        QuicPolicy::Allow => 0,
+        QuicPolicy::BlockFallbackToTcp => 1,
+        QuicPolicy::DesyncFragment => 2,
+    }
+}
+
+fn decode_quic_policy(raw: u8, caps: PlatformCapabilities) -> QuicPolicy {
+    match raw {
+        0 => QuicPolicy::Allow,
+        2 if caps.supports_raw_packets => QuicPolicy::DesyncFragment,
+        _ => QuicPolicy::BlockFallbackToTcp,
+    }
+}
+
 pub struct AdaptiveController {
     capabilities: PlatformCapabilities,
     initial_strategy: DpiStrategy,
     default_quic_blocked: bool,
+    user_quic_policy: AtomicU8,
     hash_builder: Mutex<RandomState>,
     max_entries: usize,
     /// Protected by std::sync::Mutex (critical sections are tiny O(1) map lookups).
     table: Mutex<HashMap<u64, DestinationState>>,
+    excluded_dpi: Mutex<Vec<String>>,
+    aggressive_dpi: Mutex<Vec<String>>,
     quic_throttled: AtomicBool,
     forge: Arc<ForgeRuntime>,
 }
@@ -85,9 +178,12 @@ impl AdaptiveController {
             capabilities,
             initial_strategy: effective_initial,
             default_quic_blocked,
+            user_quic_policy: AtomicU8::new(encode_quic_policy(quic_policy)),
             hash_builder: Mutex::new(RandomState::new()),
             max_entries: max_entries.max(64),
             table: Mutex::new(HashMap::new()),
+            excluded_dpi: Mutex::new(Vec::new()),
+            aggressive_dpi: Mutex::new(Vec::new()),
             quic_throttled: AtomicBool::new(default_quic_blocked),
             forge: Arc::new(ForgeRuntime::new(to_forge_caps(capabilities))),
         }
@@ -126,12 +222,47 @@ impl AdaptiveController {
             .select_raw_rule(proto, dst_port, sni, payload_len, is_sensitive, retry_count)
     }
 
+    pub fn set_quic_policy(&self, policy: QuicPolicy) {
+        self.user_quic_policy
+            .store(encode_quic_policy(policy), Ordering::Relaxed);
+        self.quic_throttled
+            .store(policy == QuicPolicy::BlockFallbackToTcp, Ordering::Relaxed);
+    }
+
+    pub fn user_quic_policy(&self) -> QuicPolicy {
+        decode_quic_policy(
+            self.user_quic_policy.load(Ordering::Relaxed),
+            self.capabilities,
+        )
+    }
+
+    pub fn set_user_domain_rules(&self, excluded: &[String], aggressive: &[String]) {
+        if let Ok(mut g) = self.excluded_dpi.lock() {
+            *g = normalize_domain_list(excluded);
+        }
+        if let Ok(mut g) = self.aggressive_dpi.lock() {
+            *g = normalize_domain_list(aggressive);
+        }
+    }
+
+    pub fn domain_rule_counts(&self) -> (usize, usize) {
+        let ex = self.excluded_dpi.lock().map(|g| g.len()).unwrap_or(0);
+        let ag = self.aggressive_dpi.lock().map(|g| g.len()).unwrap_or(0);
+        (ex, ag)
+    }
+
     pub fn effective_quic_policy(&self, dst_port: u16) -> QuicPolicy {
         if let Some(qm) = self.forge.select_quic_mode(dst_port) {
             return match qm {
                 QuicMode::Allow => QuicPolicy::Allow,
                 QuicMode::BlockFallbackTcp => QuicPolicy::BlockFallbackToTcp,
-                QuicMode::DesyncTtl(_) => self.recommended_quic_policy(),
+                QuicMode::DesyncTtl(_) => {
+                    if self.capabilities.supports_raw_packets {
+                        QuicPolicy::DesyncFragment
+                    } else {
+                        self.recommended_quic_policy()
+                    }
+                }
             };
         }
         self.recommended_quic_policy()
@@ -169,10 +300,11 @@ impl AdaptiveController {
     }
 
     pub fn recommended_quic_policy(&self) -> QuicPolicy {
-        if self.quic_throttled.load(Ordering::Relaxed) {
-            QuicPolicy::BlockFallbackToTcp
-        } else {
+        let base = self.user_quic_policy();
+        if base == QuicPolicy::BlockFallbackToTcp && !self.quic_throttled.load(Ordering::Relaxed) {
             QuicPolicy::Allow
+        } else {
+            base
         }
     }
 
@@ -208,6 +340,19 @@ impl StrategyAdvisor for AdaptiveController {
         sni: Option<&str>,
         default_if_unseen: DpiStrategy,
     ) -> DpiStrategy {
+        if self
+            .excluded_dpi
+            .lock()
+            .map(|g| match_domain_suffix(&g, sni))
+            .unwrap_or(false)
+        {
+            return DpiStrategy::Passthrough;
+        }
+        let force_aggressive = self
+            .aggressive_dpi
+            .lock()
+            .map(|g| match_domain_suffix(&g, sni))
+            .unwrap_or(false);
         let key = self.hash_target(dst, sni);
         if let Ok(mut guard) = self.table.lock() {
             if let Some(entry) = guard.get(&key).copied() {
@@ -217,7 +362,15 @@ impl StrategyAdvisor for AdaptiveController {
                 guard.remove(&key);
             }
         }
-        default_if_unseen
+        if force_aggressive {
+            if self.capabilities.supports_raw_packets {
+                DpiStrategy::TurkeyDesyncAggressive
+            } else {
+                DpiStrategy::TlsSmallChunks
+            }
+        } else {
+            default_if_unseen
+        }
     }
 
     fn report_outcome(
@@ -302,6 +455,10 @@ impl StrategyAdvisor for AdaptiveController {
 
     fn report_forge_outcome(&self, dst: SocketAddr, sni: Option<&str>, success: bool) {
         self.forge.report_flow_outcome(dst, sni, success);
+    }
+
+    fn quic_policy(&self) -> QuicPolicy {
+        self.effective_quic_policy(443)
     }
 }
 

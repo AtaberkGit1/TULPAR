@@ -92,10 +92,25 @@ impl TunConfig {
     }
 }
 
+const MAX_TUN_RX_BATCH: usize = 8;
+
 /// Abstract L3 packet interface (backed by `AsyncFd` Android TUN fd or test channels).
 pub trait PacketDevice: Send + Sync {
     fn recv_packet(&self) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + Send;
     fn send_packet(&self, pkt: Vec<u8>) -> impl std::future::Future<Output = io::Result<()>> + Send;
+
+    /// Receives at least 1 packet and drains up to `max` immediately-ready packets in one wakeup.
+    fn recv_packet_batch<'a>(
+        &'a self,
+        out: &'a mut Vec<Vec<u8>>,
+        max: usize,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send + 'a {
+        async move {
+            let _ = max;
+            out.push(self.recv_packet().await?);
+            Ok(())
+        }
+    }
 }
 
 /// In-memory or FFI-bridged `PacketDevice` using bounded Tokio MPSC channels.
@@ -119,6 +134,22 @@ impl PacketDevice for ChannelPacketDevice {
         rx.recv()
             .await
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "TUN packet channel closed"))
+    }
+
+    async fn recv_packet_batch(&self, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<()> {
+        let mut rx = self.rx.lock().await;
+        let first = rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "TUN packet channel closed"))?;
+        out.push(first);
+        while out.len() < max {
+            match rx.try_recv() {
+                Ok(pkt) => out.push(pkt),
+                Err(_) => break,
+            }
+        }
+        Ok(())
     }
 
     async fn send_packet(&self, pkt: Vec<u8>) -> io::Result<()> {
@@ -368,6 +399,7 @@ impl TunEngine {
 
         let wake = Arc::new(Notify::new());
         let mut cleanup_tick = tokio::time::interval(Duration::from_secs(10));
+        let mut rx_batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_TUN_RX_BATCH);
 
         loop {
             // Mobile battery optimization: sleep up to 30s when idle; honor 0ms poll_delay when active!
@@ -392,22 +424,24 @@ impl TunEngine {
                         break;
                     }
                 }
-                pkt_res = device.recv_packet() => {
+                pkt_res = device.recv_packet_batch(&mut rx_batch, MAX_TUN_RX_BATCH) => {
                     match pkt_res {
-                        Ok(pkt) => {
-                            let is_tcp = self.handle_inbound_tun_packet(
-                                pkt,
-                                &device,
-                                &mut vdev,
-                                &mut iface,
-                                &mut sockets,
-                                &mut tcp_flows,
-                                &mut udp_sessions,
-                                &wake,
-                                &shutdown_rx,
-                            ).await;
-                            if is_tcp {
-                                need_tcp_poll = true;
+                        Ok(()) => {
+                            for pkt in rx_batch.drain(..) {
+                                let is_tcp = self.handle_inbound_tun_packet(
+                                    pkt,
+                                    &device,
+                                    &mut vdev,
+                                    &mut iface,
+                                    &mut sockets,
+                                    &mut tcp_flows,
+                                    &mut udp_sessions,
+                                    &wake,
+                                    &shutdown_rx,
+                                ).await;
+                                if is_tcp {
+                                    need_tcp_poll = true;
+                                }
                             }
                         }
                         Err(_) => break,
@@ -582,7 +616,7 @@ impl TunEngine {
                     return false;
                 };
                 if udp.dst_port == 443
-                    && self.config.quic_policy == QuicPolicy::BlockFallbackToTcp
+                    && self.advisor.quic_policy() == QuicPolicy::BlockFallbackToTcp
                     && detect_quic_initial(udp.payload).is_some()
                 {
                     return false;

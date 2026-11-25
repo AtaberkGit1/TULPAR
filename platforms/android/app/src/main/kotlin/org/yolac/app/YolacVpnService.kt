@@ -33,6 +33,34 @@ class YolacVpnService : VpnService() {
         const val ACTION_REAPPLY = "org.yolac.app.REAPPLY"
         const val PREFS_NAME = "yolac_prefs"
         const val KEY_EXCLUDED_PACKAGES = "excluded_packages"
+        const val KEY_DNS_PROFILE = "dns_profile"
+        const val KEY_DNS_LABEL = "dns_label"
+        const val KEY_QUIC_POLICY = "quic_policy"
+        const val KEY_RULES_ALLOW = "rules_allow"
+        const val KEY_RULES_BLOCK = "rules_block"
+        const val KEY_RULES_EXCLUDE = "rules_exclude"
+
+        fun applySavedUserSettings(context: Context) {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val dnsSpec = prefs.getString(KEY_DNS_PROFILE, "auto") ?: "auto"
+            try {
+                YolacNative.nativeSetDnsProfileJson(dnsSpec)
+            } catch (_: Throwable) {
+            }
+            val quicMode = prefs.getInt(KEY_QUIC_POLICY, 1)
+            try {
+                YolacNative.nativeSetQuicPolicy(quicMode)
+            } catch (_: Throwable) {
+            }
+            val allowRaw = prefs.getString(KEY_RULES_ALLOW, "") ?: ""
+            val blockRaw = prefs.getString(KEY_RULES_BLOCK, "") ?: ""
+            val excludeRaw = prefs.getString(KEY_RULES_EXCLUDE, "") ?: ""
+            val rulesJson = HealthParser.buildUserRulesJson(allowRaw, blockRaw, excludeRaw)
+            try {
+                YolacNative.nativeSetUserRulesJson(rulesJson)
+            } catch (_: Throwable) {
+            }
+        }
         private const val CHANNEL_ID = "yolac_vpn_channel"
         private const val NOTIF_ID = 1001
 
@@ -388,6 +416,7 @@ class YolacVpnService : VpnService() {
         }
 
         val isLockdown = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && isLockdownEnabled
+        applySavedUserSettings(this)
         val detachedFd = established.pfd.detachFd()
         val ok = YolacNative.nativeStartTun(
             this,
@@ -444,6 +473,7 @@ class YolacVpnService : VpnService() {
         }
 
         val isLockdown = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && isLockdownEnabled
+        applySavedUserSettings(this)
         val detachedFd = established.pfd.detachFd()
         val ok = YolacNative.nativeStartTun(
             this,

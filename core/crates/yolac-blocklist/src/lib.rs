@@ -36,13 +36,16 @@ struct EntryMeta {
     category: BlockCategory,
 }
 
-/// Contiguous-arena domain blocklist with O(labels * log N) zero-allocation lookup.
+/// Contiguous-arena domain blocklist with O(labels * log N) zero-allocation lookup
+/// and runtime custom user allowlist / blocklist overlays.
 #[derive(Debug, Clone)]
 pub struct Blocklist {
     arena: Vec<u8>,
     entries: Vec<EntryMeta>,
     /// Sorted reversed-lowercase allowlist supporting exact + subdomain exemptions with zero heap allocs.
     allowlist_rev: Vec<String>,
+    /// Optional user-defined blocked domains (exact + subdomain match).
+    custom_block_rev: Vec<String>,
     has_single_label_rule: bool,
 }
 
@@ -60,6 +63,7 @@ impl Blocklist {
             arena: Vec::new(),
             entries: Vec::new(),
             allowlist_rev: Vec::new(),
+            custom_block_rev: Vec::new(),
             has_single_label_rule: false,
         }
     }
@@ -144,6 +148,7 @@ impl Blocklist {
             arena,
             entries,
             allowlist_rev: Vec::new(),
+            custom_block_rev: Vec::new(),
             has_single_label_rule,
         }
     }
@@ -157,12 +162,38 @@ impl Blocklist {
         }
     }
 
+    /// Adds a local user-blocked domain (matches exact domain and all its subdomains).
+    pub fn add_custom_block(&mut self, domain: &str) {
+        if !is_valid_blockable_domain(domain) {
+            return;
+        }
+        if let Some(rev) = reverse_domain_to_string(domain) {
+            if let Err(pos) = self.custom_block_rev.binary_search(&rev) {
+                self.custom_block_rev.insert(pos, rev);
+            }
+        }
+    }
+
+    /// Clones the compiled embedded arena with fresh user-defined allowlist & custom blocklist rules.
+    pub fn with_user_rules(&self, custom_allow: &[String], custom_block: &[String]) -> Self {
+        let mut out = self.clone();
+        out.allowlist_rev.clear();
+        out.custom_block_rev.clear();
+        for d in custom_allow {
+            out.add_allowlist(d);
+        }
+        for d in custom_block {
+            out.add_custom_block(d);
+        }
+        out
+    }
+
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.custom_block_rev.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.is_empty() && self.custom_block_rev.is_empty()
     }
 
     /// Approximate heap memory consumed by the compiled arena + index in bytes.
@@ -182,11 +213,18 @@ impl Blocklist {
         let rev = &stack_buf[..rev_len];
 
         // 1. Zero-allocation allowlist check (exact + any parent allowlist rule)
-        if !self.allowlist_rev.is_empty() && self.is_allowlisted_reversed(rev) {
+        if !self.allowlist_rev.is_empty() && match_reversed_sorted(&self.allowlist_rev, rev) {
             return None;
         }
 
-        // 2. Test label prefixes of the reversed domain:
+        // 2. Check custom user-blocked domains before compiled embedded arena
+        if !self.custom_block_rev.is_empty() && match_reversed_sorted(&self.custom_block_rev, rev) {
+            return Some(BlockMatch {
+                category: BlockCategory::Ads,
+            });
+        }
+
+        // 3. Test label prefixes of the reversed domain:
         //    Skip bare 1-label TLD ("com", "net", "tr") unless a single-label rule exists -> 33-50% faster!
         let mut dot_count = 0usize;
         for (idx, &b) in rev.iter().enumerate() {
@@ -210,21 +248,6 @@ impl Blocklist {
         self.check(domain).is_some()
     }
 
-    fn is_allowlisted_reversed(&self, rev: &[u8]) -> bool {
-        for (idx, &b) in rev.iter().enumerate() {
-            if b == b'.' && self.allowlist_exact(&rev[..idx]) {
-                return true;
-            }
-        }
-        self.allowlist_exact(rev)
-    }
-
-    fn allowlist_exact(&self, rev_target: &[u8]) -> bool {
-        self.allowlist_rev
-            .binary_search_by(|entry| entry.as_bytes().cmp(rev_target))
-            .is_ok()
-    }
-
     fn entry_bytes(&self, meta: &EntryMeta) -> &[u8] {
         let start = meta.offset as usize;
         let end = start + meta.len as usize;
@@ -240,6 +263,20 @@ impl Blocklist {
             category: self.entries[idx].category,
         })
     }
+}
+
+fn match_reversed_sorted(sorted_rev: &[String], rev: &[u8]) -> bool {
+    let exact = |target: &[u8]| {
+        sorted_rev
+            .binary_search_by(|entry| entry.as_bytes().cmp(target))
+            .is_ok()
+    };
+    for (idx, &b) in rev.iter().enumerate() {
+        if b == b'.' && exact(&rev[..idx]) {
+            return true;
+        }
+    }
+    exact(rev)
 }
 
 fn is_valid_blockable_domain(raw: &str) -> bool {
@@ -364,5 +401,21 @@ mod tests {
         bl.add_allowlist("doubleclick.net");
         assert!(!bl.is_blocked("doubleclick.net"));
         assert!(!bl.is_blocked("sub.doubleclick.net"));
+    }
+
+    #[test]
+    fn custom_block_and_allow_overlays_compose_cleanly() {
+        let base = Blocklist::from_rules_str("ads ads.example.com");
+        let overlaid = base.with_user_rules(
+            &["ads.example.com".to_string(), "allowed-sub.custom.net".to_string()],
+            &["custom.net".to_string(), "telemetry.corp-tracker.org".to_string()],
+        );
+        // Allowlist overrides both embedded and custom blocklist entries
+        assert!(!overlaid.is_blocked("ads.example.com"));
+        assert!(!overlaid.is_blocked("allowed-sub.custom.net"));
+        // Custom block catches exact and subdomains
+        assert!(overlaid.is_blocked("custom.net"));
+        assert!(overlaid.is_blocked("metrics.custom.net"));
+        assert!(overlaid.is_blocked("telemetry.corp-tracker.org"));
     }
 }

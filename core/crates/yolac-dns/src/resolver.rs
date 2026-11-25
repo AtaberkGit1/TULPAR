@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
 use rustls::ClientConfig;
@@ -18,12 +18,12 @@ use crate::poison::{detect_poisoning, detect_poisoning_tls, PoisonReason};
 use crate::pool::UpstreamPool;
 use crate::upstream::{
     connect_upstream_tls, default_dot_rustls_config, default_public_upstreams,
-    default_rustls_config, exchange_on_tls_stream, DefaultUpstreamDialer, UpstreamConfig,
-    UpstreamDialer, UpstreamProtocol,
+    default_rustls_config, exchange_on_tls_stream, upstreams_for_profile, DefaultUpstreamDialer,
+    DnsProfile, UpstreamConfig, UpstreamDialer, UpstreamProtocol,
 };
 use crate::wire::{
     build_blocked_response, build_dns_query, build_empty_noerror_response, parse_dns_query,
-    parse_dns_response, DnsQuery, DnsRecordData, DnsResponse, QType,
+    parse_dns_response, strip_https_ipv6_hints, DnsQuery, DnsRecordData, DnsResponse, QType,
 };
 
 /// Hedged DNS backup trigger: if preferred upstream hasn't answered within 250 ms, race #2 concurrently.
@@ -90,7 +90,9 @@ type InflightKey = (String, QType);
 
 pub struct DnsEngine {
     config: DnsConfig,
-    blocklist: Arc<Blocklist>,
+    blocklist: StdRwLock<Arc<Blocklist>>,
+    upstreams: StdRwLock<Vec<UpstreamConfig>>,
+    active_profile: StdRwLock<DnsProfile>,
     cache: StdMutex<DnsCache>,
     inflight: StdMutex<HashMap<InflightKey, Arc<Notify>>>,
     pool: UpstreamPool,
@@ -117,9 +119,12 @@ impl DnsEngine {
     ) -> Self {
         let cache_cap = config.cache_max_entries;
         let suppress = config.suppress_aaaa;
+        let initial_upstreams = config.upstreams.clone();
         Self {
             config,
-            blocklist,
+            blocklist: StdRwLock::new(blocklist),
+            upstreams: StdRwLock::new(initial_upstreams),
+            active_profile: StdRwLock::new(DnsProfile::AutoFastest),
             cache: StdMutex::new(DnsCache::new(cache_cap)),
             inflight: StdMutex::new(HashMap::new()),
             pool: UpstreamPool::new(),
@@ -146,6 +151,67 @@ impl DnsEngine {
         }
     }
 
+    fn upstreams_snapshot(&self) -> Vec<UpstreamConfig> {
+        self.upstreams
+            .read()
+            .map(|u| u.clone())
+            .unwrap_or_else(|_| self.config.upstreams.clone())
+    }
+
+    fn is_domain_blocked(&self, domain: &str) -> bool {
+        self.blocklist
+            .read()
+            .map(|b| b.is_blocked(domain))
+            .unwrap_or(false)
+    }
+
+    pub fn set_blocklist(&self, new_list: Arc<Blocklist>) {
+        if let Ok(mut b) = self.blocklist.write() {
+            *b = new_list;
+        }
+        if let Ok(mut c) = self.cache.lock() {
+            c.clear();
+        }
+    }
+
+    pub fn blocklist_snapshot(&self) -> Arc<Blocklist> {
+        self.blocklist
+            .read()
+            .map(|b| Arc::clone(&b))
+            .unwrap_or_else(|_| Arc::new(Blocklist::empty()))
+    }
+
+    pub fn reconfigure_profile(&self, profile: DnsProfile) {
+        let next_upstreams = upstreams_for_profile(&profile);
+        if let Ok(mut u) = self.upstreams.write() {
+            *u = next_upstreams;
+        }
+        if let Ok(mut p) = self.active_profile.write() {
+            *p = profile;
+        }
+        self.pool.clear_sync();
+        if let Ok(mut c) = self.cache.lock() {
+            c.clear();
+        }
+        self.preferred_upstream.store(0, Ordering::Relaxed);
+        self.active_upstream_rtt_ms.store(0, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    pub fn active_profile(&self) -> DnsProfile {
+        self.active_profile
+            .read()
+            .map(|p| p.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn is_active_upstream_ip(&self, ip: std::net::IpAddr) -> bool {
+        self.upstreams
+            .read()
+            .map(|u| u.iter().any(|cfg| cfg.bootstrap_ip == ip))
+            .unwrap_or(false)
+    }
+
     /// Ultra-fast (<50 µs), zero-async local resolution path for Windows WinDivert fast-path:
     /// resolves AAAA suppression, local blocklist hits, and fresh RAM cache hits synchronously
     /// without consuming Tokio semaphore permits or spawning tasks!
@@ -161,7 +227,7 @@ impl DnsEngine {
             ));
         }
 
-        if self.blocklist.is_blocked(&query.qname) {
+        if self.is_domain_blocked(&query.qname) {
             self.total_queries.fetch_add(1, Ordering::Relaxed);
             self.blocked_queries.fetch_add(1, Ordering::Relaxed);
             return Some((
@@ -207,7 +273,7 @@ impl DnsEngine {
             );
         }
 
-        if self.blocklist.is_blocked(&query.qname) {
+        if self.is_domain_blocked(&query.qname) {
             self.blocked_queries.fetch_add(1, Ordering::Relaxed);
             return (
                 build_blocked_response(query_wire, self.config.block_with_nxdomain),
@@ -271,7 +337,7 @@ impl DnsEngine {
         }
 
         // 2. Local ad/tracker/malware blocklist (zero network traffic)
-        if self.blocklist.is_blocked(&query.qname) {
+        if self.is_domain_blocked(&query.qname) {
             self.blocked_queries.fetch_add(1, Ordering::Relaxed);
             return (
                 build_blocked_response(query_wire, self.config.block_with_nxdomain),
@@ -363,7 +429,8 @@ impl DnsEngine {
         query_wire: &[u8],
         query: &DnsQuery,
     ) -> (Option<Vec<u8>>, DnsOutcome) {
-        let count = self.config.upstreams.len();
+        let upstreams = self.upstreams_snapshot();
+        let count = upstreams.len();
         if count == 0 {
             self.failed_queries.fetch_add(1, Ordering::Relaxed);
             self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
@@ -382,8 +449,8 @@ impl DnsEngine {
         if count >= 2 {
             let idx0 = start;
             let idx1 = (start + 1) % count;
-            let up0 = &self.config.upstreams[idx0];
-            let up1 = &self.config.upstreams[idx1];
+            let up0 = &upstreams[idx0];
+            let up1 = &upstreams[idx1];
 
             let t0 = Instant::now();
             let fut0 = self.query_with_pool(idx0, up0, query_wire);
@@ -452,7 +519,7 @@ impl DnsEngine {
         };
         for offset in first_offset..count {
             let idx = (start + offset) % count;
-            let upstream = &self.config.upstreams[idx];
+            let upstream = &upstreams[idx];
             let started = Instant::now();
             let Ok(resp_wire) = self.query_with_pool(idx, upstream, query_wire).await else {
                 continue;
@@ -531,9 +598,9 @@ impl DnsEngine {
 
         // CNAME & HTTPS TargetName uncloaking: check every target against local blocklist
         let target_blocked = parsed_resp.answers.iter().any(|ans| match &ans.data {
-            DnsRecordData::CNAME(target) => self.blocklist.is_blocked(target),
+            DnsRecordData::CNAME(target) => self.is_domain_blocked(target),
             DnsRecordData::Https { target, .. } if !target.is_empty() => {
-                self.blocklist.is_blocked(target)
+                self.is_domain_blocked(target)
             }
             _ => false,
         });
@@ -552,6 +619,12 @@ impl DnsEngine {
         {
             self.ech_records_served.fetch_add(1, Ordering::Relaxed);
         }
+
+        let resp_wire = if self.suppress_aaaa.load(Ordering::Relaxed) && query.qtype == QType::HTTPS {
+            strip_https_ipv6_hints(&resp_wire).unwrap_or(resp_wire)
+        } else {
+            resp_wire
+        };
 
         // Never cache truncated (`TC=1`) DNS replies
         if !parsed_resp.truncated {
@@ -586,7 +659,7 @@ impl DnsEngine {
     }
 
     pub fn upstream_count(&self) -> usize {
-        self.config.upstreams.len()
+        self.upstreams.read().map(|u| u.len()).unwrap_or(0)
     }
 
     pub fn reset_preferred_upstream(&self) {
@@ -594,11 +667,12 @@ impl DnsEngine {
     }
 
     pub fn active_upstream_name(&self) -> &'static str {
-        if self.config.upstreams.is_empty() {
+        let upstreams = self.upstreams_snapshot();
+        if upstreams.is_empty() {
             return "Yok";
         }
-        let idx = self.preferred_upstream.load(Ordering::Relaxed) % self.config.upstreams.len();
-        self.config.upstreams[idx].name
+        let idx = self.preferred_upstream.load(Ordering::Relaxed) % upstreams.len();
+        upstreams[idx].name
     }
 
     /// Flushes dead keep-alive TLS sockets & resets upstream preference on Wi-Fi <-> Cellular changes.
@@ -609,7 +683,11 @@ impl DnsEngine {
     }
 
     pub fn set_suppress_aaaa(&self, suppress: bool) {
-        self.suppress_aaaa.store(suppress, Ordering::Relaxed);
+        if self.suppress_aaaa.swap(suppress, Ordering::Relaxed) != suppress {
+            if let Ok(mut c) = self.cache.lock() {
+                c.clear();
+            }
+        }
     }
 
     pub fn is_suppressing_aaaa(&self) -> bool {
@@ -619,14 +697,15 @@ impl DnsEngine {
     /// Probes all configured encrypted upstreams concurrently, promotes the fastest healthy responder
     /// (requiring `NOERROR` + non-empty answers), and keeps the winning warm TLS stream in `pool`!
     pub async fn probe_fastest_upstream(&self) -> Option<usize> {
-        if self.config.upstreams.is_empty() {
+        let upstreams = self.upstreams_snapshot();
+        if upstreams.is_empty() {
             return None;
         }
         let probe_wire = build_dns_query(0x594F, "one.one.one.one", QType::A);
         let probe_query = parse_dns_query(&probe_wire)?;
 
         let mut set = tokio::task::JoinSet::new();
-        for (idx, upstream) in self.config.upstreams.iter().cloned().enumerate() {
+        for (idx, upstream) in upstreams.into_iter().enumerate() {
             let wire = probe_wire.clone();
             let dialer = Arc::clone(&self.dialer);
             let tls = Arc::clone(self.tls_for(&upstream));
@@ -669,7 +748,9 @@ impl DnsEngine {
     /// Concurrently benchmarks every configured encrypted DNS upstream, returning real `ms` latency
     /// for each and automatically selecting the fastest healthy server (Swiss Army Knife diagnostic).
     pub async fn benchmark_all_upstreams(&self) -> Vec<UpstreamBenchmark> {
-        if self.config.upstreams.is_empty() {
+        let upstreams = self.upstreams_snapshot();
+        let count = upstreams.len();
+        if upstreams.is_empty() {
             return Vec::new();
         }
         let probe_wire = build_dns_query(0x5455, "one.one.one.one", QType::A);
@@ -678,7 +759,7 @@ impl DnsEngine {
         };
 
         let mut set = tokio::task::JoinSet::new();
-        for (idx, upstream) in self.config.upstreams.iter().cloned().enumerate() {
+        for (idx, upstream) in upstreams.into_iter().enumerate() {
             let wire = probe_wire.clone();
             let pq = probe_query.clone();
             let dialer = Arc::clone(&self.dialer);
@@ -727,7 +808,7 @@ impl DnsEngine {
             });
         }
 
-        let mut results = Vec::with_capacity(self.config.upstreams.len());
+        let mut results = Vec::with_capacity(count);
         while let Some(res) = set.join_next().await {
             if let Ok((bench, stream_opt)) = res {
                 if let Some(stream) = stream_opt {
@@ -801,7 +882,7 @@ impl DnsEngine {
             poisoning_failovers: self.poisoning_failovers.load(Ordering::Relaxed),
             failed_queries: self.failed_queries.load(Ordering::Relaxed),
             ech_records_served: self.ech_records_served.load(Ordering::Relaxed),
-            upstream_count: self.config.upstreams.len(),
+            upstream_count: self.upstream_count(),
             active_upstream_name: self.active_upstream_name(),
             active_upstream_rtt_ms: self.active_upstream_rtt_ms.load(Ordering::Relaxed),
         }

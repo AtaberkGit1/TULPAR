@@ -281,11 +281,12 @@ impl HealthMonitor {
             } else {
                 stats.active_upstream_name.to_string()
             };
+            let prof_label = dns.active_profile().label_tr();
             ModuleHealthReport {
                 id: ModuleId::DnsProtection,
                 status: ModuleHealthStatus::Healthy,
                 detail_tr: format!(
-                    "Şifreli DNS (DoH/DoT) aktif: {rtt_part} · Önbellek isabet oranı: %{cache_pct}."
+                    "Şifreli DNS ({prof_label}) aktif: {rtt_part} · Önbellek isabet oranı: %{cache_pct}."
                 ),
             }
         };

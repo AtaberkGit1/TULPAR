@@ -21,6 +21,185 @@ pub enum UpstreamProtocol {
     DoT,
 }
 
+/// User-selectable encrypted DNS provider profile (zero central TULPAR servers; direct encrypted DoH/DoT).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum DnsProfile {
+    #[default]
+    AutoFastest,
+    Cloudflare,
+    Quad9Security,
+    MullvadAdblock,
+    AdGuard,
+    Custom {
+        protocol: UpstreamProtocol,
+        bootstrap_ip: IpAddr,
+        port: u16,
+        tls_server_name: String,
+        doh_path: String,
+    },
+}
+
+impl DnsProfile {
+    pub fn key(&self) -> &'static str {
+        match self {
+            Self::AutoFastest => "auto",
+            Self::Cloudflare => "cloudflare",
+            Self::Quad9Security => "quad9",
+            Self::MullvadAdblock => "mullvad_adblock",
+            Self::AdGuard => "adguard",
+            Self::Custom { .. } => "custom",
+        }
+    }
+
+    pub fn label_tr(&self) -> String {
+        match self {
+            Self::AutoFastest => "Otomatik (En Hızlı)".into(),
+            Self::Cloudflare => "Cloudflare (1.1.1.1)".into(),
+            Self::Quad9Security => "Quad9 Güvenlik (9.9.9.9)".into(),
+            Self::MullvadAdblock => "Mullvad Reklam Engelli".into(),
+            Self::AdGuard => "AdGuard DNS".into(),
+            Self::Custom {
+                tls_server_name,
+                bootstrap_ip,
+                port,
+                ..
+            } => format!("Özel ({tls_server_name} @ {bootstrap_ip}:{port})"),
+        }
+    }
+
+    pub fn parse_spec(raw: &str) -> Result<Self, String> {
+        let t = raw.trim();
+        match t.to_ascii_lowercase().as_str() {
+            "" | "auto" | "auto_fastest" | "otomatik" => Ok(Self::AutoFastest),
+            "cloudflare" => Ok(Self::Cloudflare),
+            "quad9" | "quad9_security" => Ok(Self::Quad9Security),
+            "mullvad" | "mullvad_adblock" => Ok(Self::MullvadAdblock),
+            "adguard" => Ok(Self::AdGuard),
+            _ if t.starts_with('{') => Self::from_json_str(t),
+            _ => parse_custom_dns_endpoint(t),
+        }
+    }
+
+    pub fn from_json_str(json: &str) -> Result<Self, String> {
+        let extract = |key: &str| -> Option<String> {
+            let pat = format!("\"{key}\"");
+            let idx = json.find(&pat)?;
+            let after = &json[idx + pat.len()..];
+            let colon = after.find(':')?;
+            let val = after[colon + 1..].trim_start();
+            if let Some(rest) = val.strip_prefix('"') {
+                let end = rest.find('"')?;
+                Some(rest[..end].to_string())
+            } else {
+                let end = val.find([',', '}', ' ']).unwrap_or(val.len());
+                Some(val[..end].trim().to_string())
+            }
+        };
+        let preset = extract("preset")
+            .or_else(|| extract("profile"))
+            .unwrap_or_else(|| "auto".into());
+        match preset.to_ascii_lowercase().as_str() {
+            "auto" | "auto_fastest" => Ok(Self::AutoFastest),
+            "cloudflare" => Ok(Self::Cloudflare),
+            "quad9" | "quad9_security" => Ok(Self::Quad9Security),
+            "mullvad" | "mullvad_adblock" => Ok(Self::MullvadAdblock),
+            "adguard" => Ok(Self::AdGuard),
+            "custom" => {
+                let proto = match extract("protocol").as_deref() {
+                    Some("dot") | Some("DoT") => UpstreamProtocol::DoT,
+                    _ => UpstreamProtocol::DoH,
+                };
+                let ip_raw = extract("ip")
+                    .or_else(|| extract("bootstrap_ip"))
+                    .ok_or_else(|| "Özel DNS için bootstrap IP gerekli.".to_string())?;
+                let bootstrap_ip: IpAddr = ip_raw
+                    .parse()
+                    .map_err(|_| "Geçersiz bootstrap IP adresi.".to_string())?;
+                if bootstrap_ip.is_unspecified() || bootstrap_ip.is_loopback() {
+                    return Err("Loopback/geçersiz bootstrap IP kabul edilmez.".into());
+                }
+                let port: u16 = extract("port")
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(match proto {
+                        UpstreamProtocol::DoH => 443,
+                        UpstreamProtocol::DoT => 853,
+                    });
+                let sni = extract("sni")
+                    .or_else(|| extract("tls_server_name"))
+                    .filter(|s| !s.trim().is_empty() && s.len() <= 253)
+                    .ok_or_else(|| "Özel DNS için geçerli TLS SNI alan adı gerekli.".to_string())?;
+                let path = extract("path")
+                    .or_else(|| extract("doh_path"))
+                    .filter(|p| p.starts_with('/'))
+                    .unwrap_or_else(|| "/dns-query".into());
+                Ok(Self::Custom {
+                    protocol: proto,
+                    bootstrap_ip,
+                    port,
+                    tls_server_name: sni,
+                    doh_path: path,
+                })
+            }
+            other => Err(format!("Bilinmeyen DNS profili: {other}")),
+        }
+    }
+}
+
+/// Parses compact custom DoH/DoT strings without relying on plaintext ISP DNS:
+/// - `https://1.1.1.1/dns-query#cloudflare-dns.com`
+/// - `tls://94.140.14.14:853#dns.adguard-dns.com`
+/// - `dot://9.9.9.9@dns.quad9.net`
+pub fn parse_custom_dns_endpoint(raw: &str) -> Result<DnsProfile, String> {
+    let trimmed = raw.trim();
+    let (proto, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        (UpstreamProtocol::DoH, r)
+    } else if let Some(r) = trimmed.strip_prefix("tls://") {
+        (UpstreamProtocol::DoT, r)
+    } else if let Some(r) = trimmed.strip_prefix("dot://") {
+        (UpstreamProtocol::DoT, r)
+    } else {
+        return Err("Özel DNS biçimi https://<IP>/dns-query#<SNI> veya tls://<IP>:853#<SNI> olmalıdır.".into());
+    };
+
+    let (addr_and_path, sni_raw) = rest
+        .split_once('#')
+        .or_else(|| rest.split_once('@'))
+        .ok_or_else(|| "Bootstrap sızıntısını önlemek için '#<SNI>' (ör. #dns.quad9.net) belirtilmelidir.".to_string())?;
+    let tls_server_name = sni_raw.trim().trim_end_matches('/').to_string();
+    if tls_server_name.is_empty() || tls_server_name.len() > 253 || tls_server_name.contains('/') {
+        return Err("Geçersiz TLS SNI alan adı.".into());
+    }
+
+    let (host_port, doh_path) = match addr_and_path.split_once('/') {
+        Some((hp, p)) => (hp.trim(), format!("/{p}")),
+        None => (addr_and_path.trim(), "/dns-query".to_string()),
+    };
+
+    let (ip, port) = if let Ok(sa) = host_port.parse::<SocketAddr>() {
+        (sa.ip(), sa.port())
+    } else if let Ok(ip_only) = host_port.trim_matches(['[', ']']).parse::<IpAddr>() {
+        let default_port = match proto {
+            UpstreamProtocol::DoH => 443,
+            UpstreamProtocol::DoT => 853,
+        };
+        (ip_only, default_port)
+    } else {
+        return Err("Özel DNS IP adresi ayrıştırılamadı (IPv4/IPv6 literal gereklidir).".into());
+    };
+
+    if ip.is_unspecified() || ip.is_loopback() || port == 0 {
+        return Err("Geçersiz veya loopback DNS sunucu adresi.".into());
+    }
+
+    Ok(DnsProfile::Custom {
+        protocol: proto,
+        bootstrap_ip: ip,
+        port,
+        tls_server_name,
+        doh_path,
+    })
+}
+
 #[derive(Clone)]
 pub struct UpstreamConfig {
     pub name: &'static str,
@@ -63,6 +242,130 @@ impl UpstreamDialer for DefaultUpstreamDialer {
             let _ = stream.set_nodelay(true);
             Ok(stream)
         })
+    }
+}
+
+/// Maps a user-selected `DnsProfile` to ordered encrypted upstream endpoints (all strictly HTTPS/TLS).
+pub fn upstreams_for_profile(profile: &DnsProfile) -> Vec<UpstreamConfig> {
+    match profile {
+        DnsProfile::AutoFastest => default_public_upstreams(),
+        DnsProfile::Cloudflare => vec![
+            UpstreamConfig {
+                name: "Cloudflare-DoH",
+                protocol: UpstreamProtocol::DoH,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                port: 443,
+                tls_server_name: "cloudflare-dns.com".into(),
+                doh_path: "/dns-query".into(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+            UpstreamConfig {
+                name: "Cloudflare-DoT",
+                protocol: UpstreamProtocol::DoT,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+                port: 853,
+                tls_server_name: "1dot1dot1dot1.cloudflare-dns.com".into(),
+                doh_path: String::new(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+            UpstreamConfig {
+                name: "Cloudflare-DoH-v6",
+                protocol: UpstreamProtocol::DoH,
+                bootstrap_ip: IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+                port: 443,
+                tls_server_name: "cloudflare-dns.com".into(),
+                doh_path: "/dns-query".into(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+        ],
+        DnsProfile::Quad9Security => vec![
+            UpstreamConfig {
+                name: "Quad9-DoT",
+                protocol: UpstreamProtocol::DoT,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                port: 853,
+                tls_server_name: "dns.quad9.net".into(),
+                doh_path: String::new(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+            UpstreamConfig {
+                name: "Quad9-DoH",
+                protocol: UpstreamProtocol::DoH,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)),
+                port: 443,
+                tls_server_name: "dns.quad9.net".into(),
+                doh_path: "/dns-query".into(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+        ],
+        DnsProfile::MullvadAdblock => vec![
+            UpstreamConfig {
+                name: "Mullvad-Adblock-DoT",
+                protocol: UpstreamProtocol::DoT,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(194, 242, 2, 3)),
+                port: 853,
+                tls_server_name: "adblock.dns.mullvad.net".into(),
+                doh_path: String::new(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+            UpstreamConfig {
+                name: "Mullvad-DoT",
+                protocol: UpstreamProtocol::DoT,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(194, 242, 2, 2)),
+                port: 853,
+                tls_server_name: "dns.mullvad.net".into(),
+                doh_path: String::new(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+        ],
+        DnsProfile::AdGuard => vec![
+            UpstreamConfig {
+                name: "AdGuard-DoT",
+                protocol: UpstreamProtocol::DoT,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)),
+                port: 853,
+                tls_server_name: "dns.adguard-dns.com".into(),
+                doh_path: String::new(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+            UpstreamConfig {
+                name: "AdGuard-DoH",
+                protocol: UpstreamProtocol::DoH,
+                bootstrap_ip: IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)),
+                port: 443,
+                tls_server_name: "dns.adguard-dns.com".into(),
+                doh_path: "/dns-query".into(),
+                apply_dpi_evasion: true,
+                custom_tls_config: None,
+            },
+        ],
+        DnsProfile::Custom {
+            protocol,
+            bootstrap_ip,
+            port,
+            tls_server_name,
+            doh_path,
+        } => vec![UpstreamConfig {
+            name: match protocol {
+                UpstreamProtocol::DoH => "Custom-DoH",
+                UpstreamProtocol::DoT => "Custom-DoT",
+            },
+            protocol: *protocol,
+            bootstrap_ip: *bootstrap_ip,
+            port: *port,
+            tls_server_name: tls_server_name.clone(),
+            doh_path: doh_path.clone(),
+            apply_dpi_evasion: true,
+            custom_tls_config: None,
+        }],
     }
 }
 
@@ -584,5 +887,31 @@ mod tests {
             }
         }
         assert!(successes >= 3, "At least 3 IPv4 public encrypted DNS upstreams must succeed live, got {successes}");
+    }
+
+    #[test]
+    fn parses_dns_profiles_and_rejects_plaintext_or_loopback_custom_endpoints() {
+        assert_eq!(DnsProfile::parse_spec("auto").unwrap(), DnsProfile::AutoFastest);
+        assert_eq!(DnsProfile::parse_spec("mullvad").unwrap(), DnsProfile::MullvadAdblock);
+        assert_eq!(DnsProfile::parse_spec("adguard").unwrap(), DnsProfile::AdGuard);
+
+        let custom = DnsProfile::parse_spec("https://1.1.1.1/dns-query#cloudflare-dns.com").unwrap();
+        let ups = upstreams_for_profile(&custom);
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].protocol, UpstreamProtocol::DoH);
+        assert_eq!(ups[0].port, 443);
+        assert_eq!(ups[0].tls_server_name, "cloudflare-dns.com");
+
+        let json_custom = DnsProfile::from_json_str(
+            r#"{"preset":"custom","protocol":"dot","ip":"94.140.14.14","port":853,"sni":"dns.adguard-dns.com"}"#,
+        )
+        .unwrap();
+        let ups2 = upstreams_for_profile(&json_custom);
+        assert_eq!(ups2[0].protocol, UpstreamProtocol::DoT);
+        assert_eq!(ups2[0].bootstrap_ip, IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)));
+
+        // Must reject loopback/non-IP bootstrap endpoints so plaintext DNS never leaks
+        assert!(DnsProfile::parse_spec("https://dns.google/dns-query#dns.google").is_err());
+        assert!(DnsProfile::parse_spec("https://127.0.0.1/dns-query#localhost").is_err());
     }
 }

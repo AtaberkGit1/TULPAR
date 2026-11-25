@@ -84,4 +84,28 @@ class HealthParserTest {
             YolacNative.SECURITY_WARNING_TR,
         )
     }
+
+    @Test
+    fun parsesDomainDoctorDnsProfileAndBuildsUserRulesJson() {
+        val doc = HealthParser.parseDomainDoctorResult(
+            """{"domain":"discord.com","verdict":"bypassed_with_dpi_evasion","dns_ok":true,"direct_tls_ok":false,"evasion_tls_ok":true,"summary":"discord.com: Doğrudan TLS engelli, parçalı TLS ile açıldı."}""",
+        )
+        assertTrue(doc.ok)
+        assertEquals("bypassed_with_dpi_evasion", doc.verdict)
+
+        val prof = HealthParser.parseDnsProfileSetResult(
+            """{"ok":true,"key":"mullvad_adblock","label":"Mullvad Reklam Engelli"}""",
+        )
+        assertTrue(prof.ok)
+        assertEquals("mullvad_adblock", prof.key)
+
+        val rulesJson = HealthParser.buildUserRulesJson(
+            "doubleclick.net, DOUBLECLICK.NET",
+            "tracker.test.org\nbad.example.net",
+            "banka.local.tr.",
+        )
+        assertTrue(rulesJson.contains("doubleclick.net"))
+        assertTrue(rulesJson.contains("tracker.test.org"))
+        assertTrue(rulesJson.contains("banka.local.tr"))
+    }
 }

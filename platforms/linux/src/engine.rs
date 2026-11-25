@@ -20,12 +20,13 @@ use yolac_dns::DnsEngine;
 use yolac_dpi::{
     build_benign_fake_client_hello, build_benign_fake_http_request,
     build_disorder_and_fake_packets, build_ipv4_tcp_packet, build_ipv6_tcp_packet,
-    build_turkey_desync_packets, build_udp_desync_decoys, clamp_syn_mss, detect_quic_initial,
-    detect_udp_desync_target, evade_http_request, is_forged_dpi_http_redirect,
-    is_forged_passive_dpi_rst, is_sensitive_unblocked_domain, parse_client_hello_prefix,
-    parse_http_host, parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet,
-    DpiStrategy, FakePacketMode, HttpEvasionOptions, IpProtocol, ParsedIpPacket, ParsedTcp,
-    QuicPolicy, TtlCalibrator,
+    build_quic_desync_decoys, build_reassembled_desync_packets, build_turkey_desync_packets,
+    build_udp_desync_decoys, clamp_syn_mss, detect_quic_initial, detect_udp_desync_target,
+    evade_http_request, inspect_client_hello_needs_reassembly, is_forged_dpi_http_redirect,
+    is_forged_passive_dpi_rst, is_sensitive_unblocked_domain, parse_client_hello,
+    parse_client_hello_prefix, parse_http_host, parse_ip_packet, parse_tcp, parse_udp,
+    plan_tcp_splits, segment_tcp_packet, DpiStrategy, FakePacketMode, HttpEvasionOptions,
+    IpProtocol, ParsedIpPacket, ParsedTcp, QuicPolicy, TtlCalibrator,
 };
 use yolac_net::{is_local_lan_ip, FlowOutcome, StrategyAdvisor};
 
@@ -56,12 +57,32 @@ struct PendingFlow {
     sent_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub enum PqAdvance {
+    Waiting,
+    Ready {
+        template_pkt: Vec<u8>,
+        payload: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PqStreamBuf {
+    start_seq: u32,
+    next_seq: u32,
+    expected_len: usize,
+    template_pkt: Vec<u8>,
+    payload: Vec<u8>,
+    started: Instant,
+}
+
 pub struct FlowTracker {
     hash_builder: RandomState,
     max_entries: usize,
     syn_ack_ttls: Mutex<HashMap<u64, u8>>,
     pending: Mutex<HashMap<u64, PendingFlow>>,
     udp_desynced: Mutex<HashMap<u64, Instant>>,
+    pq_streams: Mutex<HashMap<u64, PqStreamBuf>>,
 }
 
 impl Default for FlowTracker {
@@ -78,6 +99,75 @@ impl FlowTracker {
             syn_ack_ttls: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             udp_desynced: Mutex::new(HashMap::new()),
+            pq_streams: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn begin_pq_stream(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        seq: u32,
+        expected_len: usize,
+        template_pkt: &[u8],
+        first_payload: &[u8],
+    ) -> bool {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        let Ok(mut guard) = self.pq_streams.lock() else {
+            return false;
+        };
+        if let Some(prev) = guard.get(&key) {
+            if prev.start_seq == seq {
+                guard.remove(&key);
+                return false;
+            }
+        }
+        guard.retain(|_, v| v.started.elapsed() < Duration::from_millis(120));
+        if guard.len() >= 64 {
+            if let Some(&evict) = guard.keys().next() {
+                guard.remove(&evict);
+            }
+        }
+        guard.insert(
+            key,
+            PqStreamBuf {
+                start_seq: seq,
+                next_seq: seq.wrapping_add(first_payload.len() as u32),
+                expected_len: expected_len.min(16_389),
+                template_pkt: template_pkt.to_vec(),
+                payload: first_payload.to_vec(),
+                started: Instant::now(),
+            },
+        );
+        true
+    }
+
+    pub fn advance_pq_stream(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        seq: u32,
+        seg: &[u8],
+    ) -> Option<PqAdvance> {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        let mut guard = self.pq_streams.lock().ok()?;
+        let entry = guard.get_mut(&key)?;
+        if entry.started.elapsed() > Duration::from_millis(150) || seq != entry.next_seq {
+            guard.remove(&key);
+            return None;
+        }
+        let room = entry.expected_len.saturating_sub(entry.payload.len());
+        let take = if room > 0 { seg.len().min(room) } else { seg.len() };
+        entry.payload.extend_from_slice(&seg[..take]);
+        entry.next_seq = entry.next_seq.wrapping_add(seg.len() as u32);
+        if entry.payload.len() >= entry.expected_len {
+            let finished = guard.remove(&key)?;
+            Some(PqAdvance::Ready {
+                template_pkt: finished.template_pkt,
+                payload: finished.payload,
+            })
+        } else {
+            Some(PqAdvance::Waiting)
         }
     }
 
@@ -259,6 +349,21 @@ impl FlowTracker {
         guard.remove(&key);
         Some(info)
     }
+
+    pub fn clear(&self) {
+        if let Ok(mut g) = self.syn_ack_ttls.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pending.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.udp_desynced.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pq_streams.lock() {
+            g.clear();
+        }
+    }
 }
 
 fn rebuild_tcp_payload_packet(
@@ -306,7 +411,7 @@ fn rebuild_tcp_payload_packet(
 pub fn process_packet(
     raw_packet: &[u8],
     is_outbound: bool,
-    _dns: &Arc<DnsEngine>,
+    dns: &Arc<DnsEngine>,
     adaptive: &Arc<AdaptiveController>,
     calibrator: &TtlCalibrator,
     flows: &FlowTracker,
@@ -390,11 +495,24 @@ pub fn process_packet(
             let Some(udp) = parse_udp(ip.payload) else {
                 return PacketVerdict::Accept;
             };
-            if udp.dst_port == 443
-                && adaptive.effective_quic_policy(udp.dst_port) == QuicPolicy::BlockFallbackToTcp
-                && detect_quic_initial(udp.payload).is_some()
-            {
-                return PacketVerdict::Drop;
+            if udp.dst_port == 443 {
+                let policy = adaptive.effective_quic_policy(udp.dst_port);
+                if policy == QuicPolicy::BlockFallbackToTcp && detect_quic_initial(udp.payload).is_some() {
+                    return PacketVerdict::Drop;
+                }
+                if policy == QuicPolicy::DesyncFragment && detect_quic_initial(udp.payload).is_some() {
+                    let fake_ttl = calibrator
+                        .estimated_hops(ip.dst_ip)
+                        .map(|h| (h / 2).clamp(2, 5))
+                        .unwrap_or(3);
+                    if let Some(decoys) = build_quic_desync_decoys(raw_packet, fake_ttl) {
+                        let injected = decoys
+                            .into_iter()
+                            .map(|d| InjectedPacket { bytes: d.bytes })
+                            .collect();
+                        return PacketVerdict::InjectDecoysThenAccept(injected);
+                    }
+                }
             }
             if !is_local_lan_ip(ip.dst_ip)
                 && flows.should_desync_udp_flow(udp.src_port, ip.dst_ip, udp.dst_port)
@@ -430,6 +548,9 @@ pub fn process_packet(
                 return PacketVerdict::Accept;
             };
 
+            if dns.is_active_upstream_ip(ip.dst_ip) {
+                return PacketVerdict::Accept;
+            }
             if tcp.dst_port == 53 || tcp.dst_port == 853 {
                 if is_local_lan_ip(ip.dst_ip) {
                     return PacketVerdict::Accept;
@@ -471,184 +592,75 @@ pub fn process_packet(
             }
 
             if tcp.dst_port == 443 {
-                if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
-                    let sni_opt = ch.sni.as_deref();
-                    let is_sensitive = sni_opt.map(is_sensitive_unblocked_domain).unwrap_or(false);
-                    let mut forge_plan = adaptive.select_raw_forge_plan(
-                        MatchProtocol::Tls,
-                        tcp.dst_port,
-                        sni_opt,
-                        tcp.payload.len(),
-                        is_sensitive,
-                        0,
-                    );
-                    let mut strategy = if is_sensitive {
-                        adaptive.select_strategy_with_default(dst, sni_opt, DpiStrategy::Passthrough)
-                    } else {
-                        adaptive.select_strategy(dst, sni_opt)
-                    };
-
-                    if let Some((failed_strat, prev_forge, retry_n)) = flows.record_client_hello(
-                        tcp.src_port,
-                        dst,
-                        ch.sni.clone(),
-                        (tcp.seq, ch.record_total_len.max(tcp.payload.len())),
-                        strategy,
-                        forge_plan.is_some(),
-                    ) {
-                        if prev_forge {
-                            adaptive.report_forge_outcome(dst, sni_opt, false);
-                            forge_plan = adaptive.select_raw_forge_plan(
-                                MatchProtocol::Tls,
-                                tcp.dst_port,
-                                sni_opt,
-                                tcp.payload.len(),
-                                is_sensitive,
-                                retry_n,
-                            );
-                        } else {
-                            adaptive.report_outcome(
-                                dst,
-                                sni_opt,
-                                failed_strat,
-                                FlowOutcome::HandshakeTimeout,
-                            );
-                            strategy = adaptive.select_strategy(dst, sni_opt);
-                        }
-                        flows.update_pending_strategy(
-                            tcp.src_port,
-                            dst,
-                            strategy,
-                            forge_plan.is_some(),
-                        );
-                    }
-
-                    let sni_mid = if let Some((s, e)) = ch.sni_range {
-                        (s + (e.saturating_sub(s)) / 2)
-                            .clamp(1, tcp.payload.len().saturating_sub(1).max(1))
-                    } else {
-                        (tcp.payload.len() / 2).max(2)
-                    };
-
-                    if let Some(ref fplan) = forge_plan {
-                        if fplan.passthrough {
+                if let Some(pq_res) = flows.advance_pq_stream(
+                    tcp.src_port,
+                    dst,
+                    tcp.seq,
+                    tcp.payload,
+                ) {
+                    match pq_res {
+                        PqAdvance::Waiting => return PacketVerdict::Drop,
+                        PqAdvance::Ready {
+                            template_pkt,
+                            payload: full_payload,
+                        } => {
+                            if let (Some(tip), Some(ch)) = (
+                                parse_ip_packet(&template_pkt),
+                                parse_client_hello(&full_payload),
+                            ) {
+                                if let Some(ttcp) = parse_tcp(tip.payload) {
+                                    return desync_linux_tls_hello(
+                                        &template_pkt,
+                                        tip.dst_ip,
+                                        ttcp.src_port,
+                                        dst,
+                                        ttcp.seq,
+                                        &full_payload,
+                                        ch,
+                                        adaptive,
+                                        calibrator,
+                                        flows,
+                                        true,
+                                    );
+                                }
+                            }
                             return PacketVerdict::Accept;
                         }
-                        if let Some(built) = execute_raw_forge_tcp(
+                    }
+                }
+
+                if let Some(expected_len) = inspect_client_hello_needs_reassembly(tcp.payload) {
+                    let missing_sni = parse_client_hello_prefix(tcp.payload)
+                        .map(|c| c.sni.is_none())
+                        .unwrap_or(true);
+                    if missing_sni
+                        && flows.begin_pq_stream(
+                            tcp.src_port,
+                            dst,
+                            tcp.seq,
+                            expected_len,
                             raw_packet,
-                            sni_mid,
-                            None,
-                            false,
-                            fplan,
-                            calibrator,
-                            ip.dst_ip,
-                        ) {
-                            if built.len() > 1 {
-                                return PacketVerdict::ReplaceWithInjected(
-                                    built
-                                        .into_iter()
-                                        .map(|d| InjectedPacket { bytes: d.bytes })
-                                        .collect(),
-                                );
-                            }
-                        }
-                        return PacketVerdict::Accept;
+                            tcp.payload,
+                        )
+                    {
+                        return PacketVerdict::Drop;
                     }
+                }
 
-                    if strategy == DpiStrategy::Passthrough {
-                        return PacketVerdict::Accept;
-                    }
-
-                    let decoy = build_benign_fake_client_hello("www.iana.org");
-
-                    let built_opt = match strategy {
-                        DpiStrategy::TurkeyDesyncAuto => {
-                            let safe_ttl = calibrator
-                                .estimated_hops(ip.dst_ip)
-                                .map(|h| (h / 2).clamp(2, 5))
-                                .unwrap_or(3);
-                            let fakes = [
-                                FakePacketMode::BadChecksum,
-                                FakePacketMode::LowTtlWrongSeq(safe_ttl),
-                                FakePacketMode::BadChecksumWrongSeq,
-                            ];
-                            build_turkey_desync_packets(raw_packet, &[2, sni_mid], &fakes, &decoy, true)
-                        }
-                        DpiStrategy::TurkeyDesyncSuperonline => {
-                            let fakes = [
-                                FakePacketMode::LowTtlWrongSeq(2),
-                                FakePacketMode::LowTtlWrongSeq(5),
-                                FakePacketMode::BadChecksum,
-                                FakePacketMode::BadChecksumWrongSeq,
-                            ];
-                            build_turkey_desync_packets(raw_packet, &[1, sni_mid], &fakes, &decoy, true)
-                        }
-                        DpiStrategy::TurkeyDesyncAggressive => {
-                            let cal_mode = calibrator.recommended_fake_mode(ip.dst_ip, 3);
-                            let fakes = [
-                                cal_mode,
-                                FakePacketMode::LowTtlWrongSeq(6),
-                                FakePacketMode::BadChecksum,
-                                FakePacketMode::BadChecksumWrongSeq,
-                            ];
-                            build_turkey_desync_packets(
-                                raw_packet,
-                                &[1, 2, sni_mid],
-                                &fakes,
-                                &decoy,
-                                true,
-                            )
-                        }
-                        DpiStrategy::TlsRecordSplit
-                        | DpiStrategy::TcpSniSplit
-                        | DpiStrategy::TlsAndTcpSplit
-                        | DpiStrategy::TlsMultiRecordAndTcpSplit
-                        | DpiStrategy::TcpOobAndTlsSplit
-                        | DpiStrategy::TlsSmallChunks => {
-                            if let Some((p1, p2)) = segment_tcp_packet(raw_packet, sni_mid) {
-                                return PacketVerdict::ReplaceWithInjected(vec![
-                                    InjectedPacket { bytes: p1 },
-                                    InjectedPacket { bytes: p2 },
-                                ]);
-                            }
-                            None
-                        }
-                        DpiStrategy::RawDisorder => {
-                            if let Some(plan) = build_disorder_and_fake_packets(raw_packet, sni_mid, None) {
-                                return PacketVerdict::ReplaceWithInjected(
-                                    plan.packets
-                                        .into_iter()
-                                        .map(|bytes| InjectedPacket { bytes })
-                                        .collect(),
-                                );
-                            }
-                            None
-                        }
-                        DpiStrategy::RawFakeTtl { ttl } => {
-                            let mode = calibrator.recommended_fake_mode(ip.dst_ip, ttl);
-                            build_turkey_desync_packets(raw_packet, &[sni_mid], &[mode], &decoy, true)
-                        }
-                        DpiStrategy::RawBadChecksum => build_turkey_desync_packets(
-                            raw_packet,
-                            &[sni_mid],
-                            &[FakePacketMode::BadChecksum],
-                            &decoy,
-                            true,
-                        ),
-                        DpiStrategy::Passthrough => None,
-                    };
-
-                    if let Some(built) = built_opt {
-                        if built.len() > 1 {
-                            return PacketVerdict::ReplaceWithInjected(
-                                built
-                                    .into_iter()
-                                    .map(|d| InjectedPacket { bytes: d.bytes })
-                                    .collect(),
-                            );
-                        }
-                    }
-                    return PacketVerdict::Accept;
+                if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
+                    return desync_linux_tls_hello(
+                        raw_packet,
+                        ip.dst_ip,
+                        tcp.src_port,
+                        dst,
+                        tcp.seq,
+                        tcp.payload,
+                        ch,
+                        adaptive,
+                        calibrator,
+                        flows,
+                        false,
+                    );
                 }
 
                 if let Some((dst, sni, strat, used_forge)) =
@@ -740,6 +752,204 @@ pub fn process_packet(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn desync_linux_tls_hello(
+    base_pkt: &[u8],
+    dst_ip: IpAddr,
+    tcp_src_port: u16,
+    dst: SocketAddr,
+    tcp_seq: u32,
+    ch_payload: &[u8],
+    ch: yolac_dpi::ClientHelloInfo,
+    adaptive: &Arc<AdaptiveController>,
+    calibrator: &TtlCalibrator,
+    flows: &FlowTracker,
+    is_reassembled: bool,
+) -> PacketVerdict {
+    let sni_opt = ch.sni.as_deref();
+    let is_sensitive = sni_opt.map(is_sensitive_unblocked_domain).unwrap_or(false);
+    let mut forge_plan = adaptive.select_raw_forge_plan(
+        MatchProtocol::Tls,
+        dst.port(),
+        sni_opt,
+        ch_payload.len(),
+        is_sensitive,
+        0,
+    );
+    let mut strategy = if is_sensitive {
+        adaptive.select_strategy_with_default(dst, sni_opt, DpiStrategy::Passthrough)
+    } else {
+        adaptive.select_strategy(dst, sni_opt)
+    };
+
+    if let Some((failed_strat, prev_forge, retry_n)) = flows.record_client_hello(
+        tcp_src_port,
+        dst,
+        ch.sni.clone(),
+        (tcp_seq, ch.record_total_len.max(ch_payload.len())),
+        strategy,
+        forge_plan.is_some(),
+    ) {
+        if prev_forge {
+            adaptive.report_forge_outcome(dst, sni_opt, false);
+            forge_plan = adaptive.select_raw_forge_plan(
+                MatchProtocol::Tls,
+                dst.port(),
+                sni_opt,
+                ch_payload.len(),
+                is_sensitive,
+                retry_n,
+            );
+        } else {
+            adaptive.report_outcome(dst, sni_opt, failed_strat, FlowOutcome::HandshakeTimeout);
+            strategy = adaptive.select_strategy(dst, sni_opt);
+        }
+        flows.update_pending_strategy(tcp_src_port, dst, strategy, forge_plan.is_some());
+    }
+
+    let sni_mid = if let Some((s, e)) = ch.sni_range {
+        (s + (e.saturating_sub(s)) / 2).clamp(1, ch_payload.len().saturating_sub(1).max(1))
+    } else {
+        (ch_payload.len() / 2).max(2)
+    };
+    let decoy = build_benign_fake_client_hello("www.iana.org");
+
+    let build_segments = |split_points: &[usize],
+                          fakes: &[FakePacketMode],
+                          reverse: bool|
+     -> Option<Vec<yolac_dpi::DesyncPacket>> {
+        if is_reassembled {
+            build_reassembled_desync_packets(
+                base_pkt,
+                ch_payload,
+                split_points,
+                fakes,
+                &decoy,
+                reverse,
+                1380,
+            )
+        } else {
+            build_turkey_desync_packets(base_pkt, split_points, fakes, &decoy, reverse)
+        }
+    };
+
+    if let Some(ref fplan) = forge_plan {
+        if fplan.passthrough {
+            return if is_reassembled {
+                build_segments(&[ch_payload.len().min(1380)], &[], false)
+                    .map(|b| PacketVerdict::ReplaceWithInjected(b.into_iter().map(|d| InjectedPacket { bytes: d.bytes }).collect()))
+                    .unwrap_or(PacketVerdict::Accept)
+            } else {
+                PacketVerdict::Accept
+            };
+        }
+        let built_opt = if is_reassembled {
+            build_segments(&[2, sni_mid], &[FakePacketMode::BadChecksum], true)
+        } else {
+            execute_raw_forge_tcp(base_pkt, sni_mid, None, false, fplan, calibrator, dst_ip)
+        };
+        if let Some(built) = built_opt {
+            if built.len() > 1 {
+                return PacketVerdict::ReplaceWithInjected(
+                    built.into_iter().map(|d| InjectedPacket { bytes: d.bytes }).collect(),
+                );
+            }
+        }
+        return PacketVerdict::Accept;
+    }
+
+    if strategy == DpiStrategy::Passthrough {
+        return if is_reassembled {
+            build_segments(&[ch_payload.len().min(1380)], &[], false)
+                .map(|b| PacketVerdict::ReplaceWithInjected(b.into_iter().map(|d| InjectedPacket { bytes: d.bytes }).collect()))
+                .unwrap_or(PacketVerdict::Accept)
+        } else {
+            PacketVerdict::Accept
+        };
+    }
+
+    let built_opt = match strategy {
+        DpiStrategy::TurkeyDesyncAuto => {
+            let safe_ttl = calibrator
+                .estimated_hops(dst_ip)
+                .map(|h| (h / 2).clamp(2, 5))
+                .unwrap_or(3);
+            let fakes = [
+                FakePacketMode::BadChecksum,
+                FakePacketMode::LowTtlWrongSeq(safe_ttl),
+                FakePacketMode::BadChecksumWrongSeq,
+            ];
+            build_segments(&[2, sni_mid], &fakes, true)
+        }
+        DpiStrategy::TurkeyDesyncSuperonline => {
+            let fakes = [
+                FakePacketMode::LowTtlWrongSeq(2),
+                FakePacketMode::LowTtlWrongSeq(5),
+                FakePacketMode::BadChecksum,
+                FakePacketMode::BadChecksumWrongSeq,
+                FakePacketMode::BadTcpTimestamp,
+            ];
+            build_segments(&[1, sni_mid], &fakes, true)
+        }
+        DpiStrategy::TurkeyDesyncAggressive => {
+            let cal_mode = calibrator.recommended_fake_mode(dst_ip, 3);
+            let fakes = [
+                cal_mode,
+                FakePacketMode::LowTtlWrongSeq(6),
+                FakePacketMode::BadChecksum,
+                FakePacketMode::BadChecksumWrongSeq,
+                FakePacketMode::BadTcpTimestamp,
+            ];
+            build_segments(&[1, 2, sni_mid], &fakes, true)
+        }
+        DpiStrategy::TlsRecordSplit
+        | DpiStrategy::TcpSniSplit
+        | DpiStrategy::TlsAndTcpSplit
+        | DpiStrategy::TlsMultiRecordAndTcpSplit
+        | DpiStrategy::TcpOobAndTlsSplit
+        | DpiStrategy::TlsSmallChunks => {
+            if is_reassembled {
+                build_segments(&[sni_mid], &[], false)
+            } else if let Some((p1, p2)) = segment_tcp_packet(base_pkt, sni_mid) {
+                return PacketVerdict::ReplaceWithInjected(vec![
+                    InjectedPacket { bytes: p1 },
+                    InjectedPacket { bytes: p2 },
+                ]);
+            } else {
+                None
+            }
+        }
+        DpiStrategy::RawDisorder => {
+            if is_reassembled {
+                build_segments(&[sni_mid], &[], true)
+            } else if let Some(plan) = build_disorder_and_fake_packets(base_pkt, sni_mid, None) {
+                return PacketVerdict::ReplaceWithInjected(
+                    plan.packets.into_iter().map(|bytes| InjectedPacket { bytes }).collect(),
+                );
+            } else {
+                None
+            }
+        }
+        DpiStrategy::RawFakeTtl { ttl } => {
+            let mode = calibrator.recommended_fake_mode(dst_ip, ttl);
+            build_segments(&[sni_mid], &[mode], true)
+        }
+        DpiStrategy::RawBadChecksum => {
+            build_segments(&[sni_mid], &[FakePacketMode::BadChecksum], true)
+        }
+        DpiStrategy::Passthrough => None,
+    };
+
+    if let Some(built) = built_opt {
+        if built.len() > 1 {
+            return PacketVerdict::ReplaceWithInjected(
+                built.into_iter().map(|d| InjectedPacket { bytes: d.bytes }).collect(),
+            );
+        }
+    }
+    PacketVerdict::Accept
+}
+
 pub fn run_nfqueue_loop(
     queue_num: u16,
     dns: Arc<DnsEngine>,
@@ -813,6 +1023,7 @@ pub fn run_nfqueue_loop(
         }
     }
 
+    flows.clear();
     Ok(())
 }
 
@@ -1006,5 +1217,138 @@ mod tests {
             }
             other => panic!("Expected Forge ReplaceWithInjected verdict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reassembles_pq_client_hello_and_handles_quic_desync_and_port_853() {
+        let (dns, adaptive) = test_engines(DpiStrategy::TurkeyDesyncAuto);
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+
+        let sni = "pq.youtube.com";
+        let sni_bytes = sni.as_bytes();
+        let ks_len = 1380usize;
+        let name_entry_len = 1 + 2 + sni_bytes.len();
+        let sni_ext_len = 2 + name_entry_len;
+        let exts_len = 4 + ks_len + 4 + sni_ext_len;
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x44u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(exts_len as u16).to_be_bytes());
+        body.extend_from_slice(&0x0033u16.to_be_bytes());
+        body.extend_from_slice(&(ks_len as u16).to_be_bytes());
+        body.extend_from_slice(&vec![0x66u8; ks_len]);
+        body.extend_from_slice(&0x0000u16.to_be_bytes());
+        body.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+        body.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
+        body.push(0x00);
+        body.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        body.extend_from_slice(sni_bytes);
+        let hs_len = body.len();
+        let mut full_ch = vec![0x16, 0x03, 0x01];
+        full_ch.extend_from_slice(&((4 + hs_len) as u16).to_be_bytes());
+        full_ch.push(0x01);
+        full_ch.extend_from_slice(&[(hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8]);
+        full_ch.extend_from_slice(&body);
+
+        let split = 1400usize;
+        let seg1 = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(142, 250, 187, 174),
+            54100,
+            443,
+            20_000,
+            1_000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &full_ch[..split],
+        );
+        let seg2 = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(142, 250, 187, 174),
+            54100,
+            443,
+            20_000 + split as u32,
+            1_000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            2,
+            &[],
+            &full_ch[split..],
+        );
+        assert_eq!(
+            process_packet(&seg1, true, &dns, &adaptive, &calibrator, &flows),
+            PacketVerdict::Drop
+        );
+        match process_packet(&seg2, true, &dns, &adaptive, &calibrator, &flows) {
+            PacketVerdict::ReplaceWithInjected(pkts) => {
+                assert!(pkts.len() >= 5);
+                for p in &pkts {
+                    assert!(p.bytes.len() <= 1460);
+                }
+            }
+            other => panic!("Expected ReplaceWithInjected for PQ Seg 2, got {other:?}"),
+        }
+
+        // QuicPolicy::DesyncFragment injects QUIC decoys before accepting real UDP/443
+        adaptive.set_quic_policy(QuicPolicy::DesyncFragment);
+        let mut quic = vec![0xC3u8; 1200];
+        quic[1..5].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        let quic_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(142, 250, 187, 174),
+            54101,
+            443,
+            64,
+            &quic,
+        );
+        match process_packet(&quic_pkt, true, &dns, &adaptive, &calibrator, &flows) {
+            PacketVerdict::InjectDecoysThenAccept(d) => assert_eq!(d.len(), 2),
+            other => panic!("Expected InjectDecoysThenAccept, got {other:?}"),
+        }
+
+        // Rogue 853 dropped while active bootstrap DoH/DoT IP (1.1.1.1) passes
+        let dot_rogue = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(198, 51, 100, 53),
+            54102,
+            853,
+            1,
+            1,
+            ParsedTcp::SYN,
+            65535,
+            64,
+            1,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            process_packet(&dot_rogue, true, &dns, &adaptive, &calibrator, &flows),
+            PacketVerdict::Drop
+        );
+        let dot_bootstrap = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(1, 1, 1, 1),
+            54103,
+            853,
+            1,
+            1,
+            ParsedTcp::SYN,
+            65535,
+            64,
+            1,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            process_packet(&dot_bootstrap, true, &dns, &adaptive, &calibrator, &flows),
+            PacketVerdict::Accept
+        );
     }
 }

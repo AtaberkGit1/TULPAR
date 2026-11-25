@@ -13,7 +13,7 @@ use tulpar_forge::{MatchProtocol, SocketActionSpec, SplitCutSpec, TlsRecordMode}
 use yolac_dpi::{
     evade_http_request, fragment_tls_client_hello, is_sensitive_unblocked_domain,
     parse_client_hello, parse_client_hello_prefix, parse_http_host, plan_tcp_splits, DpiStrategy,
-    HttpEvasionOptions, SplitStrategy,
+    HttpEvasionOptions, QuicPolicy, SplitStrategy,
 };
 
 use crate::captive_portal::is_local_lan_ip;
@@ -61,6 +61,11 @@ pub trait StrategyAdvisor: Send + Sync {
 
     /// Reports live flow outcome to Forge's circuit breaker (auto-disables failing packages cleanly).
     fn report_forge_outcome(&self, _dst: SocketAddr, _sni: Option<&str>, _success: bool) {}
+
+    /// Effective QUIC policy (allows live switching without tearing down the TUN loop).
+    fn quic_policy(&self) -> QuicPolicy {
+        QuicPolicy::BlockFallbackToTcp
+    }
 }
 
 pub struct NoopStrategyAdvisor {

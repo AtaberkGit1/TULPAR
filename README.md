@@ -32,22 +32,25 @@ TULPAR fiziksel internet hattınızı hızlandıran bir araç değildir; aşağ�
 
 ---
 
-## v0.4.0 Özellikleri (Çok Platformlu DPI Koruma & Tanılama Araçları)
+## v0.5.0 Özellikleri (Post-Kuantum TLS, Özelleştirilebilir Şifreli DNS & Alan Adı Tanılama)
 
-- **Şifreli DNS ve Yerel Filtreleme (`yolac-dns`, `yolac-blocklist`)**:
-  - **Otomatik En Düşük Gecikmeli DoH/DoT Seçimi**: Açılışta ve ağ değişiminde Cloudflare, Quad9, Mullvad ve Google DoH/DoT uç noktalarını paralel ölçer; 250 ms hedged yedekli sorgu, RAM-only LRU önbellek, RFC 8767 SWR, CNAME uncloaking ve zehirlenme (bogon/BTK IP) tespiti uygular.
-  - **Yerel Reklam/İzleyici Engelleme**: Yanlış pozitif oluşturan iş/ödeme/CDN alan adları ayıklanmış `3.594` kurallı RAM-only önek/sonek listesi.
-- **Platform Düzeyi DPI Motorları**:
-  - **Windows (`WinDivert 2.2`)**: Çekirdek filtresi yalnızca ilgili DNS (`53`), TLS/HTTP (`80`/`443`) ve UDP akışlarını yakalar; geri kalan veri akışı çekirdek üzerinden geçer. SHA-256 doğrulamalı WinDivert + `%ProgramData%\Tulpar\driver\2.2.2` kilitleme.
-  - **Android (`VpnService`)**: `256 KB` `smoltcp` TCP penceresi, `64 KB` çift yönlü aktarım, `AsyncFd` olay döngüsü, web portlarında paralel TCP ön-bağlantısı ve `protect()` soket koruması.
-  - **Linux (`platforms/linux`)**: Saf Rust Netlink `NFQUEUE` + `IPPROTO_RAW` + `--queue-bypass` (fail-open), `nftables`/`iptables` desteği ve `:5354` yerel şifreli DNS vekili.
-- **Ayarlar İçinde Tanılama & Bakım Araçları**:
-  - **Canlı Ağ ve DNS Tanılama (Windows, Android & Linux)**: Tüm şifreli DNS sunucularının gerçek `ms` gecikmelerini, seçilen en düşük gecikmeli sunucuyu, IPv6 erişimini, engellenen alan adı sayısını ve DNS önbellek isabet oranını ölçer.
-  - **Tek Tıkla Windows Ağ ve TCP Onarımı (Windows)**: Devre dışı kalmış Windows TCP Auto-Tuning (`normal`) ve RSS ayarlarını onarır, aktif arayüz MTU değerini gösterir, eski WinDivert SCM servis kalıntılarını ve Windows DNS önbelleğini temizler.
-  - **İsteğe Bağlı UAC'siz Otomatik Başlatma (Windows)**: Görev Zamanlayıcı üzerinden açılışta otomatik başlatma anahtarı + Per-Monitor V2 HiDPI ve çift tamponlu Win32 arayüz.
-  - **Uygulama Hariç Tutma / Split-Tunneling (Android)**: Bankacılık, e-Devlet veya yerel ağ uygulamalarını tek listeden TULPAR tüneli dışında bırakma (`addDisallowedApplication`), Pil Kısıtlaması kısayolu, Android Özel DNS uyarısı ve bildirimden tek dokunuşla **Kapat** düğmesi.
-- **Güvenilirlik & Güvenlik Sertleştirmeleri**:
-  - RFC 6864 pasif DPI sahte `RST` doğrulaması (`DF=1, IP.ID=0`), HTTP `POST`/`PUT` >4 KB akış desteği, Chrome 131+ PQ `ClientHello` tam uzunluk takibi, `%ProgramData%\Tulpar\driver` sertleştirmesi, Android atomik IPv4↔IPv6 TUN geçişi ve tam LAN/multicast dışlaması (Android 8–15).
+- **Post-Kuantum TLS (`X25519MLKEM768`) Çok Segmentli ClientHello Desteği (`yolac-dpi`, Windows, Linux, Android)**:
+  - Chrome 131+ / Firefox / Chromium tabanlı tarayıcıların ~1.700+ baytlık Post-Kuantum TLS `ClientHello` mesajları iki TCP paketine bölündüğünde (SNI ikinci pakete taşsa bile), Windows (`WinDivert`) ve Linux (`NFQUEUE`) segmentleri kısa süreli RAM arabelleğinde birleştirip gerçek SNI ortasından MTU-uyumlu (`<= 1380` bayt) şekilde parçalar ve sahte paketlerle enjekte eder.
+- **Seçilebilir Şifreli DNS Profilleri & RFC 9460 Sızıntı Temizleme (`yolac-dns`)**:
+  - **Hazır Profiller + Özel DoH/DoT**: Ayarlar ve CLI üzerinden `AutoFastest`, `Cloudflare`, `Quad9 Güvenlik`, `Mullvad Reklam Engelli`, `AdGuard DNS` veya kullanıcının tanımladığı literal IPv4/IPv6 + TLS konak adlı özel `https://...` / `tls://...` sunucuları seçilebilir.
+  - **RFC 9460 `HTTPS`/`SVCB` (`Type 65`) `ipv6hint` Temizliği**: Korumasız IPv6 kapatıldığında (`suppress_aaaa`), `HTTPS` DNS yanıtlarındaki `ipv6hint` parametresi ECH anahtarı (`SvcParamKey 5`) korunarak sıyrılır.
+  - **Yetkisiz `TCP/853` DoT Engeli**: Aktif şifreli DNS bootstrap IP'leri dışındaki port 853 ve port 53 sızıntı girişimleri engellenir.
+- **Esnek QUIC Politikası & RFC 7323 PAWS Zaman Damgası Yanıltması (`yolac-dpi`)**:
+  - Varsayılan `TCP Fallback` moduna ek olarak seçilebilir **`QUIC Desync Paketi`** (`QuicPolicy::DesyncFragment` — düşük TTL ve bozuk UDP sağlama toplamlı QUIC Initial decoy) ve `Allow` modları + Stage 2/3 stratejilerinde `BadTcpTimestamp` desteği.
+- **On-Device Site Erişim Testi (Domain Doctor) & Özel Alan Adı Kuralları (`yolac-core`, `yolac-blocklist`)**:
+  - `tulpar doctor <alanadi>` (Linux), `--diagnose <alanadi>` (Windows) ve Android Ayarlar içinden doğrudan DoH/DoT + ECH, doğrudan TLS ve parçalı TLS sınaması yaparak DNS, aşılabilir DPI engeli veya aşılamaz sert IP bloğu durumunu dürüstçe raporlar.
+  - Kullanıcı tarafından belirlenen **İzin Listesi** (allowlist), **Özel Engel Listesi** (blocklist) ve **DPI Hariç Tutma / Passthrough** kuralları tüm platformlarda desteklenir.
+- **Platform Düzeyi İyileştirmeler**:
+  - **Windows (`platforms/windows`)**: İsteğe bağlı `WinDivertRecvEx`/`WinDivertSendEx` toplu paket G/Ç desteği, Ayarlar ekranında Şifreli DNS & QUIC politika seçicisi, `%ProgramData%\Tulpar\config.json` kalıcı tercihleri, `SHA256SUMS.txt` doğrulama yardımcısı ve `#000000` tek butonlu ana ekran korunumu.
+  - **Linux (`platforms/linux`)**: `CAP_NET_ADMIN` + `CAP_NET_RAW` root'suz yetki desteği (`/proc/self/status`, `tulpar repair --grant-caps`, systemd `AmbientCapabilities`), `ip6tables` NAT `:5354` fallback, `systemd-resolved` tespiti, `/etc/tulpar/config.conf` kalıcı ayarları (`doctor`, `set-dns`, `set-quic`, `allow`, `block`, `exclude`).
+  - **Android (`platforms/android`)**: Toplu TUN paket okuma (`recv_packet_batch`), Ayarlar ekranında Şifreli DNS Sağlayıcısı seçimi, Özel Alan Adı Kuralları ve Site Erişim Testi (Domain Doctor), `#000000` tek butonlu ana ekran korunumu.
+- **Temel DPI & Koruma Yetenekleri (v0.4.0 mirası)**:
+  - Otomatik en düşük gecikmeli DoH/DoT seçimi, 250 ms hedged failover, RAM-only LRU + SWR önbellek, CNAME uncloaking, zehirlenme tespiti, RFC 6864 pasif DPI `RST` filtreleme, HTTP `Host` bölme, Discord/Roblox UDP desync, Per-App Split-Tunneling (Android) ve tek tıkla Windows Ağ/TCP Onarımı.
 
 ---
 
@@ -76,7 +79,7 @@ Ayrıntılar için:
 
 | Platform / Bileşen | Paket Formatı | Uygulama Durumu | Hedef OS / Dağıtım Notu |
 |---|---|---|---|
-| **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.4.0`) | Windows, Android ve Linux tarafından paylaşılır |
+| **Ortak Rust Çekirdeği (`core/`)** | Statik/Dinamik Kütüphane + CLI | Tamamlandı (`v0.5.0`) | Windows, Android ve Linux tarafından paylaşılır |
 | **Windows (`platforms/windows`)** | `tulpar.exe` / `tulpar-windows-x64.zip` | Tamamlandı (PerMonitorV2 HiDPI `#000000` UI, Sistem Tepsisi, Tanılama & TCP Onarımı, WinDivert 2.2.2 in-kernel filtre + SHA-256 doğrulama) | Tek dosya `tulpar.exe` (imzalı WinDivert gömülü & doğrulamalı) veya `.zip` paketi |
 | **Android (`platforms/android`)** | `tulpar.apk` | Tamamlandı (Kotlin `VpnService`, Split-Tunneling, Canlı Ağ/DNS Tanılama, Hızlı Ayarlar Kutucuğu, Always-On VPN, Atomik IPv4↔IPv6 TUN, Android 15 Edge-to-Edge, JNI) | Android 8.0+ (API 26+, `arm64-v8a` & `x86_64`) |
 | **Linux (`platforms/linux`)** | `tulpar-linux-x64` / `.tar.gz` | Tamamlandı (Saf Rust Netlink `NFQUEUE` + `IPPROTO_RAW`, sıfır C `.so` bağımlılığı, `nftables` + `iptables` fallback, `fail-open` bypass, şeffaf DNS `:5354`, Zapret/nfqws çakışma onarımı, `systemd`) | Statik ikili dosya — tüm 64-bit Linux dağıtımları (Ubuntu, Debian, Arch, Fedora, Mint, SteamOS, Alpine vb.) |
@@ -89,8 +92,9 @@ Ayrıntılar için:
 ```bash
 curl -fsSLO https://github.com/AtaberkGit1/TULPAR/releases/latest/download/tulpar-linux-x64
 chmod +x tulpar-linux-x64
-./tulpar-linux-x64 test            # Canlı şifreli DNS gecikmesi (ms) ve IPv6 testi
-sudo ./tulpar-linux-x64 install    # /usr/local/bin/tulpar + systemd servisi (Zapret çakışmalarını temizler)
+./tulpar-linux-x64 test               # Canlı şifreli DNS gecikmesi (ms) ve IPv6 testi
+./tulpar-linux-x64 doctor discord.com # Canlı DNS + TLS + DPI atlatma site testi
+sudo ./tulpar-linux-x64 install       # /usr/local/bin/tulpar + systemd servisi (Zapret çakışmalarını temizler)
 ```
 
 ### Rust Çekirdeği (Linux / Windows)

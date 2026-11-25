@@ -308,6 +308,176 @@ fn parse_https_rdata(packet: &[u8], rdata_start: usize, rdata_end: usize) -> Opt
     })
 }
 
+fn collect_compression_ptrs_in_name(
+    packet: &[u8],
+    mut pos: usize,
+    ptrs: &mut Vec<(usize, usize)>,
+) -> Option<usize> {
+    let mut jumped = false;
+    let mut after_field = None;
+    let mut hops = 0usize;
+    loop {
+        if pos >= packet.len() {
+            return None;
+        }
+        let b = packet[pos];
+        if (b & 0xC0) == 0xC0 {
+            if pos + 1 >= packet.len() {
+                return None;
+            }
+            let target = (((b & 0x3F) as usize) << 8) | (packet[pos + 1] as usize);
+            ptrs.push((pos, target));
+            if !jumped {
+                after_field = Some(pos + 2);
+                jumped = true;
+            }
+            hops += 1;
+            if hops > 32 || target >= packet.len() {
+                return None;
+            }
+            pos = target;
+        } else if (b & 0xC0) != 0 {
+            return None;
+        } else if b == 0 {
+            return Some(after_field.unwrap_or(pos + 1));
+        } else {
+            let l = b as usize;
+            pos += 1;
+            if pos + l > packet.len() {
+                return None;
+            }
+            pos += l;
+        }
+    }
+}
+
+/// Strips RFC 9460 `SvcParamKey 6` (`ipv6hint`) parameters from `HTTPS` (65) and `SVCB` (64)
+/// records in a wire DNS response while preserving `ECH` (`key 5`), `ALPN` (`key 1`), `ipv4hint`
+/// (`key 4`), and recalculating RDLENGTH & compression pointers accurately.
+/// Returns `None` when no `ipv6hint` was present or if the response layout is unsafe to rewrite.
+pub fn strip_https_ipv6_hints(packet: &[u8]) -> Option<Vec<u8>> {
+    if packet.len() < 12 || (packet[2] & 0x80) == 0 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([packet[4], packet[5]]);
+    let an = u16::from_be_bytes([packet[6], packet[7]]);
+    let ns = u16::from_be_bytes([packet[8], packet[9]]);
+    let ar = u16::from_be_bytes([packet[10], packet[11]]);
+
+    let mut pos = 12usize;
+    let mut ptrs: Vec<(usize, usize)> = Vec::new();
+    let mut cuts: Vec<(usize, usize, usize)> = Vec::new(); // (rdlen_pos, cut_start, cut_end)
+
+    for _ in 0..qd {
+        pos = collect_compression_ptrs_in_name(packet, pos, &mut ptrs)?;
+        if pos + 4 > packet.len() {
+            return None;
+        }
+        pos += 4;
+    }
+
+    let total_rr = (an as usize).saturating_add(ns as usize).saturating_add(ar as usize);
+    if total_rr > 256 {
+        return None;
+    }
+    for _ in 0..total_rr {
+        pos = collect_compression_ptrs_in_name(packet, pos, &mut ptrs)?;
+        if pos + 10 > packet.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let rdlen_pos = pos + 8;
+        let rdlen = u16::from_be_bytes([packet[rdlen_pos], packet[rdlen_pos + 1]]) as usize;
+        let rdata_start = pos + 10;
+        let rdata_end = rdata_start + rdlen;
+        if rdata_end > packet.len() {
+            return None;
+        }
+
+        match rtype {
+            5 | 2 | 12 => {
+                // CNAME / NS / PTR RDATA starts with a domain name that may carry compression pointers
+                let _ = collect_compression_ptrs_in_name(packet, rdata_start, &mut ptrs)?;
+            }
+            6 => {
+                // SOA RDATA has MNAME followed by RNAME
+                let after_mname = collect_compression_ptrs_in_name(packet, rdata_start, &mut ptrs)?;
+                if after_mname < rdata_end {
+                    let _ = collect_compression_ptrs_in_name(packet, after_mname, &mut ptrs)?;
+                }
+            }
+            15 if rdlen >= 3 => {
+                // MX: 2-byte preference + exchange name
+                let _ = collect_compression_ptrs_in_name(packet, rdata_start + 2, &mut ptrs)?;
+            }
+            64 | 65 if rdlen >= 3 => {
+                // SVCB / HTTPS: SvcPriority(2) + TargetName(wire) + SvcParams
+                let mut sp = collect_compression_ptrs_in_name(packet, rdata_start + 2, &mut ptrs)?;
+                while sp + 4 <= rdata_end {
+                    let key = u16::from_be_bytes([packet[sp], packet[sp + 1]]);
+                    let val_len = u16::from_be_bytes([packet[sp + 2], packet[sp + 3]]) as usize;
+                    let param_end = sp + 4 + val_len;
+                    if param_end > rdata_end {
+                        break;
+                    }
+                    if key == 6 {
+                        cuts.push((rdlen_pos, sp, param_end));
+                    }
+                    sp = param_end;
+                }
+            }
+            _ => {}
+        }
+        pos = rdata_end;
+    }
+
+    if cuts.is_empty() {
+        return None;
+    }
+
+    ptrs.sort_unstable();
+    ptrs.dedup();
+    let mut out = packet.to_vec();
+
+    // Patch all compression pointers before splicing bytes (cumulative shifts for target >= cut_end)
+    for &(ptr_pos, target_pos) in &ptrs {
+        if cuts
+            .iter()
+            .any(|&(_, cs, ce)| target_pos >= cs && target_pos < ce)
+        {
+            return None;
+        }
+        let shift: usize = cuts
+            .iter()
+            .filter(|&&(_, _, ce)| ce <= target_pos)
+            .map(|&(_, cs, ce)| ce - cs)
+            .sum();
+        if shift > 0 {
+            let new_target = target_pos.checked_sub(shift)?;
+            if new_target > 0x3FFF {
+                return None;
+            }
+            let encoded = (0xC000u16 | (new_target as u16)).to_be_bytes();
+            out[ptr_pos..ptr_pos + 2].copy_from_slice(&encoded);
+        }
+    }
+
+    // Update each affected RDLENGTH in place
+    for &(rdlen_pos, cs, ce) in &cuts {
+        let cur = u16::from_be_bytes([out[rdlen_pos], out[rdlen_pos + 1]]) as usize;
+        let next = u16::try_from(cur.checked_sub(ce - cs)?).ok()?;
+        out[rdlen_pos..rdlen_pos + 2].copy_from_slice(&next.to_be_bytes());
+    }
+
+    // Remove cut slices back-to-front so earlier indices stay valid
+    cuts.sort_unstable_by_key(|a| std::cmp::Reverse(a.1));
+    for (_, cs, ce) in cuts {
+        out.drain(cs..ce);
+    }
+
+    Some(out)
+}
+
 /// Rewrites the 2-byte transaction ID of a cached DNS wire packet.
 pub fn patch_transaction_id(packet: &mut [u8], new_id: u16) {
     if packet.len() >= 2 {
@@ -513,5 +683,84 @@ mod tests {
         assert!(is_local_lan_hostname("portal.corp"));
         assert!(!is_local_lan_hostname("www.roblox.com"));
         assert!(!is_local_lan_hostname("g.whatsapp.net"));
+    }
+
+    #[test]
+    fn strips_https_ipv6hint_while_preserving_ech_and_compressed_trailing_records() {
+        let q = build_dns_query(0x9988, "ech.example.org", QType::HTTPS);
+        let parsed_q = parse_dns_query(&q).unwrap();
+        let q_sec = &q[12..parsed_q.question_end];
+
+        // HTTPS RR RDATA: priority=1, target="." (0x00), alpn(1), ipv4hint(4), ech(5), ipv6hint(6)
+        let mut rdata = Vec::new();
+        rdata.extend_from_slice(&1u16.to_be_bytes());
+        rdata.push(0x00);
+        // key 1 (alpn)
+        rdata.extend_from_slice(&1u16.to_be_bytes());
+        rdata.extend_from_slice(&3u16.to_be_bytes());
+        rdata.extend_from_slice(&[2, b'h', b'2']);
+        // key 4 (ipv4hint)
+        rdata.extend_from_slice(&4u16.to_be_bytes());
+        rdata.extend_from_slice(&4u16.to_be_bytes());
+        rdata.extend_from_slice(&[93, 184, 216, 34]);
+        // key 5 (ech)
+        rdata.extend_from_slice(&5u16.to_be_bytes());
+        rdata.extend_from_slice(&4u16.to_be_bytes());
+        rdata.extend_from_slice(&[0x00, 0x02, 0xFE, 0x0D]);
+        // key 6 (ipv6hint: 2001:db8::1 -> 16 bytes -> total param 20 bytes removed)
+        rdata.extend_from_slice(&6u16.to_be_bytes());
+        rdata.extend_from_slice(&16u16.to_be_bytes());
+        rdata.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&0x9988u16.to_be_bytes());
+        resp.extend_from_slice(&0x8180u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT=1
+        resp.extend_from_slice(&2u16.to_be_bytes()); // ANCOUNT=2
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(&0u16.to_be_bytes());
+        resp.extend_from_slice(q_sec);
+
+        // Answer 1: HTTPS record at owner ptr 0xC00C
+        resp.extend_from_slice(&0xC00Cu16.to_be_bytes());
+        resp.extend_from_slice(&65u16.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&120u32.to_be_bytes());
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        let target_label_anchor = resp.len() + 2; // byte offset after cut would shift only records after this!
+        let _ = target_label_anchor;
+        resp.extend_from_slice(&rdata);
+
+        // Answer 2: CNAME record pointing to a label defined inside Additional/Answer 2? Use uncompressed owner
+        // and compressed pointer referencing Answer 2's own owner (located AFTER Answer 1 cut -> must shift by -20!)
+        let rr2_owner_offset = resp.len();
+        resp.extend_from_slice(&[3, b'c', b'd', b'n', 0xC0, 0x0C]); // "cdn.ech.example.org"
+        resp.extend_from_slice(&5u16.to_be_bytes()); // CNAME
+        resp.extend_from_slice(&1u16.to_be_bytes());
+        resp.extend_from_slice(&120u32.to_be_bytes());
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        // RDATA: label "v" + ptr to rr2_owner_offset (located AFTER Answer 1 cut!)
+        resp.extend_from_slice(&[1, b'v']);
+        resp.extend_from_slice(&(0xC000u16 | (rr2_owner_offset as u16)).to_be_bytes());
+
+        let stripped = strip_https_ipv6_hints(&resp).expect("should strip ipv6hint cleanly");
+        assert_eq!(stripped.len(), resp.len() - 20);
+        // Confirm stripping twice returns None (no ipv6hint remains)
+        assert!(strip_https_ipv6_hints(&stripped).is_none());
+
+        let parsed = parse_dns_response(&stripped).expect("stripped response + shifted compression ptrs must parse");
+        assert_eq!(parsed.answers.len(), 2);
+        assert_eq!(
+            parsed.answers[0].data,
+            DnsRecordData::Https {
+                priority: 1,
+                target: String::new(),
+                has_ech: true,
+            }
+        );
+        assert_eq!(
+            parsed.answers[1].data,
+            DnsRecordData::CNAME("v.cdn.ech.example.org".to_string())
+        );
     }
 }

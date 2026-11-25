@@ -13,14 +13,26 @@ use yolac_core::ModuleHealthStatus;
 #[cfg(windows)]
 use yolac_core::SECURITY_WARNING_TR;
 use yolac_core::{
-    EngineState, ErrorCode, ModuleHealthReport, UpdateCheckResult, YolacConfig, YolacEngine,
+    parse_user_rules_json, EngineState, ErrorCode, ModuleHealthReport, UpdateCheckResult,
+    UserRulesConfig, YolacConfig, YolacEngine,
 };
+use yolac_dns::DnsProfile;
+use yolac_dpi::QuicPolicy;
 
+use crate::integrity::sha256_file_hex;
 use crate::net_optimizer::{
     inspect_and_repair_windows_network, is_windows_autostart_enabled, toggle_windows_autostart,
 };
 use crate::permissions::{is_elevated, request_uac_elevation};
 use crate::windivert::WindowsPacketEngine;
+
+#[derive(Debug, Clone, Default)]
+pub struct LaunchOptions {
+    pub elevated_start: bool,
+    pub strategy_path: Option<PathBuf>,
+    pub dns_spec: Option<String>,
+    pub quic_mode: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -54,12 +66,32 @@ pub struct AppController {
 
 impl AppController {
     pub fn new() -> Self {
-        Self::new_with_strategy(None)
+        Self::new_with_options(LaunchOptions::default())
     }
 
     pub fn new_with_strategy(strategy_path: Option<&std::path::Path>) -> Self {
+        Self::new_with_options(LaunchOptions {
+            strategy_path: strategy_path.map(PathBuf::from),
+            ..LaunchOptions::default()
+        })
+    }
+
+    pub fn new_with_options(opts: LaunchOptions) -> Self {
         let engine = Arc::new(YolacEngine::new(YolacConfig::windows_desktop(), None));
-        if let Some(p) = strategy_path {
+        apply_saved_windows_config(&engine);
+
+        if let Some(ref dns_spec) = opts.dns_spec {
+            if let Ok(profile) = DnsProfile::parse_spec(dns_spec) {
+                engine.set_dns_profile(profile);
+            }
+        }
+        if let Some(ref qmode) = opts.quic_mode {
+            if let Some(policy) = parse_quic_policy_str(qmode) {
+                engine.set_quic_policy(policy);
+            }
+        }
+
+        if let Some(ref p) = opts.strategy_path {
             let _ = engine.load_forge_package_file(p);
         } else if let Ok(prog_data) = std::env::var("ProgramData") {
             let active = std::path::Path::new(&prog_data)
@@ -173,6 +205,80 @@ impl AppController {
 
     pub fn is_autostart_enabled(&self) -> bool {
         self.autostart_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn dns_profile_label(&self) -> String {
+        self.engine.active_dns_profile().label_tr()
+    }
+
+    pub fn quic_policy_label(&self) -> &'static str {
+        match self.engine.quic_policy() {
+            QuicPolicy::BlockFallbackToTcp => "TCP Fallback (Önerilen)",
+            QuicPolicy::DesyncFragment => "QUIC Desync Paketi",
+            QuicPolicy::Allow => "Doğrudan İzin Ver",
+        }
+    }
+
+    pub fn cycle_dns_profile(&self) {
+        let next = match self.engine.active_dns_profile() {
+            DnsProfile::AutoFastest => DnsProfile::Cloudflare,
+            DnsProfile::Cloudflare => DnsProfile::Quad9Security,
+            DnsProfile::Quad9Security => DnsProfile::MullvadAdblock,
+            DnsProfile::MullvadAdblock => DnsProfile::AdGuard,
+            DnsProfile::AdGuard | DnsProfile::Custom { .. } => DnsProfile::AutoFastest,
+        };
+        self.engine.set_dns_profile(next);
+        save_windows_config(&self.engine);
+    }
+
+    pub fn cycle_quic_policy(&self) {
+        let next = match self.engine.quic_policy() {
+            QuicPolicy::BlockFallbackToTcp => QuicPolicy::DesyncFragment,
+            QuicPolicy::DesyncFragment => QuicPolicy::Allow,
+            QuicPolicy::Allow => QuicPolicy::BlockFallbackToTcp,
+        };
+        self.engine.set_quic_policy(next);
+        save_windows_config(&self.engine);
+    }
+
+    pub fn run_domain_doctor_async(
+        self: &Arc<Self>,
+        domain: String,
+        on_done: impl Fn() + Send + Sync + 'static,
+    ) {
+        {
+            let mut flag = self.running_diag.lock().unwrap();
+            if *flag {
+                return;
+            }
+            *flag = true;
+        }
+        if let Ok(mut msg) = self.diag_message.lock() {
+            *msg = Some((false, format!("{domain} için canlı erişim testi çalışıyor...")));
+        }
+
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            let rep = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()
+                .map(|rt| rt.block_on(this.engine.diagnose_domain(&domain)));
+            let (is_err, text) = match rep {
+                Some(r) => (
+                    !r.dns_ok || (!r.direct_tls_ok && !r.evasion_tls_ok),
+                    r.summary_tr,
+                ),
+                None => (true, "Tanılama çalışma zamanı başlatılamadı.".into()),
+            };
+            if let Ok(mut msg) = this.diag_message.lock() {
+                *msg = Some((is_err, text));
+            }
+            if let Ok(mut flag) = this.running_diag.lock() {
+                *flag = false;
+            }
+            on_done();
+        });
     }
 
     pub fn notify_network_resume(&self) {
@@ -472,6 +578,163 @@ pub fn is_trusted_official_release_url(url: &str) -> bool {
         .starts_with("https://github.com/ataberkgit1/tulpar/releases")
 }
 
+pub fn parse_quic_policy_str(raw: &str) -> Option<QuicPolicy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "fallback" | "block" | "tcp" => Some(QuicPolicy::BlockFallbackToTcp),
+        "desync" | "desync_fragment" | "fragment" => Some(QuicPolicy::DesyncFragment),
+        "allow" | "off" => Some(QuicPolicy::Allow),
+        _ => None,
+    }
+}
+
+pub fn parse_sha256sums_line(sums_text: &str, asset_name: &str) -> Option<String> {
+    for line in sums_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?.trim_start_matches('*');
+        if name == asset_name
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+pub fn verify_file_matches_sha256sums(
+    file_path: &std::path::Path,
+    sums_text: &str,
+    asset_name: &str,
+) -> Result<bool, String> {
+    let expected = parse_sha256sums_line(sums_text, asset_name)
+        .ok_or_else(|| format!("SHA256SUMS.txt içinde '{asset_name}' bulunamadı."))?;
+    let actual = sha256_file_hex(file_path).map_err(|e| format!("Dosya okunamadı: {e}"))?;
+    Ok(actual.eq_ignore_ascii_case(&expected))
+}
+
+fn windows_config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
+    Some(base.join("Tulpar").join("config.json"))
+}
+
+fn extract_json_str(json: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let idx = json.find(&pat)?;
+    let after = &json[idx + pat.len()..];
+    let colon = after.find(':')?;
+    let val = after[colon + 1..].trim_start();
+    let rest = val.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn apply_saved_windows_config(engine: &YolacEngine) {
+    let Some(path) = windows_config_path() else {
+        return;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if let Some(dns_spec) = extract_json_str(&raw, "dns") {
+        if let Ok(profile) = DnsProfile::parse_spec(&dns_spec) {
+            engine.set_dns_profile(profile);
+        }
+    }
+    if let Some(quic_spec) = extract_json_str(&raw, "quic") {
+        if let Some(policy) = parse_quic_policy_str(&quic_spec) {
+            engine.set_quic_policy(policy);
+        }
+    }
+    let rules = parse_user_rules_json(&raw);
+    if !rules.allowlist.is_empty()
+        || !rules.blocklist.is_empty()
+        || !rules.excluded_dpi.is_empty()
+        || !rules.aggressive_dpi.is_empty()
+    {
+        engine.set_user_rules(rules);
+    }
+}
+
+fn format_json_str_array(items: &[String]) -> String {
+    let inner: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", inner.join(","))
+}
+
+fn save_windows_config(engine: &YolacEngine) {
+    let Some(path) = windows_config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let dns_val = match engine.active_dns_profile() {
+        DnsProfile::Custom {
+            protocol,
+            bootstrap_ip,
+            port,
+            tls_server_name,
+            doh_path,
+        } => {
+            let scheme = match protocol {
+                yolac_dns::UpstreamProtocol::DoT => "tls",
+                yolac_dns::UpstreamProtocol::DoH => "https",
+            };
+            format!("{scheme}://{bootstrap_ip}:{port}{doh_path}#{tls_server_name}")
+        }
+        other => other.key().to_string(),
+    };
+    let quic_val = match engine.quic_policy() {
+        QuicPolicy::BlockFallbackToTcp => "fallback",
+        QuicPolicy::DesyncFragment => "desync",
+        QuicPolicy::Allow => "allow",
+    };
+    let rules: UserRulesConfig = engine.user_rules();
+    let payload = format!(
+        "{{\"dns\":\"{}\",\"quic\":\"{}\",\"allowlist\":{},\"blocklist\":{},\"excluded_dpi\":{},\"aggressive_dpi\":{}}}",
+        dns_val.replace('\\', "\\\\").replace('"', "\\\""),
+        quic_val,
+        format_json_str_array(&rules.allowlist),
+        format_json_str_array(&rules.blocklist),
+        format_json_str_array(&rules.excluded_dpi),
+        format_json_str_array(&rules.aggressive_dpi),
+    );
+    let _ = std::fs::write(path, payload);
+}
+
+pub fn run_cli_domain_doctor(domain: &str, dns_spec: Option<&str>, quic_mode: Option<&str>) {
+    let engine = YolacEngine::new(YolacConfig::windows_desktop(), None);
+    apply_saved_windows_config(&engine);
+    if let Some(spec) = dns_spec {
+        if let Ok(profile) = DnsProfile::parse_spec(spec) {
+            engine.set_dns_profile(profile);
+        }
+    }
+    if let Some(qmode) = quic_mode {
+        if let Some(policy) = parse_quic_policy_str(qmode) {
+            engine.set_quic_policy(policy);
+        }
+    }
+    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        let rep = rt.block_on(engine.diagnose_domain(domain));
+        println!("{}", rep.summary_tr);
+        println!("{}", rep.to_json());
+    }
+}
+
 fn ack_flag_path() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
@@ -493,7 +756,7 @@ fn mark_security_warning_acked() {
 }
 
 #[cfg(windows)]
-pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
+pub fn run_win32_ui(opts: LaunchOptions) {
     use std::sync::atomic::AtomicU32;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{
@@ -546,7 +809,7 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
     static SINGLE_INSTANCE_MUTEX: Mutex<usize> = Mutex::new(0);
 
     let controller = CTRL
-        .get_or_init(|| Arc::new(AppController::new_with_strategy(strategy_path.as_deref())))
+        .get_or_init(|| Arc::new(AppController::new_with_options(opts.clone())))
         .clone();
 
     fn release_single_instance_mutex() {
@@ -635,6 +898,8 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
         icons: [RECT; 7],
         error_rc: Option<RECT>,
         selected_rc: Option<RECT>,
+        dns_btn: RECT,
+        quic_btn: RECT,
         diag_btn: RECT,
         diag_text_rc: Option<RECT>,
         opt_btn: RECT,
@@ -722,6 +987,24 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
 
         let btn_h = sc(40, dpi);
         let btn_gap = sc(10, dpi);
+
+        // 0a. Encrypted DNS profile selector button
+        let dns_btn = RECT {
+            left: pad,
+            top: y,
+            right,
+            bottom: y + btn_h,
+        };
+        y += btn_h + btn_gap;
+
+        // 0b. QUIC / UDP-443 bypass policy selector button
+        let quic_btn = RECT {
+            left: pad,
+            top: y,
+            right,
+            bottom: y + btn_h,
+        };
+        y += btn_h + btn_gap;
 
         // 1. Live DNS & IPv6 speed diagnostic button
         let diag_btn = RECT {
@@ -819,6 +1102,8 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
             icons,
             error_rc,
             selected_rc,
+            dns_btn,
+            quic_btn,
             diag_btn,
             diag_text_rc,
             opt_btn,
@@ -1304,6 +1589,28 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
                             );
                         }
 
+                        // 0a. Encrypted DNS provider selector button
+                        let dns_label = format!("Şifreli DNS: {}", ctrl.dns_profile_label());
+                        draw_outline_button(
+                            hdc,
+                            layout.dns_btn,
+                            &dns_label,
+                            rgb(0x4A, 0x7A, 0x5A),
+                            rgb(255, 255, 255),
+                            dpi,
+                        );
+
+                        // 0b. QUIC / UDP-443 circumvention policy button
+                        let quic_label = format!("QUIC/443: {}", ctrl.quic_policy_label());
+                        draw_outline_button(
+                            hdc,
+                            layout.quic_btn,
+                            &quic_label,
+                            rgb(0x55, 0x55, 0x55),
+                            rgb(255, 255, 255),
+                            dpi,
+                        );
+
                         // 1. Live encrypted DNS & IPv6 diagnostic button
                         let diag_label = if ctrl.is_running_diag() {
                             "Ağ ve DNS Test Ediliyor..."
@@ -1556,6 +1863,18 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
                         }
 
                         let hwnd_val = hwnd as usize;
+                        if pt_in_rect(x, y, layout.dns_btn) {
+                            ctrl.cycle_dns_profile();
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
+
+                        if pt_in_rect(x, y, layout.quic_btn) {
+                            ctrl.cycle_quic_policy();
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                            return 0;
+                        }
+
                         if pt_in_rect(x, y, layout.diag_btn) {
                             ctrl.run_diagnostics_async(move || {
                                 let _ = PostMessageW(hwnd_val as HWND, WM_YOLAC_STATE, 0, 0);
@@ -1680,7 +1999,7 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
 
         // Single-instance mutex (allows brief handoff delay during UAC `--elevated-start` relaunch)
         let mut acquired = false;
-        let attempts = if autostart { 12 } else { 1 };
+        let attempts = if opts.elevated_start { 12 } else { 1 };
         for _ in 0..attempts {
             let h = CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr());
             if !h.is_null() {
@@ -1705,7 +2024,7 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
                 break;
             }
         }
-        if !acquired && !autostart {
+        if !acquired && !opts.elevated_start {
             return;
         }
 
@@ -1789,7 +2108,7 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
         ShowWindow(hwnd, SW_SHOW);
         add_icon(hwnd, controller.current_state());
 
-        if autostart && is_elevated() {
+        if opts.elevated_start && is_elevated() {
             controller.acknowledge_first_launch_warning();
             trigger_toggle(&controller, hwnd);
         }
@@ -1804,8 +2123,8 @@ pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
 }
 
 #[cfg(not(windows))]
-pub fn run_win32_ui(_autostart: bool, strategy_path: Option<PathBuf>) {
-    let _ctrl = AppController::new_with_strategy(strategy_path.as_deref());
+pub fn run_win32_ui(opts: LaunchOptions) {
+    let _ctrl = AppController::new_with_options(opts);
     eprintln!("TULPAR Windows GUI requires Windows Win32 APIs.");
 }
 
@@ -1879,5 +2198,48 @@ mod tests {
 
         ctrl.engine.set_state(EngineState::Inactive);
         assert_eq!(ctrl.on_window_close_requested(), CloseAction::ExitApp);
+    }
+
+    #[test]
+    fn windows_dns_quic_cycle_and_sha256sums_verifier() {
+        let ctrl = AppController::new();
+        assert_eq!(ctrl.dns_profile_label(), "Otomatik (En Hızlı)");
+        ctrl.cycle_dns_profile();
+        assert_eq!(ctrl.dns_profile_label(), "Cloudflare (1.1.1.1)");
+        ctrl.cycle_dns_profile();
+        assert_eq!(ctrl.dns_profile_label(), "Quad9 Güvenlik (9.9.9.9)");
+        ctrl.cycle_dns_profile();
+        assert_eq!(ctrl.dns_profile_label(), "Mullvad Reklam Engelli");
+        ctrl.cycle_dns_profile();
+        assert_eq!(ctrl.dns_profile_label(), "AdGuard DNS");
+        ctrl.cycle_dns_profile();
+        assert_eq!(ctrl.dns_profile_label(), "Otomatik (En Hızlı)");
+
+        assert_eq!(ctrl.quic_policy_label(), "TCP Fallback (Önerilen)");
+        ctrl.cycle_quic_policy();
+        assert_eq!(ctrl.quic_policy_label(), "QUIC Desync Paketi");
+        ctrl.cycle_quic_policy();
+        assert_eq!(ctrl.quic_policy_label(), "Doğrudan İzin Ver");
+        ctrl.cycle_quic_policy();
+        assert_eq!(ctrl.quic_policy_label(), "TCP Fallback (Önerilen)");
+
+        assert_eq!(parse_quic_policy_str("desync"), Some(QuicPolicy::DesyncFragment));
+        assert_eq!(parse_quic_policy_str("allow"), Some(QuicPolicy::Allow));
+        assert_eq!(parse_quic_policy_str("fallback"), Some(QuicPolicy::BlockFallbackToTcp));
+
+        // Verify SHA256SUMS.txt line parser & real file digest checker
+        let tmp = std::env::temp_dir().join("tulpar_win_sha256_test.bin");
+        std::fs::write(&tmp, b"abc").unwrap();
+        let sums = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  tulpar.exe\n";
+        assert_eq!(
+            verify_file_matches_sha256sums(&tmp, sums, "tulpar.exe"),
+            Ok(true)
+        );
+        let bad_sums = "0000000000000000000000000000000000000000000000000000000000000000  tulpar.exe\n";
+        assert_eq!(
+            verify_file_matches_sha256sums(&tmp, bad_sums, "tulpar.exe"),
+            Ok(false)
+        );
+        let _ = std::fs::remove_file(&tmp);
     }
 }

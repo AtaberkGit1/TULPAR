@@ -27,6 +27,8 @@ pub enum FakePacketMode {
     LowTtlWrongSeq(u8),
     /// Combines intentionally corrupted TCP checksum with `--wrong-seq`.
     BadChecksumWrongSeq,
+    /// Corrupts RFC 7323 TCP Timestamp (`TSval`) when TCP Timestamps option is present so PAWS drops it at server.
+    BadTcpTimestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,27 +168,58 @@ pub fn segment_tcp_packet(raw_packet: &[u8], split_at: usize) -> Option<(Vec<u8>
     Some((pkt1, pkt2))
 }
 
-/// Segments a raw IPv4/IPv6 TCP packet into multiple valid L3 packets at sorted `split_points`.
-pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Option<Vec<Vec<u8>>> {
-    let ip = parse_ip_packet(raw_packet)?;
-    if ip.protocol != IpProtocol::Tcp {
+/// Computes MTU-safe TCP payload boundaries `[0, ..., payload_len]` preserving explicit `split_points`
+/// and splitting any oversized span into chunks `<= max_seg_payload` (used for PQ ClientHello reassembly).
+fn compute_tcp_chunk_boundaries(
+    payload_len: usize,
+    split_points: &[usize],
+    max_seg_payload: usize,
+) -> Option<Vec<usize>> {
+    if payload_len < 2 {
         return None;
     }
-    let tcp = parse_tcp(ip.payload)?;
-    if (tcp.flags & ParsedTcp::SYN) != 0 || tcp.payload.len() < 2 {
-        return None;
-    }
-
     let mut cuts: Vec<usize> = split_points
         .iter()
         .copied()
-        .filter(|&p| p > 0 && p < tcp.payload.len())
+        .filter(|&p| p > 0 && p < payload_len)
         .collect();
     cuts.sort_unstable();
     cuts.dedup();
-    if cuts.is_empty() {
+    if cuts.is_empty() && payload_len <= max_seg_payload {
         return None;
     }
+
+    let mtu_step = max_seg_payload.max(64);
+    let mut boundaries = Vec::with_capacity(cuts.len() + 4);
+    boundaries.push(0usize);
+    let mut prev = 0usize;
+    for cut in cuts.into_iter().chain(std::iter::once(payload_len)) {
+        while cut.saturating_sub(prev) > mtu_step {
+            prev += mtu_step;
+            boundaries.push(prev);
+        }
+        if cut > prev {
+            boundaries.push(cut);
+            prev = cut;
+        }
+    }
+    if boundaries.len() < 3 {
+        return None;
+    }
+    Some(boundaries)
+}
+
+fn build_tcp_segments_internal(
+    ip: &crate::packet::ParsedIpPacket<'_>,
+    tcp: &ParsedTcp<'_>,
+    stream_payload: &[u8],
+    split_points: &[usize],
+    max_seg_payload: usize,
+) -> Option<Vec<Vec<u8>>> {
+    if (tcp.flags & ParsedTcp::SYN) != 0 {
+        return None;
+    }
+    let boundaries = compute_tcp_chunk_boundaries(stream_payload.len(), split_points, max_seg_payload)?;
 
     let tcp_options = if tcp.header_len > 20 {
         &ip.payload[20..tcp.header_len]
@@ -194,18 +227,13 @@ pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Op
         &[]
     };
 
-    let mut boundaries = Vec::with_capacity(cuts.len() + 2);
-    boundaries.push(0usize);
-    boundaries.extend_from_slice(&cuts);
-    boundaries.push(tcp.payload.len());
-
     let seg_count = boundaries.len() - 1;
     let mut out = Vec::with_capacity(seg_count);
 
     for i in 0..seg_count {
         let start = boundaries[i];
         let end = boundaries[i + 1];
-        let part = &tcp.payload[start..end];
+        let part = &stream_payload[start..end];
         let is_last = i + 1 == seg_count;
         let flags = if is_last {
             tcp.flags
@@ -252,6 +280,48 @@ pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Op
     Some(out)
 }
 
+/// Segments a raw IPv4/IPv6 TCP packet into multiple valid L3 packets at sorted `split_points`.
+pub fn segment_tcp_packet_multi(raw_packet: &[u8], split_points: &[usize]) -> Option<Vec<Vec<u8>>> {
+    let ip = parse_ip_packet(raw_packet)?;
+    if ip.protocol != IpProtocol::Tcp {
+        return None;
+    }
+    let tcp = parse_tcp(ip.payload)?;
+    build_tcp_segments_internal(&ip, &tcp, tcp.payload, split_points, usize::MAX)
+}
+
+fn corrupt_tcp_timestamp_opt(tcp_options: &[u8]) -> Option<Vec<u8>> {
+    let mut opts = tcp_options.to_vec();
+    let mut pos = 0usize;
+    while pos < opts.len() {
+        let kind = opts[pos];
+        if kind == 0 {
+            break;
+        }
+        if kind == 1 {
+            pos += 1;
+            continue;
+        }
+        if pos + 1 >= opts.len() {
+            break;
+        }
+        let len = opts[pos + 1] as usize;
+        if len < 2 || pos + len > opts.len() {
+            break;
+        }
+        if kind == 8 && len == 10 {
+            // Flip upper/all bits of TSval (RFC 7323 PAWS check rejects stale wrapped timestamps)
+            opts[pos + 2] ^= 0x7F;
+            opts[pos + 3] ^= 0xFF;
+            opts[pos + 4] ^= 0xFF;
+            opts[pos + 5] ^= 0xFF;
+            return Some(opts);
+        }
+        pos += len;
+    }
+    None
+}
+
 fn build_single_fake_packet(
     ip: &crate::packet::ParsedIpPacket<'_>,
     tcp: &ParsedTcp<'_>,
@@ -261,9 +331,10 @@ fn build_single_fake_packet(
 ) -> Option<DesyncPacket> {
     let ttl = match mode {
         FakePacketMode::LowTtl(t) | FakePacketMode::LowTtlWrongSeq(t) => t.max(1),
-        FakePacketMode::BadChecksum | FakePacketMode::WrongSeq | FakePacketMode::BadChecksumWrongSeq => {
-            ip.ttl
-        }
+        FakePacketMode::BadChecksum
+        | FakePacketMode::WrongSeq
+        | FakePacketMode::BadChecksumWrongSeq
+        | FakePacketMode::BadTcpTimestamp => ip.ttl,
     };
     let (seq, ack) = match mode {
         FakePacketMode::WrongSeq
@@ -272,13 +343,22 @@ fn build_single_fake_packet(
             tcp.seq.wrapping_sub(10_000),
             tcp.ack.wrapping_sub(66_000),
         ),
-        FakePacketMode::LowTtl(_) | FakePacketMode::BadChecksum => (tcp.seq, tcp.ack),
+        FakePacketMode::LowTtl(_)
+        | FakePacketMode::BadChecksum
+        | FakePacketMode::BadTcpTimestamp => (tcp.seq, tcp.ack),
     };
 
-    let tcp_options = if tcp.header_len > 20 {
+    let raw_opts = if tcp.header_len > 20 {
         &ip.payload[20..tcp.header_len]
     } else {
         &[]
+    };
+    let owned_bad_ts_opts;
+    let tcp_options: &[u8] = if matches!(mode, FakePacketMode::BadTcpTimestamp) {
+        owned_bad_ts_opts = corrupt_tcp_timestamp_opt(raw_opts)?;
+        &owned_bad_ts_opts
+    } else {
+        raw_opts
     };
     let safe_flags = (tcp.flags & !(ParsedTcp::SYN | ParsedTcp::FIN | ParsedTcp::RST)) | ParsedTcp::ACK;
 
@@ -329,18 +409,18 @@ fn build_single_fake_packet(
     })
 }
 
-/// Builds a full Turkey-ISP-grade DPI desynchronization burst:
-/// 1. One or more valid benign fake decoy packets (`LowTtl`, `WrongSeq`, `BadChecksum`)
-/// 2. Multi-point segmented real payload sent in reverse/disorder order (`seg[1..]`, then `seg[0]`)
-///    so stateful DPI fails to match SNI/Host while the destination server reassembles identically.
-pub fn build_turkey_desync_packets(
-    raw_packet: &[u8],
+/// Builds an MTU-safe DPI desynchronization burst for a single packet OR a reassembled multi-segment
+/// stream (such as a Post-Quantum `X25519MLKEM768` ClientHello > 1460 bytes).
+pub fn build_reassembled_desync_packets(
+    header_template_pkt: &[u8],
+    reassembled_payload: &[u8],
     split_points: &[usize],
     fake_modes: &[FakePacketMode],
     fake_payload: &[u8],
     reverse_first_segment: bool,
+    max_seg_payload: usize,
 ) -> Option<Vec<DesyncPacket>> {
-    let ip = parse_ip_packet(raw_packet)?;
+    let ip = parse_ip_packet(header_template_pkt)?;
     if ip.protocol != IpProtocol::Tcp {
         return None;
     }
@@ -348,7 +428,13 @@ pub fn build_turkey_desync_packets(
     if (tcp.flags & ParsedTcp::SYN) != 0 {
         return None;
     }
-    let mut segs = segment_tcp_packet_multi(raw_packet, split_points)?;
+    let mut segs = build_tcp_segments_internal(
+        &ip,
+        &tcp,
+        reassembled_payload,
+        split_points,
+        max_seg_payload,
+    )?;
 
     let base_fake_id = if ip.ip_id == 0 {
         0x3000u16
@@ -393,11 +479,38 @@ pub fn build_turkey_desync_packets(
     Some(out)
 }
 
+/// Builds a full Turkey-ISP-grade DPI desynchronization burst:
+/// 1. One or more valid benign fake decoy packets (`LowTtl`, `WrongSeq`, `BadChecksum`, `BadTcpTimestamp`)
+/// 2. Multi-point segmented real payload sent in reverse/disorder order (`seg[1..]`, then `seg[0]`)
+///    so stateful DPI fails to match SNI/Host while the destination server reassembles identically.
+pub fn build_turkey_desync_packets(
+    raw_packet: &[u8],
+    split_points: &[usize],
+    fake_modes: &[FakePacketMode],
+    fake_payload: &[u8],
+    reverse_first_segment: bool,
+) -> Option<Vec<DesyncPacket>> {
+    let ip = parse_ip_packet(raw_packet)?;
+    if ip.protocol != IpProtocol::Tcp {
+        return None;
+    }
+    let tcp = parse_tcp(ip.payload)?;
+    build_reassembled_desync_packets(
+        raw_packet,
+        tcp.payload,
+        split_points,
+        fake_modes,
+        fake_payload,
+        reverse_first_segment,
+        usize::MAX,
+    )
+}
+
 /// Detects forged inbound `TCP RST` packets injected by passive optical-splitter DPI boxes
 /// (e.g. Türk Telekom / Vodafone Procera / Sandvine):
-/// - Inbound TTL differs by `>= 3` hops from the real server's observed `SYN-ACK` TTL
-/// - OR IPv4 `IP.ID <= 1` with `DF == 0` (classic passive DPI injector fingerprint; NEVER drops
-///   legitimate RFC 6864 Linux/Cloudflare/Google atomic `RST`s which carry `DF == 1, IP.ID == 0`!).
+/// - Inbound TTL/HopLimit differs by `>= 3` hops from the real server's observed `SYN-ACK`
+/// - OR IPv4 `IP.ID <= 1` with `DF == 0` (never drops legitimate RFC 6864 `DF == 1` RSTs)
+/// - OR bare stateless IPv6 `RST` (`ACK == 0` and `window == 0`) during active handshake
 pub fn is_forged_passive_dpi_rst(raw_packet: &[u8], expected_syn_ack_ttl: Option<u8>) -> bool {
     let Some(ip) = parse_ip_packet(raw_packet) else {
         return false;
@@ -416,6 +529,10 @@ pub fn is_forged_passive_dpi_rst(raw_packet: &[u8], expected_syn_ack_ttl: Option
         if syn_ttl > 0 && ip.ttl > 0 && syn_ttl.abs_diff(ip.ttl) >= 3 {
             return true;
         }
+    }
+
+    if ip.version == 6 {
+        return tcp.window == 0 && (tcp.flags & ParsedTcp::ACK) == 0;
     }
 
     ip.version == 4 && !ip.df && (ip.ip_id == 0 || ip.ip_id == 1)
@@ -732,5 +849,68 @@ mod tests {
         let wtcp = parse_tcp(wip.payload).unwrap();
         assert_eq!(wtcp.window, 40);
         assert_eq!(tcp_checksum_ipv4(src, dst, wip.payload), u16::from_be_bytes([wip.payload[16], wip.payload[17]]));
+    }
+
+    #[test]
+    fn corrupts_tcp_timestamp_option_while_preserving_valid_checksums_and_reassembles_pq_stream() {
+        let src = Ipv4Addr::new(10, 0, 0, 2);
+        let dst = Ipv4Addr::new(104, 16, 132, 229);
+        // TCP Timestamp option (kind=8, len=10, TSval=0x11223344, TSecr=0x55667788) + 2x NOP padding
+        let opts = [1u8, 1, 8, 10, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let payload = vec![0x42u8; 2100];
+        let template = build_ipv4_tcp_packet(
+            src,
+            dst,
+            40000,
+            443,
+            10_000,
+            20_000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            99,
+            &opts,
+            &payload[..1400],
+        );
+
+        let fake_mode = [FakePacketMode::BadTcpTimestamp];
+        let pkts = build_reassembled_desync_packets(
+            &template,
+            &payload,
+            &[2, 1650],
+            &fake_mode,
+            b"DECOY",
+            true,
+            1380,
+        )
+        .expect("reassembled PQ plan");
+
+        // 1 BadTcpTimestamp decoy + segments covering 2100 bytes within 1380B payload MTU
+        assert!(!pkts[0].preserve_bad_tcp_checksum);
+        let decoy_ip = parse_ip_packet(&pkts[0].bytes).unwrap();
+        let decoy_tcp = parse_tcp(decoy_ip.payload).unwrap();
+        assert_eq!(
+            tcp_checksum_ipv4(src, dst, decoy_ip.payload),
+            u16::from_be_bytes([decoy_ip.payload[16], decoy_ip.payload[17]])
+        );
+        // TSval bytes mutated cleanly while original TSecr stayed intact
+        assert_ne!(&decoy_ip.payload[24..28], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(&decoy_ip.payload[28..32], &[0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(decoy_tcp.seq, 10_000);
+
+        // Verify all real segments fit <= 1380B payload and reassemble to exact 2100B stream
+        let mut reconstructed = vec![0u8; payload.len()];
+        for p in &pkts[1..] {
+            let ip = parse_ip_packet(&p.bytes).unwrap();
+            let tcp = parse_tcp(ip.payload).unwrap();
+            assert!(tcp.payload.len() <= 1380);
+            let off = (tcp.seq - 10_000) as usize;
+            reconstructed[off..off + tcp.payload.len()].copy_from_slice(tcp.payload);
+        }
+        assert_eq!(reconstructed, payload);
+        // Disorder guarantees leading [0..2] bytes were sent LAST
+        let last_tcp = parse_tcp(parse_ip_packet(&pkts.last().unwrap().bytes).unwrap().payload).unwrap();
+        assert_eq!(last_tcp.seq, 10_000);
+        assert_eq!(last_tcp.payload.len(), 2);
     }
 }

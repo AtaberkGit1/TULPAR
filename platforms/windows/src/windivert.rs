@@ -30,11 +30,13 @@ use yolac_dns::{parse_dns_query, DnsEngine, DnsOutcome};
 use yolac_dpi::{
     build_benign_fake_client_hello, build_benign_fake_http_request,
     build_disorder_and_fake_packets, build_ipv4_tcp_packet, build_ipv6_tcp_packet,
-    build_turkey_desync_packets, build_udp_desync_decoys, clamp_syn_mss, detect_quic_initial,
-    detect_udp_desync_target, evade_http_request, is_forged_dpi_http_redirect,
-    is_forged_passive_dpi_rst, is_sensitive_unblocked_domain, parse_client_hello_prefix,
-    parse_http_host, parse_ip_packet, parse_tcp, parse_udp, plan_tcp_splits, segment_tcp_packet,
-    DpiStrategy, FakePacketMode, HttpEvasionOptions, IpProtocol, QuicPolicy, TtlCalibrator,
+    build_quic_desync_decoys, build_reassembled_desync_packets, build_turkey_desync_packets,
+    build_udp_desync_decoys, clamp_syn_mss, detect_quic_initial, detect_udp_desync_target,
+    evade_http_request, inspect_client_hello_needs_reassembly, is_forged_dpi_http_redirect,
+    is_forged_passive_dpi_rst, is_sensitive_unblocked_domain, parse_client_hello,
+    parse_client_hello_prefix, parse_http_host, parse_ip_packet, parse_tcp, parse_udp,
+    plan_tcp_splits, segment_tcp_packet, DpiStrategy, FakePacketMode, HttpEvasionOptions,
+    IpProtocol, QuicPolicy, TtlCalibrator,
 };
 use yolac_net::{is_local_lan_ip, CaptivePortalMonitor, FlowOutcome, StrategyAdvisor};
 #[cfg(windows)]
@@ -137,12 +139,32 @@ struct PendingFlow {
     retransmit_count: u8,
 }
 
+#[derive(Debug, Clone)]
+pub enum PqAdvance {
+    Waiting,
+    Ready {
+        template_pkt: Vec<u8>,
+        payload: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PqStreamBuf {
+    start_seq: u32,
+    next_seq: u32,
+    expected_len: usize,
+    template_pkt: Vec<u8>,
+    payload: Vec<u8>,
+    started: Instant,
+}
+
 pub struct FlowTracker {
     hash_builder: RandomState,
     max_entries: usize,
     syn_ack_ttls: Mutex<HashMap<u64, u8>>,
     pending: Mutex<HashMap<u64, PendingFlow>>,
     udp_desynced: Mutex<HashMap<u64, Instant>>,
+    pq_streams: Mutex<HashMap<u64, PqStreamBuf>>,
 }
 
 impl FlowTracker {
@@ -153,6 +175,84 @@ impl FlowTracker {
             syn_ack_ttls: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             udp_desynced: Mutex::new(HashMap::new()),
+            pq_streams: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn begin_pq_stream(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        seq: u32,
+        expected_len: usize,
+        template_pkt: &[u8],
+        first_payload: &[u8],
+    ) -> bool {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        let Ok(mut guard) = self.pq_streams.lock() else {
+            return false;
+        };
+        if let Some(prev) = guard.get(&key) {
+            if prev.start_seq == seq {
+                // Retransmission of initial PQ segment: stop delaying and let normal path send immediately.
+                guard.remove(&key);
+                return false;
+            }
+        }
+        guard.retain(|_, v| v.started.elapsed() < Duration::from_millis(120));
+        if guard.len() >= 64 {
+            if let Some(&evict) = guard.keys().next() {
+                guard.remove(&evict);
+            }
+        }
+        guard.insert(
+            key,
+            PqStreamBuf {
+                start_seq: seq,
+                next_seq: seq.wrapping_add(first_payload.len() as u32),
+                expected_len: expected_len.min(16_389),
+                template_pkt: template_pkt.to_vec(),
+                payload: first_payload.to_vec(),
+                started: Instant::now(),
+            },
+        );
+        true
+    }
+
+    pub fn advance_pq_stream(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        seq: u32,
+        seg: &[u8],
+    ) -> Option<PqAdvance> {
+        let key = self.flow_key(local_port, dst.ip(), dst.port());
+        let mut guard = self.pq_streams.lock().ok()?;
+        let entry = guard.get_mut(&key)?;
+        if entry.started.elapsed() > Duration::from_millis(150) {
+            guard.remove(&key);
+            return None;
+        }
+        if seq != entry.next_seq {
+            guard.remove(&key);
+            return None;
+        }
+        let room = entry.expected_len.saturating_sub(entry.payload.len());
+        if room > 0 {
+            let take = seg.len().min(room);
+            entry.payload.extend_from_slice(&seg[..take]);
+        } else {
+            entry.payload.extend_from_slice(seg);
+        }
+        entry.next_seq = entry.next_seq.wrapping_add(seg.len() as u32);
+        if entry.payload.len() >= entry.expected_len {
+            let finished = guard.remove(&key)?;
+            Some(PqAdvance::Ready {
+                template_pkt: finished.template_pkt,
+                payload: finished.payload,
+            })
+        } else {
+            Some(PqAdvance::Waiting)
         }
     }
 
@@ -352,6 +452,9 @@ impl FlowTracker {
         if let Ok(mut g) = self.udp_desynced.lock() {
             g.clear();
         }
+        if let Ok(mut g) = self.pq_streams.lock() {
+            g.clear();
+        }
     }
 }
 
@@ -392,6 +495,26 @@ mod loader {
         p_send_len: *mut u32,
         p_addr: *const WinDivertAddress,
     ) -> i32;
+    pub type WinDivertRecvExFn = unsafe extern "C" fn(
+        handle: *mut c_void,
+        p_packet: *mut c_void,
+        packet_len: u32,
+        p_recv_len: *mut u32,
+        flags: u64,
+        p_addr: *mut WinDivertAddress,
+        p_addr_len: *mut u32,
+        lp_overlapped: *mut c_void,
+    ) -> i32;
+    pub type WinDivertSendExFn = unsafe extern "C" fn(
+        handle: *mut c_void,
+        p_packet: *const c_void,
+        packet_len: u32,
+        p_send_len: *mut u32,
+        flags: u64,
+        p_addr: *const WinDivertAddress,
+        addr_len: u32,
+        lp_overlapped: *mut c_void,
+    ) -> i32;
     pub type WinDivertHelperCalcChecksumsFn = unsafe extern "C" fn(
         p_packet: *mut c_void,
         packet_len: u32,
@@ -412,7 +535,9 @@ mod loader {
         _integrity_lock: VerifiedWinDivertLock,
         pub open: WinDivertOpenFn,
         pub recv: WinDivertRecvFn,
+        pub recv_ex: Option<WinDivertRecvExFn>,
         pub send: WinDivertSendFn,
+        pub send_ex: Option<WinDivertSendExFn>,
         pub calc_checksums: WinDivertHelperCalcChecksumsFn,
         pub set_param: Option<WinDivertSetParamFn>,
         pub shutdown: WinDivertShutdownFn,
@@ -460,13 +585,21 @@ mod loader {
                 let set_param = GetProcAddress(module, c"WinDivertSetParam".as_ptr().cast()).map(
                     |p| std::mem::transmute::<unsafe extern "system" fn() -> isize, WinDivertSetParamFn>(p),
                 );
+                let recv_ex = GetProcAddress(module, c"WinDivertRecvEx".as_ptr().cast()).map(|p| {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, WinDivertRecvExFn>(p)
+                });
+                let send_ex = GetProcAddress(module, c"WinDivertSendEx".as_ptr().cast()).map(|p| {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, WinDivertSendExFn>(p)
+                });
 
                 Ok(Self {
                     module,
                     _integrity_lock: lock,
                     open: sym!(c"WinDivertOpen", WinDivertOpenFn),
                     recv: sym!(c"WinDivertRecv", WinDivertRecvFn),
+                    recv_ex,
                     send: sym!(c"WinDivertSend", WinDivertSendFn),
+                    send_ex,
                     calc_checksums: sym!(
                         c"WinDivertHelperCalcChecksums",
                         WinDivertHelperCalcChecksumsFn
@@ -557,17 +690,16 @@ impl WindowsPacketEngine {
             (code, detail)
         })?);
 
-        // v0.4.0 ULTRA-FAST ZERO-JITTER KERNEL BYTECODE FILTER:
-        // Matches ONLY TLS ClientHello/ServerHello, HTTP verbs/3xx redirects, DNS (53), QUIC (443),
-        // Discord IP Discovery (74B), STUN Binding (0x2112A442), and Roblox RakNet (0x05 00 FF FF)
-        // inside Windows kernel bytecode — >99.95% of gaming, Discord RTP voice, bulk HTTPS uploads,
-        // and Gigabit download ACKs NEVER leave the Windows kernel!
+        // v0.5.0 ZERO-JITTER KERNEL BYTECODE FILTER:
+        // Captures TLS SYN + ClientHello (including multi-segment Post-Quantum X25519MLKEM768),
+        // HTTP verbs/3xx redirects, DNS (53), rogue DoT (853), QUIC (443), Discord IP Discovery (74B),
+        // STUN Binding (0x2112A442), and Roblox RakNet while keeping download ACKs in kernel!
         let kernel_fast_filter = CString::new(
-            "not loopback and ((outbound and ((tcp.DstPort == 443 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 9 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x01))) or (tcp.DstPort == 80 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 16 and (tcp.Payload[0] == 0x47 or tcp.Payload[0] == 0x50 or tcp.Payload[0] == 0x48 or tcp.Payload[0] == 0x44 or tcp.Payload[0] == 0x4F)))) or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443 or (udp.DstPort >= 10000 and udp.PayloadLength == 74 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[2] == 0x00 and udp.Payload[3] == 0x46) or ((udp.DstPort >= 10000 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599)) and udp.PayloadLength >= 20 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[4] == 0x21 and udp.Payload[5] == 0x12 and udp.Payload[6] == 0xA4 and udp.Payload[7] == 0x42) or (udp.DstPort >= 49152 and udp.PayloadLength >= 17 and udp.Payload[0] == 0x05 and udp.Payload[1] == 0x00 and udp.Payload[2] == 0xFF and udp.Payload[3] == 0xFF and udp.Payload[4] == 0x00 and udp.Payload[5] == 0xFE))) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 6 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x02))) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50 and tcp.Payload[9] == 0x33))))))",
+            "not loopback and ((outbound and ((tcp.DstPort == 443 and ((tcp.Syn and not tcp.Ack) or tcp.PayloadLength > 0)) or (tcp.DstPort == 80 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 16 and (tcp.Payload[0] == 0x47 or tcp.Payload[0] == 0x50 or tcp.Payload[0] == 0x48 or tcp.Payload[0] == 0x44 or tcp.Payload[0] == 0x4F)))) or udp.DstPort == 53 or tcp.DstPort == 53 or tcp.DstPort == 853 or udp.DstPort == 443 or (udp.DstPort >= 10000 and udp.PayloadLength == 74 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[2] == 0x00 and udp.Payload[3] == 0x46) or ((udp.DstPort >= 10000 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599)) and udp.PayloadLength >= 20 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[4] == 0x21 and udp.Payload[5] == 0x12 and udp.Payload[6] == 0xA4 and udp.Payload[7] == 0x42) or (udp.DstPort >= 49152 and udp.PayloadLength >= 17 and udp.Payload[0] == 0x05 and udp.Payload[1] == 0x00 and udp.Payload[2] == 0xFF and udp.Payload[3] == 0xFF and udp.Payload[4] == 0x00 and udp.Payload[5] == 0xFE))) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 6 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x02))) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50 and tcp.Payload[9] == 0x33))))))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert filtre derleme hatası.".into()))?;
         let fallback_filter = CString::new(
-            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or udp.DstPort == 443 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599))) or (inbound and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and (tcp.Syn or tcp.Rst or tcp.Fin)))",
+            "not loopback and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 80 or udp.DstPort == 53 or tcp.DstPort == 53 or tcp.DstPort == 853 or udp.DstPort == 443 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599))) or (inbound and (tcp.SrcPort == 443 or tcp.SrcPort == 80) and (tcp.Syn or tcp.Rst or tcp.Fin)))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert yedek filtre derleme hatası.".into()))?;
 
@@ -653,187 +785,202 @@ impl WindowsPacketEngine {
 
             let send_handle = Arc::new(RwLock::new(raw_handle_addr));
             let dns_sem = Arc::new(tokio::sync::Semaphore::new(64));
-            let mut buf = vec![0u8; 65536];
-            let mut addr = WinDivertAddress::default();
+            let mut batch_buf = vec![0u8; 65_536 * 8];
+            let mut batch_addrs = vec![WinDivertAddress::default(); 16];
+            let mut tx_bytes_buf: Vec<u8> = Vec::with_capacity(65_536);
+            let mut tx_addrs_buf: Vec<WinDivertAddress> = Vec::with_capacity(16);
             let mut recv_len = 0u32;
             let mut unexpected_exit = false;
 
             while !stop_flag.load(Ordering::Relaxed) {
-                let ok = unsafe {
-                    (thread_api.recv)(
-                        raw_handle,
-                        buf.as_mut_ptr().cast(),
-                        buf.len() as u32,
-                        &mut recv_len,
-                        &mut addr,
-                    )
-                };
-                if ok == 0 {
-                    if !stop_flag.load(Ordering::SeqCst) {
-                        unexpected_exit = true;
+                let mut rx_pairs: Vec<(&[u8], WinDivertAddress)> = Vec::new();
+                if let Some(recv_ex) = thread_api.recv_ex {
+                    let mut addr_len_bytes =
+                        (batch_addrs.len() * std::mem::size_of::<WinDivertAddress>()) as u32;
+                    let ok = unsafe {
+                        recv_ex(
+                            raw_handle,
+                            batch_buf.as_mut_ptr().cast(),
+                            batch_buf.len() as u32,
+                            &mut recv_len,
+                            0,
+                            batch_addrs.as_mut_ptr(),
+                            &mut addr_len_bytes,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if ok == 0 {
+                        if !stop_flag.load(Ordering::SeqCst) {
+                            unexpected_exit = true;
+                        }
+                        break;
                     }
-                    break;
+                    let count = (addr_len_bytes as usize)
+                        / std::mem::size_of::<WinDivertAddress>();
+                    rx_pairs = unpack_windivert_batch(
+                        &batch_buf[..recv_len as usize],
+                        &batch_addrs[..count.min(batch_addrs.len())],
+                    );
+                    if rx_pairs.is_empty() && recv_len > 0 {
+                        rx_pairs.push((&batch_buf[..recv_len as usize], batch_addrs[0]));
+                    }
+                } else {
+                    let ok = unsafe {
+                        (thread_api.recv)(
+                            raw_handle,
+                            batch_buf.as_mut_ptr().cast(),
+                            65_536,
+                            &mut recv_len,
+                            &mut batch_addrs[0],
+                        )
+                    };
+                    if ok == 0 {
+                        if !stop_flag.load(Ordering::SeqCst) {
+                            unexpected_exit = true;
+                        }
+                        break;
+                    }
+                    rx_pairs.push((&batch_buf[..recv_len as usize], batch_addrs[0]));
                 }
-                let pkt = &buf[..recv_len as usize];
 
-                // Handle outbound UDP/53 DNS:
-                // 1. Check dst_port == 53 FIRST (zero wasted parsing on non-DNS packets!)
-                // 2. Try synchronous <50µs local blocklist / RAM LRU cache hit before touching Tokio!
-                // 3. Dispatch uncached misses asynchronously with SWR so WinDivertRecv NEVER deadlocks.
-                if addr.is_outbound() {
-                    if let Some(ip) = parse_ip_packet(pkt) {
-                        if ip.protocol == IpProtocol::Udp {
-                            if let Some(udp) = parse_udp(ip.payload) {
-                                if udp.dst_port == 53 {
-                                    let is_local_lan = is_local_lan_ip(ip.dst_ip);
-                                    let is_local_name = is_local_lan
-                                        && parse_dns_query(udp.payload)
-                                            .map(|q| is_local_lan_hostname(&q.qname))
-                                            .unwrap_or(false);
-                                    if !(portal.is_bypass_active() && is_local_lan) && !is_local_name {
-                                        // Ultra-fast synchronous local blocklist / cache hit (<50 µs)
-                                        if let Some((resp_opt, _)) = dns.try_resolve_local(udp.payload) {
-                                            if let Some(resp_wire) = resp_opt {
-                                                if let Some(mut reply_pkt) = build_dns_reply_l3(
-                                                    ip.src_ip,
-                                                    ip.dst_ip,
-                                                    udp.src_port,
-                                                    udp.dst_port,
-                                                    &resp_wire,
-                                                ) {
-                                                    let mut reply_addr = addr;
-                                                    reply_addr.set_inbound();
-                                                    reply_addr.mark_checksums_valid(
-                                                        ip.dst_ip.is_ipv6(),
-                                                        false,
-                                                    );
-                                                    unsafe {
-                                                        let _ = (thread_api.calc_checksums)(
-                                                            reply_pkt.as_mut_ptr().cast(),
-                                                            reply_pkt.len() as u32,
-                                                            &mut reply_addr,
-                                                            0,
-                                                        );
+                let mut batch_tx: Vec<OutgoingPacket> = Vec::with_capacity(rx_pairs.len() * 2);
+
+                for (pkt, addr) in rx_pairs {
+                    // Handle outbound UDP/53 DNS asynchronously with <50us local fast-path
+                    let mut handled_dns = false;
+                    if addr.is_outbound() {
+                        if let Some(ip) = parse_ip_packet(pkt) {
+                            if ip.protocol == IpProtocol::Udp {
+                                if let Some(udp) = parse_udp(ip.payload) {
+                                    if udp.dst_port == 53 {
+                                        let is_local_lan = is_local_lan_ip(ip.dst_ip);
+                                        let is_local_name = is_local_lan
+                                            && parse_dns_query(udp.payload)
+                                                .map(|q| is_local_lan_hostname(&q.qname))
+                                                .unwrap_or(false);
+                                        if !(portal.is_bypass_active() && is_local_lan) && !is_local_name {
+                                            handled_dns = true;
+                                            if let Some((resp_opt, _)) = dns.try_resolve_local(udp.payload) {
+                                                if let Some(resp_wire) = resp_opt {
+                                                    if let Some(reply_pkt) = build_dns_reply_l3(
+                                                        ip.src_ip,
+                                                        ip.dst_ip,
+                                                        udp.src_port,
+                                                        udp.dst_port,
+                                                        &resp_wire,
+                                                    ) {
+                                                        let mut reply_addr = addr;
+                                                        reply_addr.set_inbound();
+                                                        batch_tx.push(OutgoingPacket {
+                                                            bytes: reply_pkt,
+                                                            addr: reply_addr,
+                                                            checksum: ChecksumAction::Recalculate,
+                                                        });
                                                     }
-                                                    if let Ok(guard) = send_handle.read() {
-                                                        if *guard != 0 {
-                                                            let h = *guard as *mut c_void;
-                                                            let mut send_len = 0u32;
-                                                            unsafe {
-                                                                let _ = (thread_api.send)(
-                                                                    h,
-                                                                    reply_pkt.as_mut_ptr().cast(),
-                                                                    reply_pkt.len() as u32,
-                                                                    &mut send_len,
-                                                                    &mut reply_addr,
+                                                }
+                                            } else if let Ok(permit) = Arc::clone(&dns_sem).try_acquire_owned() {
+                                                let dns_c = Arc::clone(&dns);
+                                                let portal_c = Arc::clone(&portal);
+                                                let api_c = Arc::clone(&thread_api);
+                                                let sh_c = Arc::clone(&send_handle);
+                                                let query_bytes = udp.payload.to_vec();
+                                                let src_ip = ip.src_ip;
+                                                let dst_ip = ip.dst_ip;
+                                                let src_port = udp.src_port;
+                                                let dst_port = udp.dst_port;
+                                                let mut reply_addr = addr;
+                                                reply_addr.set_inbound();
+
+                                                rt.spawn(async move {
+                                                    let _permit = permit;
+                                                    let qname = parse_dns_query(&query_bytes).map(|q| q.qname);
+                                                    let (resp_opt, outcome) =
+                                                        dns_c.resolve_with_swr(&query_bytes).await;
+                                                    match outcome {
+                                                        DnsOutcome::UpstreamResolved => {
+                                                            portal_c.on_dns_upstream_success()
+                                                        }
+                                                        DnsOutcome::Failed => {
+                                                            if let Some(name) = qname.as_deref() {
+                                                                portal_c.on_dns_query_and_failure_state(
+                                                                    name,
+                                                                    dns_c.consecutive_failures(),
                                                                 );
                                                             }
                                                         }
+                                                        _ => {}
                                                     }
-                                                }
-                                            }
-                                            continue;
-                                        }
-
-                                        if let Ok(permit) = Arc::clone(&dns_sem).try_acquire_owned() {
-                                            let dns_c = Arc::clone(&dns);
-                                            let portal_c = Arc::clone(&portal);
-                                            let api_c = Arc::clone(&thread_api);
-                                            let sh_c = Arc::clone(&send_handle);
-                                            let query_bytes = udp.payload.to_vec();
-                                            let src_ip = ip.src_ip;
-                                            let dst_ip = ip.dst_ip;
-                                            let src_port = udp.src_port;
-                                            let dst_port = udp.dst_port;
-                                            let mut reply_addr = addr;
-                                            reply_addr.set_inbound();
-
-                                            rt.spawn(async move {
-                                                let _permit = permit;
-                                                let qname = parse_dns_query(&query_bytes).map(|q| q.qname);
-                                                let (resp_opt, outcome) =
-                                                    dns_c.resolve_with_swr(&query_bytes).await;
-                                                match outcome {
-                                                    DnsOutcome::UpstreamResolved => {
-                                                        portal_c.on_dns_upstream_success()
-                                                    }
-                                                    DnsOutcome::Failed => {
-                                                        if let Some(name) = qname.as_deref() {
-                                                            portal_c.on_dns_query_and_failure_state(
-                                                                name,
-                                                                dns_c.consecutive_failures(),
+                                                    if let Some(resp_wire) = resp_opt {
+                                                        if let Some(mut reply_pkt) = build_dns_reply_l3(
+                                                            src_ip, dst_ip, src_port, dst_port, &resp_wire,
+                                                        ) {
+                                                            reply_addr.mark_checksums_valid(
+                                                                dst_ip.is_ipv6(),
+                                                                false,
                                                             );
-                                                        }
-                                                    }
-                                                    _ => {}
-                                                }
-                                                if let Some(resp_wire) = resp_opt {
-                                                    if let Some(mut reply_pkt) = build_dns_reply_l3(
-                                                        src_ip, dst_ip, src_port, dst_port, &resp_wire,
-                                                    ) {
-                                                        reply_addr.mark_checksums_valid(
-                                                            dst_ip.is_ipv6(),
-                                                            false,
-                                                        );
-                                                        unsafe {
-                                                            let _ = (api_c.calc_checksums)(
-                                                                reply_pkt.as_mut_ptr().cast(),
-                                                                reply_pkt.len() as u32,
-                                                                &mut reply_addr,
-                                                                0,
-                                                            );
-                                                        }
-                                                        if let Ok(guard) = sh_c.read() {
-                                                            if *guard != 0 {
-                                                                let h = *guard as *mut c_void;
-                                                                let mut send_len = 0u32;
-                                                                unsafe {
-                                                                    let _ = (api_c.send)(
-                                                                        h,
-                                                                        reply_pkt.as_mut_ptr().cast(),
-                                                                        reply_pkt.len() as u32,
-                                                                        &mut send_len,
-                                                                        &mut reply_addr,
-                                                                    );
+                                                            unsafe {
+                                                                let _ = (api_c.calc_checksums)(
+                                                                    reply_pkt.as_mut_ptr().cast(),
+                                                                    reply_pkt.len() as u32,
+                                                                    &mut reply_addr,
+                                                                    0,
+                                                                );
+                                                            }
+                                                            if let Ok(guard) = sh_c.read() {
+                                                                if *guard != 0 {
+                                                                    let h = *guard as *mut c_void;
+                                                                    let mut send_len = 0u32;
+                                                                    unsafe {
+                                                                        let _ = (api_c.send)(
+                                                                            h,
+                                                                            reply_pkt.as_mut_ptr().cast(),
+                                                                            reply_pkt.len() as u32,
+                                                                            &mut send_len,
+                                                                            &mut reply_addr,
+                                                                        );
+                                                                    }
                                                                 }
                                                             }
                                                         }
                                                     }
-                                                }
-                                            });
+                                                });
+                                            }
                                         }
-                                        continue;
                                     }
                                 }
                             }
                         }
                     }
+                    if !handled_dns {
+                        let processed = process_packet_with_tracker(
+                            pkt,
+                            addr,
+                            &rt,
+                            &dns,
+                            &adaptive,
+                            &calibrator,
+                            &flows,
+                            &portal,
+                        );
+                        batch_tx.extend(processed);
+                    }
                 }
 
-                let processed = process_packet_with_tracker(
-                    pkt,
-                    addr,
-                    &rt,
-                    &dns,
-                    &adaptive,
-                    &calibrator,
-                    &flows,
-                    &portal,
-                );
+                if batch_tx.is_empty() {
+                    continue;
+                }
 
-                for mut out in processed {
+                for out in &mut batch_tx {
                     match out.checksum {
                         ChecksumAction::Passthrough => {}
-                        ChecksumAction::Recalculate => {
-                            unsafe {
-                                let _ = (thread_api.calc_checksums)(
-                                    out.bytes.as_mut_ptr().cast(),
-                                    out.bytes.len() as u32,
-                                    &mut out.addr,
-                                    0,
-                                );
-                            }
-                        }
+                        ChecksumAction::Recalculate => unsafe {
+                            let _ = (thread_api.calc_checksums)(
+                                out.bytes.as_mut_ptr().cast(),
+                                out.bytes.len() as u32,
+                                &mut out.addr,
+                                0,
+                            );
+                        },
                         ChecksumAction::PreserveBadTcpChecksum => {
                             let is_v6 = out.bytes.first().map(|b| (b >> 4) == 6).unwrap_or(false);
                             out.addr.mark_checksums_valid(is_v6, true);
@@ -843,10 +990,38 @@ impl WindowsPacketEngine {
                             out.addr.mark_checksums_valid(is_v6, false);
                         }
                     }
-                    let mut send_len = 0u32;
-                    if let Ok(guard) = send_handle.read() {
-                        if *guard != 0 {
-                            let h = *guard as *mut c_void;
+                }
+
+                if let Ok(guard) = send_handle.read() {
+                    if *guard != 0 {
+                        let h = *guard as *mut c_void;
+                        if let (Some(send_ex), true) = (thread_api.send_ex, batch_tx.len() > 1) {
+                            tx_bytes_buf.clear();
+                            tx_addrs_buf.clear();
+                            for out in &batch_tx {
+                                tx_bytes_buf.extend_from_slice(&out.bytes);
+                                tx_addrs_buf.push(out.addr);
+                            }
+                            let mut send_len = 0u32;
+                            let ok = unsafe {
+                                send_ex(
+                                    h,
+                                    tx_bytes_buf.as_ptr().cast(),
+                                    tx_bytes_buf.len() as u32,
+                                    &mut send_len,
+                                    0,
+                                    tx_addrs_buf.as_ptr(),
+                                    (tx_addrs_buf.len() * std::mem::size_of::<WinDivertAddress>())
+                                        as u32,
+                                    std::ptr::null_mut(),
+                                )
+                            };
+                            if ok != 0 {
+                                continue;
+                            }
+                        }
+                        for out in &mut batch_tx {
+                            let mut send_len = 0u32;
                             unsafe {
                                 let _ = (thread_api.send)(
                                     h,
@@ -937,6 +1112,33 @@ impl Drop for WindowsPacketEngine {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Unpacks concatenated L3 IPv4/IPv6 packets returned by `WinDivertRecvEx` along with their
+/// parallel `WINDIVERT_ADDRESS` slice, cleanly stopping on malformed lengths.
+pub fn unpack_windivert_batch<'a>(
+    buf: &'a [u8],
+    addrs: &[WinDivertAddress],
+) -> Vec<(&'a [u8], WinDivertAddress)> {
+    let mut out = Vec::with_capacity(addrs.len());
+    let mut off = 0usize;
+    for &addr in addrs {
+        if off >= buf.len() {
+            break;
+        }
+        let rem = &buf[off..];
+        let pkt_len = match rem[0] >> 4 {
+            4 if rem.len() >= 20 => u16::from_be_bytes([rem[2], rem[3]]) as usize,
+            6 if rem.len() >= 40 => 40 + u16::from_be_bytes([rem[4], rem[5]]) as usize,
+            _ => break,
+        };
+        if pkt_len == 0 || off + pkt_len > buf.len() {
+            break;
+        }
+        out.push((&buf[off..off + pkt_len], addr));
+        off += pkt_len;
+    }
+    out
 }
 
 /// Pure, cross-platform testable WinDivert packet processor with full FlowTracker feedback,
@@ -1097,6 +1299,24 @@ fn process_inbound_inner(
     }]
 }
 
+#[inline]
+fn passthrough_pkt(bytes: Vec<u8>, addr: WinDivertAddress) -> OutgoingPacket {
+    OutgoingPacket {
+        bytes,
+        addr,
+        checksum: ChecksumAction::Passthrough,
+    }
+}
+
+#[inline]
+fn recalc_pkt(bytes: Vec<u8>, addr: WinDivertAddress) -> OutgoingPacket {
+    OutgoingPacket {
+        bytes,
+        addr,
+        checksum: ChecksumAction::Recalculate,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_outbound_inner(
     pkt: &[u8],
@@ -1109,16 +1329,8 @@ fn process_outbound_inner(
     flows: &FlowTracker,
     portal: &CaptivePortalMonitor,
 ) -> Vec<OutgoingPacket> {
-    let passthrough = |bytes: Vec<u8>, a: WinDivertAddress| OutgoingPacket {
-        bytes,
-        addr: a,
-        checksum: ChecksumAction::Passthrough,
-    };
-    let recalc = |bytes: Vec<u8>, a: WinDivertAddress| OutgoingPacket {
-        bytes,
-        addr: a,
-        checksum: ChecksumAction::Recalculate,
-    };
+    let passthrough = passthrough_pkt;
+    let recalc = recalc_pkt;
 
     match ip.protocol {
         IpProtocol::Udp => {
@@ -1163,14 +1375,40 @@ fn process_outbound_inner(
                 return vec![];
             }
 
-            // 2. QUIC UDP/443 fallback policy (ENABLED BY DEFAULT on Windows -> equivalent to GoodbyeDPI `-q`)
-            //    Forces Chrome/Edge/Brave/Opera immediately onto DPI-protected TCP/443!
-            if udp.dst_port == 443
-                && adaptive.effective_quic_policy(udp.dst_port) == QuicPolicy::BlockFallbackToTcp
-                && !is_local_lan_ip(ip.dst_ip)
-                && (detect_quic_initial(udp.payload).is_some() || !udp.payload.is_empty())
-            {
-                return vec![];
+            // 2. QUIC UDP/443 policy (BlockFallbackToTcp OR selective QuicPolicy::DesyncFragment)
+            if udp.dst_port == 443 && !is_local_lan_ip(ip.dst_ip) {
+                let policy = adaptive.effective_quic_policy(udp.dst_port);
+                if policy == QuicPolicy::BlockFallbackToTcp
+                    && (detect_quic_initial(udp.payload).is_some() || !udp.payload.is_empty())
+                {
+                    return vec![];
+                }
+                if policy == QuicPolicy::DesyncFragment
+                    && detect_quic_initial(udp.payload).is_some()
+                {
+                    let fake_ttl = calibrator
+                        .estimated_hops(ip.dst_ip)
+                        .map(|h| (h / 2).clamp(2, 5))
+                        .unwrap_or(3);
+                    if let Some(decoys) = build_quic_desync_decoys(pkt, fake_ttl) {
+                        let mut burst = Vec::with_capacity(decoys.len() + 1);
+                        for d in decoys {
+                            if d.preserve_bad_udp_checksum {
+                                let mut bad_addr = addr;
+                                bad_addr.mark_checksums_valid(ip.version == 6, false);
+                                burst.push(OutgoingPacket {
+                                    bytes: d.bytes,
+                                    addr: bad_addr,
+                                    checksum: ChecksumAction::PreserveBadUdpChecksum,
+                                });
+                            } else {
+                                burst.push(recalc(d.bytes, addr));
+                            }
+                        }
+                        burst.push(passthrough(pkt.to_vec(), addr));
+                        return burst;
+                    }
+                }
             }
 
             // 3. Single-shot UDP desync for Discord Voice STUN/IP-Discovery, WhatsApp/Telegram STUN & Roblox RakNet
@@ -1220,9 +1458,16 @@ fn process_outbound_inner(
                 return vec![];
             }
 
-            // Let encrypted DoH/DoT bootstrap upstreams pass straight through without double-fragmentation
-            if is_bootstrap_dns_ip(ip.dst_ip) {
+            // Let active/bootstrap DoH/DoT upstreams pass straight through without double-fragmentation,
+            // and block rogue unauthorized DoT (port 853) leaks to third-party IPs.
+            if dns.is_active_upstream_ip(ip.dst_ip) || is_bootstrap_dns_ip(ip.dst_ip) {
                 return vec![passthrough(pkt.to_vec(), addr)];
+            }
+            if tcp.dst_port == 853 {
+                if portal.is_bypass_active() && is_local_lan_ip(ip.dst_ip) {
+                    return vec![passthrough(pkt.to_vec(), addr)];
+                }
+                return vec![];
             }
 
             let dst = SocketAddr::new(ip.dst_ip, tcp.dst_port);
@@ -1247,212 +1492,85 @@ fn process_outbound_inner(
             }
 
             if !tcp.payload.is_empty() {
-                if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
-                    let sni_opt = ch.sni.as_deref();
-                    let is_sensitive = sni_opt.map(is_sensitive_unblocked_domain).unwrap_or(false);
-                    let mut forge_plan = adaptive.select_raw_forge_plan(
-                        MatchProtocol::Tls,
-                        tcp.dst_port,
-                        sni_opt,
-                        tcp.payload.len(),
-                        is_sensitive,
-                        0,
-                    );
-                    let mut strategy = if is_sensitive {
-                        adaptive.select_strategy_with_default(dst, sni_opt, DpiStrategy::Passthrough)
-                    } else {
-                        adaptive.select_strategy(dst, sni_opt)
-                    };
-
-                    // Real silent-blackhole detection using full `ch.record_total_len` (fixes Chrome 131+ PQ!)
-                    if let Some((failed_strategy, prev_forge, retry_n)) = flows.record_client_hello(
+                if tcp.dst_port == 443 {
+                    if let Some(pq_res) = flows.advance_pq_stream(
                         tcp.src_port,
                         dst,
-                        ch.sni.clone(),
-                        (tcp.seq, ch.record_total_len.max(tcp.payload.len())),
-                        strategy,
-                        forge_plan.is_some(),
+                        tcp.seq,
+                        tcp.payload,
                     ) {
-                        if prev_forge {
-                            adaptive.report_forge_outcome(dst, sni_opt, false);
-                            forge_plan = adaptive.select_raw_forge_plan(
-                                MatchProtocol::Tls,
-                                tcp.dst_port,
-                                sni_opt,
-                                tcp.payload.len(),
-                                is_sensitive,
-                                retry_n,
-                            );
-                        } else {
-                            adaptive.report_outcome(
-                                dst,
-                                sni_opt,
-                                failed_strategy,
-                                FlowOutcome::HandshakeTimeout,
-                            );
-                            strategy = adaptive.select_strategy(dst, sni_opt);
-                        }
-                        flows.update_pending_strategy(
-                            tcp.src_port,
-                            dst,
-                            strategy,
-                            forge_plan.is_some(),
-                        );
-                    }
-
-                    // Reuse already-parsed `ch.sni_range` (zero redundant double TLS parsing!)
-                    let sni_mid = if let Some((s, e)) = ch.sni_range {
-                        (s + (e.saturating_sub(s)) / 2).clamp(1, tcp.payload.len().saturating_sub(1).max(1))
-                    } else {
-                        (tcp.payload.len() / 2).max(2)
-                    };
-                    let decoy = build_benign_fake_client_hello("www.iana.org");
-
-                    let emit_desync = |desync: Vec<yolac_dpi::DesyncPacket>| -> Vec<OutgoingPacket> {
-                        desync
-                            .into_iter()
-                            .map(|d| {
-                                if d.preserve_bad_tcp_checksum {
-                                    let mut bad_addr = addr;
-                                    bad_addr.mark_checksums_valid(ip.version == 6, true);
-                                    OutgoingPacket {
-                                        bytes: d.bytes,
-                                        addr: bad_addr,
-                                        checksum: ChecksumAction::PreserveBadTcpChecksum,
+                        match pq_res {
+                            PqAdvance::Waiting => return vec![],
+                            PqAdvance::Ready {
+                                template_pkt,
+                                payload: full_payload,
+                            } => {
+                                if let (Some(tip), Some(ch)) = (
+                                    parse_ip_packet(&template_pkt),
+                                    parse_client_hello(&full_payload),
+                                ) {
+                                    if let Some(ttcp) = parse_tcp(tip.payload) {
+                                        if let Some(out) = desync_tls_hello(
+                                            &template_pkt,
+                                            tip.version == 6,
+                                            tip.dst_ip,
+                                            ttcp.src_port,
+                                            dst,
+                                            ttcp.seq,
+                                            addr,
+                                            &full_payload,
+                                            ch,
+                                            adaptive,
+                                            calibrator,
+                                            flows,
+                                            true,
+                                        ) {
+                                            return out;
+                                        }
                                     }
-                                } else {
-                                    recalc(d.bytes, addr)
                                 }
-                            })
-                            .collect()
-                    };
-
-                    if let Some(ref fplan) = forge_plan {
-                        if !fplan.passthrough {
-                            if let Some(desync) = execute_raw_forge_tcp(
-                                pkt,
-                                sni_mid,
-                                None,
-                                false,
-                                fplan,
-                                calibrator,
-                                ip.dst_ip,
-                            ) {
-                                return emit_desync(desync);
-                            }
-                        }
-                        return vec![passthrough(pkt.to_vec(), addr)];
-                    }
-
-                    match strategy {
-                        DpiStrategy::Passthrough => {}
-                        DpiStrategy::TurkeyDesyncAuto => {
-                            // Safe-First Stage 1 Default (All Turkish ISPs: Vodafone / Türk Telekom / Superonline / Kablonet / TurkNet):
-                            // Uses ONLY 100% server-safe decoys (NEVER exact-seq valid-checksum LowTtl on Stage 1!)
-                            // so asymmetric routes to nearby Istanbul Anycast servers can NEVER corrupt a real TLS handshake:
-                            //   1. Exact-seq BadChecksum (server kernel drops 100% of the time; ISP DPI accepts www.iana.org)
-                            //   2. Calibrated LowTtlWrongSeq (passes home NAT, expires mid-path, RFC 5961 out-of-window even at 1 hop)
-                            //   3. BadChecksumWrongSeq (Vodafone/Superonline `--wrong-seq --wrong-chksum`)
-                            // + 3-segment reverse-order split at offset 2 (`-e 2`) and mid-SNI!
-                            let safe_ttl = calibrator
-                                .estimated_hops(ip.dst_ip)
-                                .map(|h| (h / 2).clamp(2, 5))
-                                .unwrap_or(3);
-                            let fakes = [
-                                FakePacketMode::BadChecksum,
-                                FakePacketMode::LowTtlWrongSeq(safe_ttl),
-                                FakePacketMode::BadChecksumWrongSeq,
-                            ];
-                            if let Some(desync) = build_turkey_desync_packets(
-                                pkt,
-                                &[2, sni_mid],
-                                &fakes,
-                                &decoy,
-                                true,
-                            ) {
-                                return emit_desync(desync);
-                            }
-                        }
-                        DpiStrategy::TurkeyDesyncSuperonline => {
-                            // Stage 2 (Vodafone / Superonline strict escalation):
-                            // Quad decoy (LowTtlWrongSeq(2), LowTtlWrongSeq(5), exact-seq BadChecksum, BadChecksumWrongSeq)
-                            // + 1-byte leading reverse-frag split (`-e 1` + mid-SNI)!
-                            let fakes = [
-                                FakePacketMode::LowTtlWrongSeq(2),
-                                FakePacketMode::LowTtlWrongSeq(5),
-                                FakePacketMode::BadChecksum,
-                                FakePacketMode::BadChecksumWrongSeq,
-                            ];
-                            if let Some(desync) = build_turkey_desync_packets(
-                                pkt,
-                                &[1, sni_mid],
-                                &fakes,
-                                &decoy,
-                                true,
-                            ) {
-                                return emit_desync(desync);
-                            }
-                        }
-                        DpiStrategy::TurkeyDesyncAggressive => {
-                            // Stage 3 (Ultra-strict fallback):
-                            // Calibrated server-safe decoy + LowTtlWrongSeq(6) + BadChecksum + BadChecksumWrongSeq + 4-piece disordered split!
-                            let cal_mode = calibrator.recommended_fake_mode(ip.dst_ip, 3);
-                            let fakes = [
-                                cal_mode,
-                                FakePacketMode::LowTtlWrongSeq(6),
-                                FakePacketMode::BadChecksum,
-                                FakePacketMode::BadChecksumWrongSeq,
-                            ];
-                            if let Some(desync) = build_turkey_desync_packets(
-                                pkt,
-                                &[1, 2, sni_mid],
-                                &fakes,
-                                &decoy,
-                                true,
-                            ) {
-                                return emit_desync(desync);
-                            }
-                        }
-                        DpiStrategy::TlsRecordSplit
-                        | DpiStrategy::TcpSniSplit
-                        | DpiStrategy::TlsAndTcpSplit
-                        | DpiStrategy::TlsMultiRecordAndTcpSplit
-                        | DpiStrategy::TcpOobAndTlsSplit
-                        | DpiStrategy::TlsSmallChunks => {
-                            if let Some((p1, p2)) = segment_tcp_packet(pkt, sni_mid) {
-                                return vec![recalc(p1, addr), recalc(p2, addr)];
-                            }
-                        }
-                        DpiStrategy::RawDisorder => {
-                            if let Some(plan) = build_disorder_and_fake_packets(pkt, sni_mid, None) {
-                                return plan.packets.into_iter().map(|p| recalc(p, addr)).collect();
-                            }
-                        }
-                        DpiStrategy::RawFakeTtl { ttl } => {
-                            let mode = calibrator.recommended_fake_mode(ip.dst_ip, ttl);
-                            if let Some(desync) = build_turkey_desync_packets(
-                                pkt,
-                                &[sni_mid],
-                                &[mode],
-                                &decoy,
-                                true,
-                            ) {
-                                return emit_desync(desync);
-                            }
-                        }
-                        DpiStrategy::RawBadChecksum => {
-                            if let Some(desync) = build_turkey_desync_packets(
-                                pkt,
-                                &[sni_mid],
-                                &[FakePacketMode::BadChecksum],
-                                &decoy,
-                                true,
-                            ) {
-                                return emit_desync(desync);
+                                return vec![passthrough(pkt.to_vec(), addr)];
                             }
                         }
                     }
-                    let _ = ch;
+
+                    if let Some(expected_len) = inspect_client_hello_needs_reassembly(tcp.payload) {
+                        let missing_sni = parse_client_hello_prefix(tcp.payload)
+                            .map(|c| c.sni.is_none())
+                            .unwrap_or(true);
+                        if missing_sni
+                            && flows.begin_pq_stream(
+                                tcp.src_port,
+                                dst,
+                                tcp.seq,
+                                expected_len,
+                                pkt,
+                                tcp.payload,
+                            )
+                        {
+                            return vec![];
+                        }
+                    }
+                }
+
+                if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
+                    if let Some(out) = desync_tls_hello(
+                        pkt,
+                        ip.version == 6,
+                        ip.dst_ip,
+                        tcp.src_port,
+                        dst,
+                        tcp.seq,
+                        addr,
+                        tcp.payload,
+                        ch,
+                        adaptive,
+                        calibrator,
+                        flows,
+                        false,
+                    ) {
+                        return out;
+                    }
                 } else if let Some(http_info) = parse_http_host(tcp.payload) {
                     let is_sensitive = is_sensitive_unblocked_domain(&http_info.host);
                     let host_mid = http_info.host_range.0
@@ -1557,6 +1675,200 @@ fn process_outbound_inner(
     }
 
     vec![passthrough(pkt.to_vec(), addr)]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn desync_tls_hello(
+    base_pkt: &[u8],
+    is_v6: bool,
+    dst_ip: IpAddr,
+    tcp_src_port: u16,
+    dst: SocketAddr,
+    tcp_seq: u32,
+    addr: WinDivertAddress,
+    ch_payload: &[u8],
+    ch: yolac_dpi::ClientHelloInfo,
+    adaptive: &AdaptiveController,
+    calibrator: &TtlCalibrator,
+    flows: &FlowTracker,
+    is_reassembled: bool,
+) -> Option<Vec<OutgoingPacket>> {
+    let sni_opt = ch.sni.as_deref();
+    let is_sensitive = sni_opt.map(is_sensitive_unblocked_domain).unwrap_or(false);
+    let mut forge_plan = adaptive.select_raw_forge_plan(
+        MatchProtocol::Tls,
+        dst.port(),
+        sni_opt,
+        ch_payload.len(),
+        is_sensitive,
+        0,
+    );
+    let mut strategy = if is_sensitive {
+        adaptive.select_strategy_with_default(dst, sni_opt, DpiStrategy::Passthrough)
+    } else {
+        adaptive.select_strategy(dst, sni_opt)
+    };
+
+    if let Some((failed_strategy, prev_forge, retry_n)) = flows.record_client_hello(
+        tcp_src_port,
+        dst,
+        ch.sni.clone(),
+        (tcp_seq, ch.record_total_len.max(ch_payload.len())),
+        strategy,
+        forge_plan.is_some(),
+    ) {
+        if prev_forge {
+            adaptive.report_forge_outcome(dst, sni_opt, false);
+            forge_plan = adaptive.select_raw_forge_plan(
+                MatchProtocol::Tls,
+                dst.port(),
+                sni_opt,
+                ch_payload.len(),
+                is_sensitive,
+                retry_n,
+            );
+        } else {
+            adaptive.report_outcome(dst, sni_opt, failed_strategy, FlowOutcome::HandshakeTimeout);
+            strategy = adaptive.select_strategy(dst, sni_opt);
+        }
+        flows.update_pending_strategy(tcp_src_port, dst, strategy, forge_plan.is_some());
+    }
+
+    let sni_mid = if let Some((s, e)) = ch.sni_range {
+        (s + (e.saturating_sub(s)) / 2).clamp(1, ch_payload.len().saturating_sub(1).max(1))
+    } else {
+        (ch_payload.len() / 2).max(2)
+    };
+    let decoy = build_benign_fake_client_hello("www.iana.org");
+
+    let emit_desync = |desync: Vec<yolac_dpi::DesyncPacket>| -> Vec<OutgoingPacket> {
+        desync
+            .into_iter()
+            .map(|d| {
+                if d.preserve_bad_tcp_checksum {
+                    let mut bad_addr = addr;
+                    bad_addr.mark_checksums_valid(is_v6, true);
+                    OutgoingPacket {
+                        bytes: d.bytes,
+                        addr: bad_addr,
+                        checksum: ChecksumAction::PreserveBadTcpChecksum,
+                    }
+                } else {
+                    recalc_pkt(d.bytes, addr)
+                }
+            })
+            .collect()
+    };
+
+    let build_segments = |split_points: &[usize],
+                          fakes: &[FakePacketMode],
+                          reverse: bool|
+     -> Option<Vec<yolac_dpi::DesyncPacket>> {
+        if is_reassembled {
+            build_reassembled_desync_packets(
+                base_pkt,
+                ch_payload,
+                split_points,
+                fakes,
+                &decoy,
+                reverse,
+                1380,
+            )
+        } else {
+            build_turkey_desync_packets(base_pkt, split_points, fakes, &decoy, reverse)
+        }
+    };
+
+    if let Some(ref fplan) = forge_plan {
+        if !fplan.passthrough {
+            if !is_reassembled {
+                if let Some(desync) = execute_raw_forge_tcp(
+                    base_pkt,
+                    sni_mid,
+                    None,
+                    false,
+                    fplan,
+                    calibrator,
+                    dst_ip,
+                ) {
+                    return Some(emit_desync(desync));
+                }
+            } else if let Some(desync) = build_segments(&[2, sni_mid], &[FakePacketMode::BadChecksum], true) {
+                return Some(emit_desync(desync));
+            }
+        }
+        return (!is_reassembled).then(|| vec![passthrough_pkt(base_pkt.to_vec(), addr)]);
+    }
+
+    match strategy {
+        DpiStrategy::Passthrough => {
+            if is_reassembled {
+                return build_segments(&[ch_payload.len().min(1380)], &[], false).map(emit_desync);
+            }
+            None
+        }
+        DpiStrategy::TurkeyDesyncAuto => {
+            let safe_ttl = calibrator
+                .estimated_hops(dst_ip)
+                .map(|h| (h / 2).clamp(2, 5))
+                .unwrap_or(3);
+            let fakes = [
+                FakePacketMode::BadChecksum,
+                FakePacketMode::LowTtlWrongSeq(safe_ttl),
+                FakePacketMode::BadChecksumWrongSeq,
+            ];
+            build_segments(&[2, sni_mid], &fakes, true).map(emit_desync)
+        }
+        DpiStrategy::TurkeyDesyncSuperonline => {
+            let fakes = [
+                FakePacketMode::LowTtlWrongSeq(2),
+                FakePacketMode::LowTtlWrongSeq(5),
+                FakePacketMode::BadChecksum,
+                FakePacketMode::BadChecksumWrongSeq,
+                FakePacketMode::BadTcpTimestamp,
+            ];
+            build_segments(&[1, sni_mid], &fakes, true).map(emit_desync)
+        }
+        DpiStrategy::TurkeyDesyncAggressive => {
+            let cal_mode = calibrator.recommended_fake_mode(dst_ip, 3);
+            let fakes = [
+                cal_mode,
+                FakePacketMode::LowTtlWrongSeq(6),
+                FakePacketMode::BadChecksum,
+                FakePacketMode::BadChecksumWrongSeq,
+                FakePacketMode::BadTcpTimestamp,
+            ];
+            build_segments(&[1, 2, sni_mid], &fakes, true).map(emit_desync)
+        }
+        DpiStrategy::TlsRecordSplit
+        | DpiStrategy::TcpSniSplit
+        | DpiStrategy::TlsAndTcpSplit
+        | DpiStrategy::TlsMultiRecordAndTcpSplit
+        | DpiStrategy::TcpOobAndTlsSplit
+        | DpiStrategy::TlsSmallChunks => {
+            if is_reassembled {
+                build_segments(&[sni_mid], &[], false).map(emit_desync)
+            } else {
+                segment_tcp_packet(base_pkt, sni_mid)
+                    .map(|(p1, p2)| vec![recalc_pkt(p1, addr), recalc_pkt(p2, addr)])
+            }
+        }
+        DpiStrategy::RawDisorder => {
+            if is_reassembled {
+                build_segments(&[sni_mid], &[], true).map(emit_desync)
+            } else {
+                build_disorder_and_fake_packets(base_pkt, sni_mid, None)
+                    .map(|plan| plan.packets.into_iter().map(|p| recalc_pkt(p, addr)).collect())
+            }
+        }
+        DpiStrategy::RawFakeTtl { ttl } => {
+            let mode = calibrator.recommended_fake_mode(dst_ip, ttl);
+            build_segments(&[sni_mid], &[mode], true).map(emit_desync)
+        }
+        DpiStrategy::RawBadChecksum => {
+            build_segments(&[sni_mid], &[FakePacketMode::BadChecksum], true).map(emit_desync)
+        }
+    }
 }
 
 fn is_bootstrap_dns_ip(ip: IpAddr) -> bool {
@@ -2111,5 +2423,165 @@ mod tests {
         out_addr.set_outbound();
         let out = process_outbound_packet(&pkt, out_addr, &rt, &dns, &adaptive);
         assert!(out.len() >= 4, "Forge turkey-balanced must emit decoys+segments on Windows");
+    }
+
+    #[test]
+    fn unpacks_windivert_batch_packets_cleanly() {
+        let p1 = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(1, 1, 1, 1),
+            55001,
+            443,
+            64,
+            b"abc",
+        );
+        let p2 = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(9, 9, 9, 9),
+            55002,
+            443,
+            64,
+            b"hello!",
+        );
+        let mut concat = Vec::new();
+        concat.extend_from_slice(&p1);
+        concat.extend_from_slice(&p2);
+        let mut a1 = WinDivertAddress::default();
+        a1.set_outbound();
+        let a2 = WinDivertAddress::default();
+        let unpacked = unpack_windivert_batch(&concat, &[a1, a2]);
+        assert_eq!(unpacked.len(), 2);
+        assert_eq!(unpacked[0].0, p1.as_slice());
+        assert!(unpacked[0].1.is_outbound());
+        assert_eq!(unpacked[1].0, p2.as_slice());
+        assert!(!unpacked[1].1.is_outbound());
+    }
+
+    #[test]
+    fn reassembles_pq_two_segment_client_hello_and_supports_quic_desync_and_853_guard() {
+        let (rt, dns, adaptive) = test_runtime_and_engines(DpiStrategy::TurkeyDesyncAuto);
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+        let portal = CaptivePortalMonitor::default();
+        let mut out_addr = WinDivertAddress::default();
+        out_addr.set_outbound();
+
+        // Build ~1700-byte Post-Quantum ClientHello with X25519MLKEM768 dummy key_share BEFORE SNI
+        let sni = "pq.discord.com";
+        let sni_bytes = sni.as_bytes();
+        let ks_len = 1380usize;
+        let name_entry_len = 1 + 2 + sni_bytes.len();
+        let sni_ext_len = 2 + name_entry_len;
+        let exts_len = 4 + ks_len + 4 + sni_ext_len;
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x33u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(exts_len as u16).to_be_bytes());
+        body.extend_from_slice(&0x0033u16.to_be_bytes());
+        body.extend_from_slice(&(ks_len as u16).to_be_bytes());
+        body.extend_from_slice(&vec![0x77u8; ks_len]);
+        body.extend_from_slice(&0x0000u16.to_be_bytes());
+        body.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+        body.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
+        body.push(0x00);
+        body.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        body.extend_from_slice(sni_bytes);
+        let hs_len = body.len();
+        let mut full_ch = vec![0x16, 0x03, 0x01];
+        full_ch.extend_from_slice(&((4 + hs_len) as u16).to_be_bytes());
+        full_ch.push(0x01);
+        full_ch.extend_from_slice(&[(hs_len >> 16) as u8, (hs_len >> 8) as u8, hs_len as u8]);
+        full_ch.extend_from_slice(&body);
+
+        let split = 1400usize;
+        let seg1_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(162, 159, 130, 234),
+            56301,
+            443,
+            10_000,
+            5_000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &full_ch[..split],
+        );
+        let seg2_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(162, 159, 130, 234),
+            56301,
+            443,
+            10_000 + split as u32,
+            5_000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            2,
+            &[],
+            &full_ch[split..],
+        );
+
+        let r1 = process_packet_with_tracker(&seg1_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert!(r1.is_empty(), "PQ Seg 1 without SNI must be held briefly for Seg 2");
+
+        let r2 = process_packet_with_tracker(&seg2_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert!(r2.len() >= 5, "PQ Seg 2 completion must emit decoys + MTU-safe SNI-split burst");
+        for out in &r2 {
+            assert!(out.bytes.len() <= 1460, "Reassembled segments must respect MTU ceiling");
+        }
+
+        // Verify unauthorized port 853 DoT is dropped while active upstream IP passes
+        let dot_rogue = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(198, 51, 100, 53),
+            56302,
+            853,
+            1,
+            1,
+            ParsedTcp::SYN,
+            65535,
+            64,
+            1,
+            &[],
+            &[],
+        );
+        assert!(process_packet_with_tracker(&dot_rogue, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal).is_empty());
+
+        let dot_trusted = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(1, 1, 1, 1),
+            56303,
+            853,
+            1,
+            1,
+            ParsedTcp::SYN,
+            65535,
+            64,
+            1,
+            &[],
+            &[],
+        );
+        assert_eq!(process_packet_with_tracker(&dot_trusted, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal).len(), 1);
+
+        // Verify QuicPolicy::DesyncFragment emits QUIC decoy burst + passthrough
+        adaptive.set_quic_policy(QuicPolicy::DesyncFragment);
+        let mut quic_init = vec![0u8; 1200];
+        quic_init[0] = 0xC3;
+        quic_init[1..5].copy_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        let quic_pkt = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(162, 159, 130, 234),
+            56304,
+            443,
+            64,
+            &quic_init,
+        );
+        let q_out = process_packet_with_tracker(&quic_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(q_out.len(), 3, "DesyncFragment must emit LowTtl + BadCsum QUIC decoys + real packet");
+        assert_eq!(q_out[1].checksum, ChecksumAction::PreserveBadUdpChecksum);
     }
 }

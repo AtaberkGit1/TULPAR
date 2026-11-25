@@ -60,4 +60,16 @@ object YolacNative {
 
     @JvmStatic
     external fun nativeGetForgeStatusJson(): String
+
+    @JvmStatic
+    external fun nativeSetDnsProfileJson(spec: String): String
+
+    @JvmStatic
+    external fun nativeSetQuicPolicy(mode: Int)
+
+    @JvmStatic
+    external fun nativeSetUserRulesJson(rulesJson: String): Boolean
+
+    @JvmStatic
+    external fun nativeDiagnoseDomainJson(domain: String): String
 }

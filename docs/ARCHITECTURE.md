@@ -15,11 +15,11 @@ core/
 ├── Cargo.toml
 └── crates/
     ├── yolac-dpi        # IP/TCP/UDP/TLS/HTTP/QUIC parsing + DPI circumvention transforms
-    ├── yolac-blocklist  # Contiguous arena suffix blocklist (ads, trackers, malware)
-    ├── yolac-dns        # RFC1035 wire parser, poisoning detection, CNAME uncloaking, DoH/DoT, RAM LRU
-    ├── yolac-net        # Userspace smoltcp L3 TUN engine, DPI TCP relay, UDP NAT, LeakGuard
-    ├── yolac-core       # YolacEngine orchestrator, AdaptiveController, HealthMonitor, ForgeRuntime
-    ├── yolac-ffi        # Panic-safe Android JNI bindings (+ C-ABI & Forge package loader)
+    ├── yolac-blocklist  # Contiguous arena suffix blocklist + runtime custom allow/block overlays
+    ├── yolac-dns        # RFC1035 wire parser, RFC9460 HTTPS ipv6hint strip, selectable DoH/DoT profiles, CNAME uncloaking, RAM LRU
+    ├── yolac-net        # Batched smoltcp L3 TUN engine, DPI TCP relay, UDP NAT, LeakGuard
+    ├── yolac-core       # YolacEngine orchestrator, AdaptiveController, live diagnostics & Domain Doctor, 7-module HealthMonitor, updater
+    ├── yolac-ffi        # Panic-safe Android JNI bindings (+ C-ABI DNS/QUIC/rules/doctor setters)
     └── yolac-cli        # Diagnostic & verification CLI
 forge/                   # TULPAR Forge: Safe strategy DSL, .tulpar format, verifier, local lab & CLI
 ```
@@ -51,27 +51,26 @@ Android prohibits raw IP packet spoofing in unprivileged apps and provides a Lay
 ```
 
 ### 3.2 Windows (`WinDivert 2.2` Kernel Packet Filter)
-On Windows, an elevated process intercepts targeted L3/L4 packets via SHA-256-verified `WinDivert.dll` + `WinDivert64.sys`:
+On Windows, an elevated process intercepts targeted L3/L4 packets using SHA-256-verified `WinDivert.dll` + `WinDivert64.sys` with optional `WinDivertRecvEx`/`WinDivertSendEx` batching:
 
 ```
 [Windows Network Stack]
-     │  Targeted IPv4/IPv6 packets (TCP 80/443, UDP 53/443/custom game ranges)
+     │  Targeted IPv4/IPv6 packets (TCP 80/443/853, UDP 53/443/custom game ranges)
      ▼
 [WinDivert Kernel Driver]
      │
      ▼
 [platforms/windows :: WinDivertEngine]
-     ├── UDP/53 ──► [yolac-dns] ─► Craft & inject inbound DNS response packet directly (zero ISP leak)
-     ├── UDP/443 (QUIC) ─► [yolac-dpi::quic] ─► Desync or drop for TCP fallback
-     └── TCP 80/443 ─► [yolac-dpi]
-                         ├── TLS Record Fragmentation + TCP Segmentation (SNI midpoint)
-                         ├── Out-of-Order Segment Transmission (Disorder)
-                         ├── Low-TTL / Bad-Checksum Decoy ClientHello Injection
-                         └── HTTP Host Split
+     ├── UDP/53 & TCP/853 ──► [yolac-dns] ─► Inject inbound encrypted reply or drop third-party DoT/53
+     ├── UDP/443 (QUIC) ──► [yolac-dpi::quic] ─► Drop for TCP fallback, DesyncFragment decoys, or Allow
+     └── TCP 80/443 ──► [yolac-dpi]
+                         ├── Post-Quantum multi-segment ClientHello RAM reassembly + MTU-safe SNI split
+                         ├── Out-of-Order (Disorder) TCP transmission + Low-TTL / Bad-Checksum / Bad-Timestamp decoys
+                         └── HTTP Host Split & Header Case Evasion
 ```
 
 ### 3.3 Linux (`platforms/linux` — Netlink `NFQUEUE` + `IPPROTO_RAW`)
-On Linux, `tulpar` runs as a static zero-dependency binary (`CAP_NET_ADMIN` / `root`) using fail-open `NFQUEUE` (`--queue-bypass`), `SO_MARK` loop protection (`SO_MARK = 0x54554C50`), raw socket re-injection, and a local encrypted DNS proxy (`:5354`) with `nftables` / `iptables` fallback.
+On Linux, `tulpar` runs as a static zero-dependency binary (`root` or `CAP_NET_ADMIN` + `CAP_NET_RAW`) using fail-open `NFQUEUE` (`--queue-bypass`), `SO_MARK` loop protection (`SO_MARK = 0x54554C50`), raw socket re-injection (including PQ ClientHello reassembly, QUIC `DesyncFragment`, and rogue `TCP/853` drop), and a local encrypted DNS proxy (`:5354`) with `nftables` + `iptables`/`ip6tables` fallback.
 
 ---
 

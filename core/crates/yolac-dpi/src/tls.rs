@@ -43,6 +43,21 @@ pub fn parse_client_hello_prefix(data: &[u8]) -> Option<ClientHelloInfo> {
     parse_client_hello_inner(data, true)
 }
 
+/// Returns `Some(expected_record_total_len)` when `data` begins a valid TLS ClientHello record
+/// (`0x16 0x03 0x00..=0x04 ... 0x01`) whose bytes exceed `data.len()`, indicating that follow-on
+/// TCP segments are needed to complete a Post-Quantum (`X25519MLKEM768`) ClientHello reassembly.
+pub fn inspect_client_hello_needs_reassembly(data: &[u8]) -> Option<usize> {
+    if data.len() < 9 || data[0] != 0x16 || !is_valid_tls_record_version([data[1], data[2]]) {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    if !(4..=16384).contains(&record_len) || data[5] != 0x01 {
+        return None;
+    }
+    let total = 5 + record_len;
+    (data.len() < total).then_some(total)
+}
+
 fn parse_client_hello_inner(data: &[u8], allow_truncated: bool) -> Option<ClientHelloInfo> {
     // TLS record header: 1 byte type (0x16 Handshake), 2 bytes version, 2 bytes length
     if data.len() < 9 || data[0] != 0x16 {
@@ -502,5 +517,54 @@ pub(crate) mod tests {
         assert_eq!(info.sni.as_deref(), Some("pq-censored.example.org"));
         let (s, e) = info.sni_range.unwrap();
         assert_eq!(&first_mss_segment[s..e], b"pq-censored.example.org");
+    }
+
+    #[test]
+    fn pq_client_hello_with_sni_in_second_segment_signals_reassembly() {
+        let sni_bytes = b"second-seg.example.com";
+        let name_entry_len = 1 + 2 + sni_bytes.len();
+        let sni_ext_data_len = 2 + name_entry_len;
+        let pq_key_share_len = 1520usize;
+        let extensions_len = (4 + pq_key_share_len) + (4 + sni_ext_data_len);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0xAA; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        body.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+        // Permutation: key_share first pushes SNI past 1460-byte TCP MSS
+        body.extend_from_slice(&0x0033u16.to_be_bytes());
+        body.extend_from_slice(&(pq_key_share_len as u16).to_be_bytes());
+        body.resize(body.len() + pq_key_share_len, 0x33);
+        body.extend_from_slice(&0x0000u16.to_be_bytes());
+        body.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+        body.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        body.extend_from_slice(sni_bytes);
+
+        let hs_len = body.len();
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&((4 + hs_len) as u16).to_be_bytes());
+        rec.push(0x01);
+        rec.push(((hs_len >> 16) & 0xFF) as u8);
+        rec.push(((hs_len >> 8) & 0xFF) as u8);
+        rec.push((hs_len & 0xFF) as u8);
+        rec.extend_from_slice(&body);
+
+        let seg1 = &rec[..1460];
+        let seg2 = &rec[1460..];
+        let partial = parse_client_hello_prefix(seg1).unwrap();
+        assert!(partial.sni.is_none());
+        assert_eq!(inspect_client_hello_needs_reassembly(seg1), Some(rec.len()));
+
+        let combined = [seg1, seg2].concat();
+        assert_eq!(inspect_client_hello_needs_reassembly(&combined), None);
+        let full = parse_client_hello(&combined).unwrap();
+        assert_eq!(full.sni.as_deref(), Some("second-seg.example.com"));
+        let (s, e) = full.sni_range.unwrap();
+        assert!(s > 1460 && &combined[s..e] == sni_bytes);
     }
 }
