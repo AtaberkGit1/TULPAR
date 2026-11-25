@@ -1,0 +1,82 @@
+# High-resilience escalation preset for strict stateful deep-packet inspectors.
+strategy "strict-isp-desync" {
+  version = "1.0.0"
+  author = "TULPAR Contributors"
+  description = "Multi-stage TLS/HTTP/QUIC/UDP desync profile for strict stateful ISP DPI"
+  min_core_version = "0.4.0"
+  requires_raw_fallback = "auto_degrade"
+
+  rollback {
+    max_consecutive_failures = 5
+    min_samples = 8
+    max_failure_pct = 70
+  }
+
+  rule tls_stage_0 {
+    priority = 100
+    match proto == tls, port in [443, 8443, 2053, 2083, 2087, 2096]
+    raw_actions {
+      tcp_split = [1, 2, sni_mid]
+      disorder = true
+      decoy_sni = "www.iana.org"
+      decoys = [low_ttl_wrong_seq(2), bad_checksum, bad_checksum_wrong_seq]
+    }
+    socket_actions {
+      tls_record = small_chunks(20)
+      paced_flush = true
+    }
+  }
+
+  rule tls_stage_retry {
+    priority = 95
+    when on_retry >= 1
+    match proto == tls, port == 443
+    raw_actions {
+      tcp_split = [1, 2, sni_mid]
+      disorder = true
+      decoy_sni = "www.iana.org"
+      decoys = [low_ttl_wrong_seq(3), low_ttl_wrong_seq(6), bad_checksum, bad_checksum_wrong_seq]
+      syn_mss_clamp = 536
+    }
+    socket_actions {
+      tls_record = small_chunks(16)
+      tcp_oob = true
+    }
+  }
+
+  rule http_strict {
+    priority = 80
+    match proto == http, port in [80, 8080]
+    raw_actions {
+      http_split_host = true
+      http_host_case = true
+      tcp_split = [2, host_mid]
+      disorder = true
+      decoy_sni = "www.iana.org"
+      decoys = [low_ttl_wrong_seq(3), bad_checksum_wrong_seq]
+    }
+    socket_actions {
+      http_split_host = true
+      http_host_case = true
+      tcp_split = [2, host_mid]
+    }
+  }
+
+  rule quic_strict {
+    priority = 70
+    match proto == quic, port == 443
+    quic_mode = block_fallback_tcp
+  }
+
+  rule udp_voice_game {
+    priority = 65
+    match proto in [udp_stun, udp_raknet]
+    udp_desync_ttl = 3
+    udp_bad_checksum_decoy = true
+  }
+
+  lab_assert {
+    expect_pass = [shallow_sni_reset, stateful_sni_reassembly, hop_sensitive_inline_dpi, passive_optical_rst, http_host_block, quic_throttle, protocol_throttler]
+    expect_honest_unbypassable = [hard_ip_blackhole]
+  }
+}

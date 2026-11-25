@@ -3,7 +3,7 @@ name = "yolac-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Minimal YOLAÇ diagnostic & verification CLI"
+description = "Minimal TULPAR diagnostic & verification CLI"
 
 [dependencies]
 tokio.workspace = true

@@ -54,7 +54,22 @@ pub struct AppController {
 
 impl AppController {
     pub fn new() -> Self {
+        Self::new_with_strategy(None)
+    }
+
+    pub fn new_with_strategy(strategy_path: Option<&std::path::Path>) -> Self {
         let engine = Arc::new(YolacEngine::new(YolacConfig::windows_desktop(), None));
+        if let Some(p) = strategy_path {
+            let _ = engine.load_forge_package_file(p);
+        } else if let Ok(prog_data) = std::env::var("ProgramData") {
+            let active = std::path::Path::new(&prog_data)
+                .join("Tulpar")
+                .join("strategies")
+                .join("active.tulpar");
+            if active.is_file() {
+                let _ = engine.load_forge_package_file(&active);
+            }
+        }
         let initial_screen = if is_security_warning_acked() {
             Screen::Main
         } else {
@@ -478,7 +493,7 @@ fn mark_security_warning_acked() {
 }
 
 #[cfg(windows)]
-pub fn run_win32_ui(autostart: bool) {
+pub fn run_win32_ui(autostart: bool, strategy_path: Option<PathBuf>) {
     use std::sync::atomic::AtomicU32;
     use std::sync::OnceLock;
     use windows_sys::Win32::Foundation::{
@@ -530,7 +545,9 @@ pub fn run_win32_ui(autostart: bool) {
     static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
     static SINGLE_INSTANCE_MUTEX: Mutex<usize> = Mutex::new(0);
 
-    let controller = CTRL.get_or_init(|| Arc::new(AppController::new())).clone();
+    let controller = CTRL
+        .get_or_init(|| Arc::new(AppController::new_with_strategy(strategy_path.as_deref())))
+        .clone();
 
     fn release_single_instance_mutex() {
         if let Ok(mut g) = SINGLE_INSTANCE_MUTEX.lock() {
@@ -629,15 +646,20 @@ pub fn run_win32_ui(autostart: bool) {
         content_height: i32,
     }
 
-    fn compute_settings_layout(
-        w: i32,
-        dpi: i32,
-        scroll_y: i32,
+    #[derive(Clone, Copy)]
+    struct SettingsContentFlags {
         has_errors: bool,
         has_selected: bool,
         has_diag: bool,
         has_opt_msg: bool,
         has_update_msg: bool,
+    }
+
+    fn compute_settings_layout(
+        w: i32,
+        dpi: i32,
+        scroll_y: i32,
+        flags: SettingsContentFlags,
     ) -> SettingsLayout {
         let pad = sc(24, dpi);
         let right = (w - pad).max(pad + sc(180, dpi));
@@ -670,7 +692,7 @@ pub fn run_win32_ui(autostart: bool) {
         }
 
         let mut y = icon_y + icon_size + sc(14, dpi);
-        let error_rc = if has_errors {
+        let error_rc = if flags.has_errors {
             let h = sc(78, dpi);
             let r = RECT {
                 left: pad,
@@ -684,7 +706,7 @@ pub fn run_win32_ui(autostart: bool) {
             None
         };
 
-        let selected_rc = if has_selected {
+        let selected_rc = if flags.has_selected {
             let h = sc(46, dpi);
             let r = RECT {
                 left: pad,
@@ -710,7 +732,7 @@ pub fn run_win32_ui(autostart: bool) {
         };
         y += btn_h + sc(6, dpi);
 
-        let diag_text_rc = if has_diag {
+        let diag_text_rc = if flags.has_diag {
             let h = sc(68, dpi);
             let r = RECT {
                 left: pad,
@@ -743,7 +765,7 @@ pub fn run_win32_ui(autostart: bool) {
         };
         y += btn_h + sc(6, dpi);
 
-        let opt_text_rc = if has_opt_msg {
+        let opt_text_rc = if flags.has_opt_msg {
             let h = sc(44, dpi);
             let r = RECT {
                 left: pad,
@@ -767,7 +789,7 @@ pub fn run_win32_ui(autostart: bool) {
         };
         y += btn_h + sc(6, dpi);
 
-        let update_text_rc = if has_update_msg {
+        let update_text_rc = if flags.has_update_msg {
             let h = sc(38, dpi);
             let r = RECT {
                 left: pad,
@@ -821,9 +843,9 @@ pub fn run_win32_ui(autostart: bool) {
         text_color: COLORREF,
         dpi: i32,
     ) {
-        let pen = CreatePen(PS_SOLID as i32, 1, border_color);
+        let pen = CreatePen(PS_SOLID, 1, border_color);
         let op = SelectObject(hdc, pen.cast());
-        let ob = SelectObject(hdc, GetStockObject(BLACK_BRUSH as i32));
+        let ob = SelectObject(hdc, GetStockObject(BLACK_BRUSH));
         let rad = sc(8, dpi);
         RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
         SelectObject(hdc, op);
@@ -855,14 +877,14 @@ pub fn run_win32_ui(autostart: bool) {
         } else {
             rgb(0x28, 0x28, 0x28)
         };
-        let ring_pen = CreatePen(PS_SOLID as i32, sc(1, dpi).max(1), ring_color);
+        let ring_pen = CreatePen(PS_SOLID, sc(1, dpi).max(1), ring_color);
         let old_p = SelectObject(hdc, ring_pen.cast());
-        let old_b = SelectObject(hdc, GetStockObject(NULL_BRUSH as i32));
+        let old_b = SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
         SelectObject(hdc, old_p);
         DeleteObject(ring_pen.cast());
 
-        let pen = CreatePen(PS_SOLID as i32, sc(2, dpi).max(1), color);
+        let pen = CreatePen(PS_SOLID, sc(2, dpi).max(1), color);
         let old_p2 = SelectObject(hdc, pen.cast());
         let r = sc(9, dpi);
         match idx {
@@ -1024,11 +1046,13 @@ pub fn run_win32_ui(autostart: bool) {
                         w,
                         dpi,
                         ctrl.settings_scroll_y(),
-                        has_errors,
-                        ctrl.selected_module().is_some(),
-                        ctrl.diag_status_text().is_some(),
-                        ctrl.optimizer_status_text().is_some(),
-                        ctrl.update_status_text().is_some(),
+                        SettingsContentFlags {
+                            has_errors,
+                            has_selected: ctrl.selected_module().is_some(),
+                            has_diag: ctrl.diag_status_text().is_some(),
+                            has_opt_msg: ctrl.optimizer_status_text().is_some(),
+                            has_update_msg: ctrl.update_status_text().is_some(),
+                        },
                     );
                     let max_scroll = (layout.content_height - h).max(0);
                     let step = sc(36, dpi);
@@ -1056,7 +1080,7 @@ pub fn run_win32_ui(autostart: bool) {
                     screen_hdc
                 };
 
-                FillRect(hdc, &rc, GetStockObject(BLACK_BRUSH as i32).cast());
+                FillRect(hdc, &rc, GetStockObject(BLACK_BRUSH).cast());
 
                 match ctrl.current_screen() {
                     Screen::FirstLaunchWarning => {
@@ -1068,7 +1092,7 @@ pub fn run_win32_ui(autostart: bool) {
                             bottom: (h / 2) + sc(26, dpi),
                         };
                         let bg = CreateSolidBrush(rgb(0x11, 0x07, 0x07));
-                        let pen = CreatePen(PS_SOLID as i32, 1, rgb(0x8A, 0x2E, 0x2E));
+                        let pen = CreatePen(PS_SOLID, 1, rgb(0x8A, 0x2E, 0x2E));
                         let ob = SelectObject(hdc, bg.cast());
                         let op = SelectObject(hdc, pen.cast());
                         let rad = sc(10, dpi);
@@ -1133,9 +1157,9 @@ pub fn run_win32_ui(autostart: bool) {
                         // Top-right small minimalist gear icon
                         let gx = w - sc(34, dpi);
                         let gy = sc(30, dpi);
-                        let gpen = CreatePen(PS_SOLID as i32, sc(2, dpi).max(1), rgb(0x7A, 0x7A, 0x7A));
+                        let gpen = CreatePen(PS_SOLID, sc(2, dpi).max(1), rgb(0x7A, 0x7A, 0x7A));
                         let ogp = SelectObject(hdc, gpen.cast());
-                        let onb = SelectObject(hdc, GetStockObject(NULL_BRUSH as i32));
+                        let onb = SelectObject(hdc, GetStockObject(NULL_BRUSH));
                         let r_in = sc(4, dpi);
                         let r_out = sc(9, dpi);
                         Ellipse(hdc, gx - r_in, gy - r_in, gx + r_in, gy + r_in);
@@ -1169,7 +1193,7 @@ pub fn run_win32_ui(autostart: bool) {
                         };
 
                         let brush = CreateSolidBrush(fill_rgb);
-                        let pen = CreatePen(PS_SOLID as i32, sc(2, dpi).max(1), stroke_rgb);
+                        let pen = CreatePen(PS_SOLID, sc(2, dpi).max(1), stroke_rgb);
                         let old_brush = SelectObject(hdc, brush.cast());
                         let old_pen = SelectObject(hdc, pen.cast());
                         Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
@@ -1179,9 +1203,9 @@ pub fn run_win32_ui(autostart: bool) {
                         DeleteObject(pen.cast());
 
                         let gr = (r as f32 * 0.28) as i32;
-                        let gpen2 = CreatePen(PS_SOLID as i32, sc(3, dpi).max(2), glyph_rgb);
+                        let gpen2 = CreatePen(PS_SOLID, sc(3, dpi).max(2), glyph_rgb);
                         let old_gpen = SelectObject(hdc, gpen2.cast());
-                        let old_nb = SelectObject(hdc, GetStockObject(NULL_BRUSH as i32));
+                        let old_nb = SelectObject(hdc, GetStockObject(NULL_BRUSH));
                         let start_x = cx + (gr as f32 * 0.57) as i32;
                         let start_y = cy - (gr as f32 * 0.82) as i32;
                         let end_x = cx - (gr as f32 * 0.57) as i32;
@@ -1222,27 +1246,16 @@ pub fn run_win32_ui(autostart: bool) {
                         let opt_msg = ctrl.optimizer_status_text();
                         let upd_msg = ctrl.update_status_text();
 
-                        let probe_layout = compute_settings_layout(
-                            w,
-                            dpi,
-                            0,
+                        let flags = SettingsContentFlags {
                             has_errors,
-                            sel.is_some(),
-                            diag_msg.is_some(),
-                            opt_msg.is_some(),
-                            upd_msg.is_some(),
-                        );
+                            has_selected: sel.is_some(),
+                            has_diag: diag_msg.is_some(),
+                            has_opt_msg: opt_msg.is_some(),
+                            has_update_msg: upd_msg.is_some(),
+                        };
+                        let probe_layout = compute_settings_layout(w, dpi, 0, flags);
                         let scroll_y = ctrl.clamp_settings_scroll((probe_layout.content_height - h).max(0));
-                        let layout = compute_settings_layout(
-                            w,
-                            dpi,
-                            scroll_y,
-                            has_errors,
-                            sel.is_some(),
-                            diag_msg.is_some(),
-                            opt_msg.is_some(),
-                            upd_msg.is_some(),
-                        );
+                        let layout = compute_settings_layout(w, dpi, scroll_y, flags);
 
                         // Scrollable content drawn first, then fixed header bar drawn cleanly over top
                         for (i, rep) in reports.iter().enumerate() {
@@ -1291,11 +1304,11 @@ pub fn run_win32_ui(autostart: bool) {
                             );
                         }
 
-                        // 1. Live DNS & IPv6 speed diagnostic button
+                        // 1. Live encrypted DNS & IPv6 diagnostic button
                         let diag_label = if ctrl.is_running_diag() {
-                            "Ağ ve DNS Hızı Ölçülüyor..."
+                            "Ağ ve DNS Test Ediliyor..."
                         } else {
-                            "Ağ ve Hız Testi (DNS / IPv6)"
+                            "Ağ ve DNS Tanılama (DoH / IPv6)"
                         };
                         draw_outline_button(
                             hdc,
@@ -1314,11 +1327,11 @@ pub fn run_win32_ui(autostart: bool) {
                             draw_utf8(hdc, &msg, &mut drc, col, DT_LEFT | DT_WORDBREAK, sc(12, dpi));
                         }
 
-                        // 2. 1-Click Network & TCP Optimizer/Repair button
+                        // 2. 1-Click Network & TCP Repair button
                         let opt_label = if ctrl.is_running_optimizer() {
                             "TCP/IP & DNS Onarılıyor..."
                         } else {
-                            "Ağ ve TCP Hızlandır / Onar"
+                            "Windows Ağ ve TCP Onarımı"
                         };
                         draw_outline_button(
                             hdc,
@@ -1386,7 +1399,7 @@ pub fn run_win32_ui(autostart: bool) {
                         // 5. Security Warning Box
                         let warn_box = layout.warn_box;
                         let wbg = CreateSolidBrush(rgb(0x11, 0x07, 0x07));
-                        let wpen = CreatePen(PS_SOLID as i32, 1, rgb(0x7A, 0x2B, 0x2B));
+                        let wpen = CreatePen(PS_SOLID, 1, rgb(0x7A, 0x2B, 0x2B));
                         let owb = SelectObject(hdc, wbg.cast());
                         let owp = SelectObject(hdc, wpen.cast());
                         RoundRect(
@@ -1425,7 +1438,7 @@ pub fn run_win32_ui(autostart: bool) {
                             right: w,
                             bottom: sc(56, dpi),
                         };
-                        FillRect(hdc, &hdr_bg, GetStockObject(BLACK_BRUSH as i32).cast());
+                        FillRect(hdc, &hdr_bg, GetStockObject(BLACK_BRUSH).cast());
                         let mut hdr = RECT {
                             left: sc(24, dpi),
                             top: sc(16, dpi),
@@ -1514,11 +1527,13 @@ pub fn run_win32_ui(autostart: bool) {
                             w,
                             dpi,
                             ctrl.settings_scroll_y(),
-                            has_errors,
-                            ctrl.selected_module().is_some(),
-                            ctrl.diag_status_text().is_some(),
-                            ctrl.optimizer_status_text().is_some(),
-                            ctrl.update_status_text().is_some(),
+                            SettingsContentFlags {
+                                has_errors,
+                                has_selected: ctrl.selected_module().is_some(),
+                                has_diag: ctrl.diag_status_text().is_some(),
+                                has_opt_msg: ctrl.optimizer_status_text().is_some(),
+                                has_update_msg: ctrl.update_status_text().is_some(),
+                            },
                         );
 
                         if pt_in_rect(x, y, layout.back_rc) {
@@ -1701,7 +1716,7 @@ pub fn run_win32_ui(autostart: bool) {
         let title: Vec<u16> = "TULPAR\0".encode_utf16().collect();
 
         let app_icon = {
-            let embedded = LoadIconW(hinst, 1usize as *const u16);
+            let embedded = LoadIconW(hinst, std::ptr::without_provenance::<u16>(1));
             if !embedded.is_null() {
                 embedded
             } else {
@@ -1717,7 +1732,7 @@ pub fn run_win32_ui(autostart: bool) {
             hInstance: hinst,
             hIcon: app_icon,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hbrBackground: GetStockObject(BLACK_BRUSH as i32).cast(),
+            hbrBackground: GetStockObject(BLACK_BRUSH).cast(),
             lpszMenuName: std::ptr::null(),
             lpszClassName: class_name.as_ptr(),
         };
@@ -1789,8 +1804,8 @@ pub fn run_win32_ui(autostart: bool) {
 }
 
 #[cfg(not(windows))]
-pub fn run_win32_ui(_autostart: bool) {
-    let _ctrl = AppController::new();
+pub fn run_win32_ui(_autostart: bool, strategy_path: Option<PathBuf>) {
+    let _ctrl = AppController::new_with_strategy(strategy_path.as_deref());
     eprintln!("TULPAR Windows GUI requires Windows Win32 APIs.");
 }
 

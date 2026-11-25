@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use yolac_core::{
-    health_reports_to_json, EngineState, ErrorCode, YolacConfig, YolacEngine,
+    forge_status_to_json, health_reports_to_json, EngineState, ErrorCode, YolacConfig, YolacEngine,
 };
 use yolac_net::{ChannelPacketDevice, Ipv6LeakMode, MemoryProfile, PacketDevice, SocketProtector};
 
@@ -386,6 +386,66 @@ pub extern "C" fn yolac_report_platform_error(handle: *mut YolacHandle, error_co
     .unwrap_or(-1)
 }
 
+#[no_mangle]
+pub extern "C" fn yolac_load_forge_package(
+    handle: *mut YolacHandle,
+    data: *const u8,
+    len: usize,
+) -> i32 {
+    if handle.is_null() || data.is_null() || len == 0 || len > 128 * 1024 {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        let Ok(guard) = h.engine.lock() else {
+            return -1;
+        };
+        if guard.load_forge_package_bytes(bytes).is_ok() {
+            0
+        } else {
+            -2
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn yolac_unload_forge_package(handle: *mut YolacHandle) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let Ok(guard) = h.engine.lock() else {
+            return -1;
+        };
+        guard.unload_forge_package();
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+#[no_mangle]
+pub extern "C" fn yolac_get_forge_status_json(
+    handle: *mut YolacHandle,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let h = unsafe { &*handle };
+        let Ok(guard) = h.engine.lock() else {
+            return -1;
+        };
+        let json = forge_status_to_json(&guard.forge_status());
+        write_c_string(&json, out_buf, out_len)
+    }))
+    .unwrap_or(-1)
+}
+
 /// Non-blocking epoll/kqueue `AsyncFd`-backed Unix/Android TUN device:
 /// - ZERO dedicated OS reader threads (eliminates Drop::drop() ANR deadlock!)
 /// - ZERO 200ms idle polling wakeups during Android Doze (432,000 -> 0 wakeups/day!)
@@ -533,6 +593,39 @@ mod tests {
         assert_eq!(yolac_stop(handle), 0);
         assert_eq!(yolac_stop(handle), 0); // Double stop safe
         assert_eq!(yolac_get_state(handle), 0); // Inactive
+        yolac_destroy(handle);
+    }
+
+    #[test]
+    fn ffi_loads_verified_forge_package_rejects_corrupt_and_reports_status() {
+        let pkg_bytes = include_bytes!("../../../../forge/examples/turkey_balanced.tulpar");
+        let handle = yolac_create(std::ptr::null());
+        assert!(!handle.is_null());
+
+        let mut buf = vec![0 as c_char; 2048];
+        let n0 = yolac_get_forge_status_json(handle, buf.as_mut_ptr(), buf.len());
+        assert!(n0 > 0);
+        let j0 = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert!(j0.contains("\"status\":\"baseline\""), "got {j0}");
+
+        // Valid .tulpar package loads cleanly without recompiling
+        assert_eq!(yolac_load_forge_package(handle, pkg_bytes.as_ptr(), pkg_bytes.len()), 0);
+        let n1 = yolac_get_forge_status_json(handle, buf.as_mut_ptr(), buf.len());
+        assert!(n1 > 0);
+        let j1 = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap();
+        assert!(j1.contains("\"status\":\"active\"") && j1.contains("turkey-balanced"), "got {j1}");
+
+        // Health report reflects active Forge package honestly
+        let mut hbuf = vec![0 as c_char; 4096];
+        let hn = yolac_get_health_json(handle, hbuf.as_mut_ptr(), hbuf.len());
+        assert!(hn > 20);
+
+        // Corrupted .tulpar fails integrity verification without crashing
+        let mut corrupt = pkg_bytes.to_vec();
+        corrupt[20] ^= 0xFF;
+        assert_eq!(yolac_load_forge_package(handle, corrupt.as_ptr(), corrupt.len()), -2);
+
+        assert_eq!(yolac_unload_forge_package(handle), 0);
         yolac_destroy(handle);
     }
 

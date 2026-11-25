@@ -170,7 +170,7 @@ class SettingsActivity : ComponentActivity() {
             cornerRadius = 8f * density
         }
         privateDnsBanner = TextView(this).apply {
-            text = "Not: Android Özel DNS (Private DNS) açık görünüyor. Reklam engelleme ve TULPAR DNS hızlandırmasının tam çalışması için Android Ağ ayarlarından Özel DNS'i 'Kapalı' yapmanız önerilir (açmak için dokunun)."
+            text = "Not: Android Özel DNS (Private DNS) açık görünüyor. Reklam engelleme ve TULPAR şifreli DNS çözümlemesinin tam çalışması için Android Ağ ayarlarından Özel DNS'i 'Kapalı' yapmanız önerilir (açmak için dokunun)."
             setTextColor(Color.parseColor("#F5D78E"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             val dp = (12 * density).toInt()
@@ -204,8 +204,8 @@ class SettingsActivity : ComponentActivity() {
             }
         }
 
-        // Swiss Army Knife #1: Live Encrypted DNS & IPv6 Speed Diagnostic
-        diagButton = makeOutlineButton("Ağ ve Hız Testi (DNS / IPv6)", "#4A7A5A").apply {
+        // Swiss Army Knife #1: Live Encrypted DNS & IPv6 Diagnostic
+        diagButton = makeOutlineButton("Ağ ve DNS Tanılama (DoH / IPv6)", "#4A7A5A").apply {
             setOnClickListener { runLiveDiagnostics() }
         }
         root.addView(
@@ -489,7 +489,7 @@ class SettingsActivity : ComponentActivity() {
         if (runningDiagnostics) return
         runningDiagnostics = true
         diagButton.isEnabled = false
-        diagButton.text = "Ağ ve DNS Hızı Ölçülüyor..."
+        diagButton.text = "Ağ ve DNS Test Ediliyor..."
         diagStatusText.text = "Şifreli DNS sunucuları ve IPv6 erişimi ölçülüyor..."
         diagStatusText.setTextColor(Color.parseColor("#BDBDBD"))
         diagStatusText.visibility = View.VISIBLE
@@ -500,7 +500,7 @@ class SettingsActivity : ComponentActivity() {
             }
             runningDiagnostics = false
             diagButton.isEnabled = true
-            diagButton.text = "Ağ ve Hız Testi (DNS / IPv6)"
+            diagButton.text = "Ağ ve DNS Tanılama (DoH / IPv6)"
             refreshHealth()
 
             val parsed = HealthParser.parseDiagnosticResult(rawJson)

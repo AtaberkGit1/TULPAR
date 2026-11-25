@@ -22,8 +22,11 @@ pub fn flush_windows_dns_cache() {
         if module.is_null() {
             return;
         }
-        if let Some(proc_addr) = GetProcAddress(module, b"DnsFlushResolverCache\0".as_ptr()) {
-            let func: unsafe extern "system" fn() -> i32 = std::mem::transmute(proc_addr);
+        if let Some(proc_addr) = GetProcAddress(module, c"DnsFlushResolverCache".as_ptr().cast()) {
+            let func = std::mem::transmute::<
+                unsafe extern "system" fn() -> isize,
+                unsafe extern "system" fn() -> i32,
+            >(proc_addr);
             let _ = func();
         }
         FreeLibrary(module);

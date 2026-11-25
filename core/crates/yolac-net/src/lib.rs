@@ -1,4 +1,4 @@
-//! YOLAÇ Network Engine: Socket protection, LeakGuard, DPI TCP Relay, and Userspace TUN Router.
+//! TULPAR Network Engine: Socket protection, LeakGuard, DPI TCP Relay, and Userspace TUN Router.
 
 pub mod captive_portal;
 pub mod ipv6_probe;

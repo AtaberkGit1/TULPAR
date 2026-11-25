@@ -1,4 +1,4 @@
-//! Minimal YOLAÇ diagnostic runner (on-device verification, zero telemetry).
+//! Minimal TULPAR diagnostic runner (on-device verification, zero telemetry).
 
 use yolac_blocklist::Blocklist;
 use yolac_core::{YolacConfig, YolacEngine};
@@ -8,21 +8,21 @@ use yolac_dpi::{fragment_tls_client_hello, parse_client_hello, SplitStrategy};
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("yolac-cli {}", env!("CARGO_PKG_VERSION"));
+        println!("tulpar-cli (yolac-cli) {}", env!("CARGO_PKG_VERSION"));
         return;
     }
 
     let bl = Blocklist::embedded_default();
-    let engine = YolacEngine::new(YolacConfig::mobile_ios(), None);
+    let engine = YolacEngine::new(YolacConfig::mobile_android(), None);
     println!(
-        "YOLAÇ Core Self-Check\n- Embedded blocklist rules: {} ({} bytes RAM)\n- Initial engine state: {:?}",
+        "TULPAR Core Self-Check\n- Embedded blocklist rules: {} ({} bytes RAM)\n- Initial engine state: {:?}",
         bl.len(),
         bl.memory_bytes(),
         engine.state()
     );
 
     // Quick TLS ClientHello fragmentation sanity check
-    let sample_sni = b"yolac.test";
+    let sample_sni = b"tulpar.test";
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
     body.extend_from_slice(&[0u8; 32]);

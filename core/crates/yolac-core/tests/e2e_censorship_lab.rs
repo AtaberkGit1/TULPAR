@@ -50,7 +50,7 @@ fn build_test_tls_configs(
     (Arc::new(srv_cfg), Arc::new(cli_cfg))
 }
 
-/// Spawns a real TLS echo server that reads `PING` and replies `OK:YOLAC`.
+/// Spawns a real TLS echo server that reads `PING` and replies `OK:TULPAR`.
 async fn spawn_tls_echo_server(srv_cfg: Arc<ServerConfig>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -66,7 +66,7 @@ async fn spawn_tls_echo_server(srv_cfg: Arc<ServerConfig>) -> SocketAddr {
                 let mut buf = [0u8; 64];
                 if let Ok(n) = tls.read(&mut buf).await {
                     if n > 0 {
-                        let _ = tls.write_all(b"OK:YOLAC").await;
+                        let _ = tls.write_all(b"OK:TULPAR").await;
                         let _ = tls.flush().await;
                     }
                 }
@@ -127,7 +127,7 @@ async fn test_1_sni_dpi_middlebox_blocks_direct_but_yolac_bypasses() {
     let direct_res = connector.connect(sni.clone(), direct_tcp).await;
     assert!(direct_res.is_err(), "Direct unfragmented ClientHello must be blocked by DPI");
 
-    // B) Connection relayed via YOLAÇ DpiTcpRelay MUST SUCCEED
+    // B) Connection relayed via TULPAR DpiTcpRelay MUST SUCCEED
     let local_proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = local_proxy.local_addr().unwrap();
     let relay = Arc::new(DpiTcpRelay::new(
@@ -147,12 +147,12 @@ async fn test_1_sni_dpi_middlebox_blocks_direct_but_yolac_bypasses() {
     let mut tls = connector
         .connect(sni, proxied_tcp)
         .await
-        .expect("YOLAÇ must bypass SNI DPI middlebox");
+        .expect("TULPAR must bypass SNI DPI middlebox");
     tls.write_all(b"PING").await.unwrap();
     tls.flush().await.unwrap();
     let mut reply = [0u8; 16];
     let n = tls.read(&mut reply).await.unwrap();
-    assert_eq!(&reply[..n], b"OK:YOLAC");
+    assert_eq!(&reply[..n], b"OK:TULPAR");
 }
 
 fn build_dns_a_answer(query: &[u8], ip: Ipv4Addr, ttl: u32) -> Vec<u8> {
@@ -566,7 +566,7 @@ async fn test_4_adaptive_controller_auto_escalates_after_dpi_rst() {
     tls.write_all(b"PING").await.unwrap();
     let mut buf = [0u8; 16];
     let n = tls.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], b"OK:YOLAC");
+    assert_eq!(&buf[..n], b"OK:TULPAR");
 
     // Attempt 2: Strategy is now remembered in salted RAM table -> succeeds immediately without retry
     let c2 = TcpStream::connect(proxy_addr).await.unwrap();
@@ -576,7 +576,7 @@ async fn test_4_adaptive_controller_auto_escalates_after_dpi_rst() {
         .expect("Subsequent attempt must use remembered escalated strategy");
     tls2.write_all(b"PING").await.unwrap();
     let n2 = tls2.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n2], b"OK:YOLAC");
+    assert_eq!(&buf[..n2], b"OK:TULPAR");
 }
 
 #[tokio::test]
@@ -1078,7 +1078,7 @@ async fn test_9_turkey_isp_stateful_dpi_blocks_weak_split_but_multi_record_and_e
     tls.write_all(b"PING").await.unwrap();
     let mut reply = [0u8; 16];
     let n = tls.read(&mut reply).await.unwrap();
-    assert_eq!(&reply[..n], b"OK:YOLAC");
+    assert_eq!(&reply[..n], b"OK:TULPAR");
 
     // Also verify Turkish BTK public sinkhole IP (195.175.254.2) is flagged as DNS poisoning!
     let q = yolac_dns::wire::DnsQuery {

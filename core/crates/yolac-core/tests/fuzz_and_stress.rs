@@ -1,5 +1,5 @@
 //! Deterministic fuzzing, malformed-packet resilience, DoH keep-alive pooling,
-//! and concurrency/OOM stress tests for YOLAÇ hardening.
+//! and concurrency/OOM stress tests for TULPAR hardening.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};

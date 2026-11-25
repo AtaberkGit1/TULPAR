@@ -378,6 +378,15 @@ class YolacVpnService : VpnService() {
             return
         }
 
+        // Dynamically load an optional verified `.tulpar` strategy package (zero APK recompile)
+        try {
+            val activePkg = java.io.File(filesDir, "forge/active.tulpar")
+            if (activePkg.isFile && activePkg.length() in 32L..(128L * 1024L)) {
+                YolacNative.nativeLoadForgePackage(activePkg.readBytes())
+            }
+        } catch (_: Throwable) {
+        }
+
         val isLockdown = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && isLockdownEnabled
         val detachedFd = established.pfd.detachFd()
         val ok = YolacNative.nativeStartTun(

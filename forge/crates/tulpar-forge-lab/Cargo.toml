@@ -1,0 +1,18 @@
+[package]
+name = "tulpar-forge-lab"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "Offline censorship simulation lab, adversarial sandbox verification, and benchmark suite for TULPAR Forge"
+
+[dependencies]
+tulpar-forge = { path = "../tulpar-forge" }
+yolac-dpi = { path = "../../../core/crates/yolac-dpi" }
+yolac-blocklist = { path = "../../../core/crates/yolac-blocklist" }
+yolac-dns = { path = "../../../core/crates/yolac-dns" }
+yolac-net = { path = "../../../core/crates/yolac-net" }
+yolac-core = { path = "../../../core/crates/yolac-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.13"

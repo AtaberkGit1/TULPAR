@@ -1,7 +1,8 @@
-//! Real health checks for the 7 YOLAÇ Settings modules (zero fake success indicators).
+//! Real health checks for the 7 TULPAR Settings modules (zero fake success indicators).
 
 use std::sync::{Mutex, OnceLock};
 
+use tulpar_forge::{ForgeStatus, ForgeStatusSnapshot};
 use yolac_blocklist::Blocklist;
 use yolac_dns::DnsEngine;
 use yolac_dpi::{fragment_tls_client_hello, parse_client_hello, PlatformCapabilities, SplitStrategy};
@@ -124,6 +125,25 @@ impl HealthMonitor {
         blocklist: &Blocklist,
         dns: &DnsEngine,
         captive_portal: &CaptivePortalMonitor,
+    ) -> [ModuleHealthReport; 7] {
+        self.evaluate_all_with_forge(
+            engine_state,
+            capabilities,
+            blocklist,
+            dns,
+            captive_portal,
+            None,
+        )
+    }
+
+    pub fn evaluate_all_with_forge(
+        &self,
+        engine_state: EngineState,
+        capabilities: PlatformCapabilities,
+        blocklist: &Blocklist,
+        dns: &DnsEngine,
+        captive_portal: &CaptivePortalMonitor,
+        forge: Option<&ForgeStatusSnapshot>,
     ) -> [ModuleHealthReport; 7] {
         let recorded_err = self.platform_error.lock().ok().and_then(|g| g.clone());
         let effective_err: Option<(ErrorCode, Option<String>)> = match engine_state {
@@ -265,7 +285,7 @@ impl HealthMonitor {
                 id: ModuleId::DnsProtection,
                 status: ModuleHealthStatus::Healthy,
                 detail_tr: format!(
-                    "Turbo Şifreli DNS aktif: {rtt_part} · Önbellek isabeti: %{cache_pct}."
+                    "Şifreli DNS (DoH/DoT) aktif: {rtt_part} · Önbellek isabet oranı: %{cache_pct}."
                 ),
             }
         };
@@ -293,19 +313,28 @@ impl HealthMonitor {
 
         let dpi_ok = *DPI_SELF_CHECK_OK.get_or_init(verify_dpi_transform_self_check);
         let dpi_report = if dpi_ok {
-            let msg = if capabilities.supports_raw_packets {
+            let base = if capabilities.supports_raw_packets {
                 if cfg!(target_os = "linux") {
                     "Çekirdek seviyesi DPI atlatma (Netlink NFQUEUE + Raw Soket + UDP desync) aktif."
                 } else {
-                    "Çekirdek seviyesi DPI atlatma (%99.95 sıfır gecikmeli WinDivert bytecode filtresi + UDP desync) aktif."
+                    "Çekirdek seviyesi DPI atlatma (WinDivert el sıkışma filtresi + UDP desync) aktif."
                 }
             } else {
-                "Yüksek verimli TUN motoru, çoklu TLS parçalama ve UDP desync aktif."
+                "Kullanıcı alanı TUN motoru, çoklu TLS parçalama ve UDP desync aktif."
+            };
+            let detail_tr = match forge.map(|f| (&f.status, f.package_name.as_deref())) {
+                Some((ForgeStatus::Active, Some(name))) => {
+                    format!("{base} [Forge paketi aktif: {name}]")
+                }
+                Some((ForgeStatus::DisabledRollback { .. }, Some(name))) => {
+                    format!("{base} [Forge paketi '{name}' hata nedeniyle güvenli temele geri alındı]")
+                }
+                _ => base.to_string(),
             };
             ModuleHealthReport {
                 id: ModuleId::AdvancedDpiCircumvention,
                 status: ModuleHealthStatus::Healthy,
-                detail_tr: msg.into(),
+                detail_tr,
             }
         } else {
             ModuleHealthReport {
@@ -402,6 +431,26 @@ pub fn health_reports_to_json(reports: &[ModuleHealthReport; 7]) -> String {
     }
     out.push(']');
     out
+}
+
+pub fn forge_status_to_json(snap: &ForgeStatusSnapshot) -> String {
+    let (status_str, reason_str) = match &snap.status {
+        ForgeStatus::BaselineOnly => ("baseline", ""),
+        ForgeStatus::Active => ("active", ""),
+        ForgeStatus::DisabledRollback { reason } => ("disabled_rollback", reason.as_str()),
+    };
+    format!(
+        "{{\"status\":\"{}\",\"package\":\"{}\",\"version\":\"{}\",\"sha256_prefix\":\"{}\",\"consecutive_failures\":{},\"total_samples\":{},\"failed_samples\":{},\"distinct_failed_targets\":{},\"reason\":\"{}\"}}",
+        status_str,
+        escape_json(snap.package_name.as_deref().unwrap_or("")),
+        escape_json(snap.package_version.as_deref().unwrap_or("")),
+        escape_json(snap.sha256_prefix.as_deref().unwrap_or("")),
+        snap.consecutive_failures,
+        snap.total_samples,
+        snap.failed_samples,
+        snap.distinct_failed_targets,
+        escape_json(reason_str),
+    )
 }
 
 fn error_code_description_tr(code: ErrorCode) -> &'static str {

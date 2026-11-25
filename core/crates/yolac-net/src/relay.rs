@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tulpar_forge::{MatchProtocol, SocketActionSpec, SplitCutSpec, TlsRecordMode};
 use yolac_dpi::{
     evade_http_request, fragment_tls_client_hello, is_sensitive_unblocked_domain,
     parse_client_hello, parse_client_hello_prefix, parse_http_host, plan_tcp_splits, DpiStrategy,
@@ -45,6 +46,21 @@ pub trait StrategyAdvisor: Send + Sync {
         self.select_strategy(dst, sni)
     }
     fn report_outcome(&self, dst: SocketAddr, sni: Option<&str>, used: DpiStrategy, outcome: FlowOutcome);
+
+    /// Optional TULPAR Forge socket plan hook (returns `None` on fast path when no Forge package is active).
+    fn forge_socket_plan(
+        &self,
+        _dst: SocketAddr,
+        _sni: Option<&str>,
+        _proto: MatchProtocol,
+        _payload_len: usize,
+        _retry_count: u8,
+    ) -> Option<SocketActionSpec> {
+        None
+    }
+
+    /// Reports live flow outcome to Forge's circuit breaker (auto-disables failing packages cleanly).
+    fn report_forge_outcome(&self, _dst: SocketAddr, _sni: Option<&str>, _success: bool) {}
 }
 
 pub struct NoopStrategyAdvisor {
@@ -292,6 +308,12 @@ impl DpiTcpRelay {
             self.advisor.select_strategy(dst, sni.as_deref())
         };
 
+        let flow_proto = if tls_info.is_some() {
+            MatchProtocol::Tls
+        } else {
+            MatchProtocol::Http
+        };
+
         // Non-idempotent HTTP (POST/PUT/PATCH/DELETE) or partial HTTP headers (>4KB body):
         // apply HTTP evasion on the first write and immediately enter bidirectional copy so we NEVER
         // deadlock waiting for a response before forwarding the rest of the body or duplicate POSTs!
@@ -303,7 +325,14 @@ impl DpiTcpRelay {
                     Some(s) => s,
                     None => self.connect_upstream(dst).await?,
                 };
-                send_with_strategy_tcp(&mut upstream, initial, strategy).await?;
+                if let Some(plan) =
+                    self.advisor
+                        .forge_socket_plan(dst, sni.as_deref(), flow_proto, initial.len(), 0)
+                {
+                    send_with_forge_socket_plan(&mut upstream, initial, &plan).await?;
+                } else {
+                    send_with_strategy_tcp(&mut upstream, initial, strategy).await?;
+                }
                 let _ = tokio::io::copy_bidirectional_with_sizes(
                     &mut client,
                     &mut upstream,
@@ -325,7 +354,15 @@ impl DpiTcpRelay {
                 None => self.connect_upstream(dst).await?,
             };
             let sent_at = Instant::now();
-            if let Err(e) = send_with_strategy_tcp(&mut candidate, initial, strategy).await {
+            let active_forge_plan =
+                self.advisor
+                    .forge_socket_plan(dst, sni.as_deref(), flow_proto, initial.len(), attempt);
+            let write_res = if let Some(ref plan) = active_forge_plan {
+                send_with_forge_socket_plan(&mut candidate, initial, plan).await
+            } else {
+                send_with_strategy_tcp(&mut candidate, initial, strategy).await
+            };
+            if let Err(e) = write_res {
                 if from_speculative && attempt < MAX_RETRIES {
                     attempt += 1;
                     continue;
@@ -336,15 +373,19 @@ impl DpiTcpRelay {
             let mut resp_buf = [0u8; 4096];
             match timeout(self.handshake_timeout, candidate.read(&mut resp_buf)).await {
                 Ok(Ok(rn)) if rn > 0 => {
-                    let outcome = if strategy == DpiStrategy::Passthrough
-                        && sent_at.elapsed() > Duration::from_millis(1500)
-                    {
-                        FlowOutcome::ThrottledSlowHandshake
+                    if active_forge_plan.is_some() {
+                        self.advisor.report_forge_outcome(dst, sni.as_deref(), true);
                     } else {
-                        FlowOutcome::Success
-                    };
-                    self.advisor
-                        .report_outcome(dst, sni.as_deref(), strategy, outcome);
+                        let outcome = if strategy == DpiStrategy::Passthrough
+                            && sent_at.elapsed() > Duration::from_millis(1500)
+                        {
+                            FlowOutcome::ThrottledSlowHandshake
+                        } else {
+                            FlowOutcome::Success
+                        };
+                        self.advisor
+                            .report_outcome(dst, sni.as_deref(), strategy, outcome);
+                    }
                     break (candidate, resp_buf[..rn].to_vec());
                 }
                 Ok(Ok(_)) => {
@@ -354,19 +395,17 @@ impl DpiTcpRelay {
                         attempt += 1;
                         continue;
                     }
-                    self.advisor.report_outcome(
+                    let retry_more = self.handle_handshake_failure(
                         dst,
                         sni.as_deref(),
-                        strategy,
+                        &mut strategy,
+                        active_forge_plan.is_some(),
                         FlowOutcome::ResetOrEofDuringHandshake,
+                        &mut attempt,
+                        MAX_RETRIES,
                     );
-                    if attempt < MAX_RETRIES {
-                        let next = self.advisor.select_strategy(dst, sni.as_deref());
-                        if next != strategy {
-                            strategy = next;
-                            attempt += 1;
-                            continue;
-                        }
+                    if retry_more {
+                        continue;
                     }
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionReset,
@@ -378,36 +417,30 @@ impl DpiTcpRelay {
                         attempt += 1;
                         continue;
                     }
-                    self.advisor.report_outcome(
+                    if self.handle_handshake_failure(
                         dst,
                         sni.as_deref(),
-                        strategy,
+                        &mut strategy,
+                        active_forge_plan.is_some(),
                         FlowOutcome::ResetOrEofDuringHandshake,
-                    );
-                    if attempt < MAX_RETRIES {
-                        let next = self.advisor.select_strategy(dst, sni.as_deref());
-                        if next != strategy {
-                            strategy = next;
-                            attempt += 1;
-                            continue;
-                        }
+                        &mut attempt,
+                        MAX_RETRIES,
+                    ) {
+                        continue;
                     }
                     return Err(e);
                 }
                 Err(_) => {
-                    self.advisor.report_outcome(
+                    if self.handle_handshake_failure(
                         dst,
                         sni.as_deref(),
-                        strategy,
+                        &mut strategy,
+                        active_forge_plan.is_some(),
                         FlowOutcome::HandshakeTimeout,
-                    );
-                    if attempt < MAX_RETRIES {
-                        let next = self.advisor.select_strategy(dst, sni.as_deref());
-                        if next != strategy {
-                            strategy = next;
-                            attempt += 1;
-                            continue;
-                        }
+                        &mut attempt,
+                        MAX_RETRIES,
+                    ) {
+                        continue;
                     }
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -430,6 +463,192 @@ impl DpiTcpRelay {
         .await?;
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_handshake_failure(
+        &self,
+        dst: SocketAddr,
+        sni: Option<&str>,
+        strategy: &mut DpiStrategy,
+        used_forge: bool,
+        outcome: FlowOutcome,
+        attempt: &mut u8,
+        max_retries: u8,
+    ) -> bool {
+        if used_forge {
+            self.advisor.report_forge_outcome(dst, sni, false);
+            if *attempt < max_retries {
+                *attempt += 1;
+                return true;
+            }
+            return false;
+        }
+        self.advisor.report_outcome(dst, sni, *strategy, outcome);
+        if *attempt < max_retries {
+            let next = self.advisor.select_strategy(dst, sni);
+            if next != *strategy {
+                *strategy = next;
+                *attempt += 1;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Executes a capability-verified TULPAR Forge socket action plan over a `TcpStream`.
+pub async fn send_with_forge_socket_plan(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    plan: &SocketActionSpec,
+) -> io::Result<()> {
+    if plan.passthrough || payload.len() < 2 {
+        stream.write_all(payload).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+
+    if let Some(ch) = parse_client_hello_prefix(payload) {
+        let frag = match plan.tls_record.unwrap_or(TlsRecordMode::SniMid) {
+            TlsRecordMode::None => payload.to_vec(),
+            TlsRecordMode::SniMid => {
+                fragment_tls_client_hello(payload, SplitStrategy::SniMid)
+                    .unwrap_or_else(|| payload.to_vec())
+            }
+            TlsRecordMode::OffsetAndSniMid(off) => {
+                fragment_tls_client_hello(payload, SplitStrategy::OffsetAndSniMid(off as usize))
+                    .unwrap_or_else(|| payload.to_vec())
+            }
+            TlsRecordMode::SmallChunks(sz) => {
+                fragment_tls_client_hello(payload, SplitStrategy::MultiChunk(sz as usize))
+                    .unwrap_or_else(|| payload.to_vec())
+            }
+        };
+
+        if plan.tcp_oob && frag.len() >= 2 {
+            let first_rec_len =
+                (5 + u16::from_be_bytes([frag[3], frag[4]]) as usize).min(frag.len());
+            stream.write_all(&frag[..1]).await?;
+            stream.flush().await?;
+            tokio::task::yield_now().await;
+            if first_rec_len > 1 {
+                stream.write_all(&frag[1..first_rec_len]).await?;
+                stream.flush().await?;
+            }
+            send_unix_tcp_oob(stream);
+            tokio::task::yield_now().await;
+            if first_rec_len < frag.len() {
+                return write_tls_records_paced(stream, &frag[first_rec_len..], false).await;
+            }
+            return Ok(());
+        }
+
+        if plan.tcp_splits.is_empty() {
+            if matches!(plan.tls_record, Some(TlsRecordMode::SmallChunks(_))) || plan.paced_flush {
+                return write_tls_records_paced(stream, &frag, false).await;
+            }
+            stream.write_all(&frag).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
+
+        let sni_mid = ch.sni_range.map(|(s, e)| s + (e.saturating_sub(s)) / 2);
+        let first_rec_end = if frag.len() >= 5 && frag[0] == 0x16 {
+            Some(5 + u16::from_be_bytes([frag[3], frag[4]]) as usize)
+        } else {
+            None
+        };
+        let mut points = resolve_cut_points(&plan.tcp_splits, frag.len(), sni_mid, None, first_rec_end);
+        if points.is_empty() {
+            points.push((frag.len() / 2).max(1));
+        }
+        return write_tcp_split_points(stream, &frag, &points).await;
+    }
+
+    if let Some(http) = parse_http_host(payload) {
+        let evaded = evade_http_request(
+            payload,
+            HttpEvasionOptions {
+                mix_host_case: plan.http_host_case,
+                ..HttpEvasionOptions::default()
+            },
+        )
+        .unwrap_or_else(|| payload.to_vec());
+        let host_mid = parse_http_host(&evaded)
+            .map(|h| h.host_range.0 + (h.host_range.1 - h.host_range.0) / 2)
+            .or_else(|| Some(http.host_range.0 + (http.host_range.1 - http.host_range.0) / 2));
+        let points = if plan.tcp_splits.is_empty() && plan.http_split_host {
+            vec![host_mid.unwrap_or(2).clamp(1, evaded.len().saturating_sub(1))]
+        } else {
+            resolve_cut_points(&plan.tcp_splits, evaded.len(), None, host_mid, None)
+        };
+        if !points.is_empty() {
+            return write_tcp_split_points(stream, &evaded, &points).await;
+        }
+        stream.write_all(&evaded).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+fn resolve_cut_points(
+    cuts: &[SplitCutSpec],
+    len: usize,
+    sni_mid: Option<usize>,
+    host_mid: Option<usize>,
+    first_rec_end: Option<usize>,
+) -> Vec<usize> {
+    let mut pts: Vec<usize> = cuts
+        .iter()
+        .filter_map(|c| c.resolve(len, sni_mid, host_mid, first_rec_end))
+        .collect();
+    pts.sort_unstable();
+    pts.dedup();
+    pts
+}
+
+async fn write_tcp_split_points<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+    cuts: &[usize],
+) -> io::Result<()> {
+    let mut prev = 0usize;
+    for &cut in cuts {
+        if cut > prev && cut < data.len() {
+            writer.write_all(&data[prev..cut]).await?;
+            writer.flush().await?;
+            tokio::task::yield_now().await;
+            prev = cut;
+        }
+    }
+    if prev < data.len() {
+        writer.write_all(&data[prev..]).await?;
+        writer.flush().await?;
+    }
+    Ok(())
+}
+
+fn send_unix_tcp_oob(stream: &TcpStream) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let oob: u8 = b'a';
+        let _ = unsafe {
+            libc::send(
+                fd,
+                (&oob as *const u8).cast(),
+                1,
+                libc::MSG_OOB | libc::MSG_NOSIGNAL,
+            )
+        };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = stream;
 }
 
 /// Sends an initial TLS ClientHello or HTTP request over a real `TcpStream` using the selected
@@ -453,21 +672,7 @@ async fn send_with_strategy_tcp(
                 stream.write_all(&frag[1..first_rec_len]).await?;
                 stream.flush().await?;
             }
-            // Inject 1 urgent TCP OOB byte (`MSG_OOB`, ByeDPI `-o1`) on Linux/Android sockets
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = stream.as_raw_fd();
-                let oob: u8 = b'a';
-                let _ = unsafe {
-                    libc::send(
-                        fd,
-                        (&oob as *const u8).cast(),
-                        1,
-                        libc::MSG_OOB | libc::MSG_NOSIGNAL,
-                    )
-                };
-            }
+            send_unix_tcp_oob(stream);
             tokio::task::yield_now().await;
             if first_rec_len < frag.len() {
                 return write_tls_records_paced(stream, &frag[first_rec_len..], false).await;

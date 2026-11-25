@@ -1,4 +1,4 @@
-# YOLAÇ Curated Embedded Ad, Tracker & Malware Blocklist
+# TULPAR Curated Embedded Ad, Tracker & Malware Blocklist
 # Includes curated baseline + MIT-licensed StevenBlack unified hosts subset (zero false positives on core services).
 # Strictly RAM-only contiguous arena (< 400 KB RAM).
 

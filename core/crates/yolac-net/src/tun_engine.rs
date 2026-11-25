@@ -1,7 +1,7 @@
 //! High-throughput userspace L3 TUN packet router using `smoltcp` (Android VpnService).
 //!
-//! v0.4.0 Turbo Upgrades:
-//! - 256 KB per-flow TCP buffers + Nagle disabled + zero ACK delay (unlocks 40-150+ Mbps single-stream)
+//! v0.4.0 TUN Engine Upgrades:
+//! - 256 KB per-flow TCP buffers + Nagle disabled + zero ACK delay
 //! - Proper half-close (`ChannelStream::poll_shutdown`) + active RFC 793 `TCP RST|ACK` on refused/blocked flows
 //! - Zero-busy-spin shutdown (`shutdown_rx.changed()` Err break + task cancellation on DNS/UDP)
 //! - Self-healing UDP NAT sessions + 60s TCP idle timeout + 30s idle battery sleep

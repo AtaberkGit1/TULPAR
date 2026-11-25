@@ -6,13 +6,31 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use yolac_dpi::{DpiStrategy, PlatformCapabilities, QuicPolicy};
+use tulpar_forge::{
+    DecoySpec, DecoyTtlMode, ForgePlatformCaps, ForgeRuntime, ForgeStatusSnapshot, MatchProtocol,
+    QuicMode, RawActionSpec, SocketActionSpec, VerifyReport,
+};
+use yolac_dpi::{
+    build_benign_fake_client_hello, build_benign_fake_http_request, build_ipv4_tcp_packet,
+    build_ipv6_tcp_packet, build_turkey_desync_packets, evade_http_request, parse_ip_packet,
+    parse_tcp, DesyncPacket, DpiStrategy, FakePacketMode, HttpEvasionOptions, IpProtocol,
+    PlatformCapabilities, QuicPolicy, TtlCalibrator,
+};
 use yolac_net::{FlowOutcome, StrategyAdvisor};
+
+fn to_forge_caps(caps: PlatformCapabilities) -> ForgePlatformCaps {
+    ForgePlatformCaps {
+        supports_raw_packets: caps.supports_raw_packets,
+        supports_ttl_fake: caps.supports_ttl_fake,
+        supports_bad_checksum: caps.supports_bad_checksum,
+    }
+}
 
 const ENTRY_TTL: Duration = Duration::from_secs(20 * 60);
 
@@ -32,6 +50,7 @@ pub struct AdaptiveController {
     /// Protected by std::sync::Mutex (critical sections are tiny O(1) map lookups).
     table: Mutex<HashMap<u64, DestinationState>>,
     quic_throttled: AtomicBool,
+    forge: Arc<ForgeRuntime>,
 }
 
 impl AdaptiveController {
@@ -70,7 +89,56 @@ impl AdaptiveController {
             max_entries: max_entries.max(64),
             table: Mutex::new(HashMap::new()),
             quic_throttled: AtomicBool::new(default_quic_blocked),
+            forge: Arc::new(ForgeRuntime::new(to_forge_caps(capabilities))),
         }
+    }
+
+    pub fn forge(&self) -> &Arc<ForgeRuntime> {
+        &self.forge
+    }
+
+    pub fn load_forge_package_bytes(&self, bytes: &[u8]) -> Result<VerifyReport, String> {
+        self.forge.load_package_bytes(bytes)
+    }
+
+    pub fn load_forge_package_file(&self, path: &Path) -> Result<VerifyReport, String> {
+        self.forge.load_package_file(path)
+    }
+
+    pub fn unload_forge_package(&self) {
+        self.forge.unload();
+    }
+
+    pub fn forge_status(&self) -> ForgeStatusSnapshot {
+        self.forge.snapshot()
+    }
+
+    pub fn select_raw_forge_plan(
+        &self,
+        proto: MatchProtocol,
+        dst_port: u16,
+        sni: Option<&str>,
+        payload_len: usize,
+        is_sensitive: bool,
+        retry_count: u8,
+    ) -> Option<RawActionSpec> {
+        self.forge
+            .select_raw_rule(proto, dst_port, sni, payload_len, is_sensitive, retry_count)
+    }
+
+    pub fn effective_quic_policy(&self, dst_port: u16) -> QuicPolicy {
+        if let Some(qm) = self.forge.select_quic_mode(dst_port) {
+            return match qm {
+                QuicMode::Allow => QuicPolicy::Allow,
+                QuicMode::BlockFallbackTcp => QuicPolicy::BlockFallbackToTcp,
+                QuicMode::DesyncTtl(_) => self.recommended_quic_policy(),
+            };
+        }
+        self.recommended_quic_policy()
+    }
+
+    pub fn effective_udp_desync(&self, proto: MatchProtocol, dst_port: u16) -> Option<(u8, bool)> {
+        self.forge.select_udp_desync(proto, dst_port)
     }
 
     fn hash_target(&self, dst: SocketAddr, sni: Option<&str>) -> u64 {
@@ -216,6 +284,152 @@ impl StrategyAdvisor for AdaptiveController {
             }
         }
     }
+
+    fn forge_socket_plan(
+        &self,
+        dst: SocketAddr,
+        sni: Option<&str>,
+        proto: MatchProtocol,
+        payload_len: usize,
+        retry_count: u8,
+    ) -> Option<SocketActionSpec> {
+        let is_sensitive = sni
+            .map(yolac_dpi::is_sensitive_unblocked_domain)
+            .unwrap_or(false);
+        self.forge
+            .select_socket_rule(proto, dst.port(), sni, payload_len, is_sensitive, retry_count)
+    }
+
+    fn report_forge_outcome(&self, dst: SocketAddr, sni: Option<&str>, success: bool) {
+        self.forge.report_flow_outcome(dst, sni, success);
+    }
+}
+
+/// Shared capability-verified raw L3/L4 packet executor for TULPAR Forge (`Windows WinDivert`,
+/// `Linux NFQUEUE+Raw`, and `tulpar-forge-lab` L3 simulator) with zero logic duplication.
+pub fn execute_raw_forge_tcp(
+    raw_packet: &[u8],
+    sni_mid: usize,
+    host_mid: Option<usize>,
+    is_http: bool,
+    plan: &RawActionSpec,
+    calibrator: &TtlCalibrator,
+    dst_ip: IpAddr,
+) -> Option<Vec<DesyncPacket>> {
+    if plan.passthrough {
+        return None;
+    }
+    let ip = parse_ip_packet(raw_packet)?;
+    if ip.protocol != IpProtocol::Tcp {
+        return None;
+    }
+    let tcp = parse_tcp(ip.payload)?;
+    if tcp.payload.len() < 2 {
+        return None;
+    }
+
+    let source_pkt = if is_http && (plan.http_host_case || plan.http_split_host) {
+        if let Some(evaded) = evade_http_request(
+            tcp.payload,
+            HttpEvasionOptions {
+                mix_host_case: plan.http_host_case,
+                ..HttpEvasionOptions::default()
+            },
+        ) {
+            if evaded.len() == tcp.payload.len() {
+                let tcp_opts = if tcp.header_len > 20 {
+                    &ip.payload[20..tcp.header_len]
+                } else {
+                    &[]
+                };
+                match (ip.src_ip, ip.dst_ip) {
+                    (IpAddr::V4(s), IpAddr::V4(d)) => build_ipv4_tcp_packet(
+                        s,
+                        d,
+                        tcp.src_port,
+                        tcp.dst_port,
+                        tcp.seq,
+                        tcp.ack,
+                        tcp.flags,
+                        tcp.window,
+                        ip.ttl,
+                        ip.ip_id.max(1),
+                        tcp_opts,
+                        &evaded,
+                    ),
+                    (IpAddr::V6(s), IpAddr::V6(d)) => build_ipv6_tcp_packet(
+                        s,
+                        d,
+                        tcp.src_port,
+                        tcp.dst_port,
+                        tcp.seq,
+                        tcp.ack,
+                        tcp.flags,
+                        tcp.window,
+                        ip.ttl,
+                        tcp_opts,
+                        &evaded,
+                    ),
+                    _ => raw_packet.to_vec(),
+                }
+            } else {
+                raw_packet.to_vec()
+            }
+        } else {
+            raw_packet.to_vec()
+        }
+    } else {
+        raw_packet.to_vec()
+    };
+
+    let payload_len = tcp.payload.len();
+    let mut cuts: Vec<usize> = plan
+        .tcp_splits
+        .iter()
+        .filter_map(|c| c.resolve(payload_len, Some(sni_mid), host_mid, None))
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    if cuts.is_empty() && (plan.disorder || !plan.decoys.is_empty()) {
+        cuts.push(host_mid.unwrap_or(sni_mid).clamp(1, payload_len - 1));
+    }
+
+    let safe_hops_ttl = calibrator
+        .estimated_hops(dst_ip)
+        .map(|h| (h / 2).clamp(2, 5))
+        .unwrap_or(3);
+    let fakes: Vec<FakePacketMode> = plan
+        .decoys
+        .iter()
+        .map(|d| match d {
+            DecoySpec::BadChecksum => FakePacketMode::BadChecksum,
+            DecoySpec::WrongSeq => FakePacketMode::WrongSeq,
+            DecoySpec::BadChecksumWrongSeq => FakePacketMode::BadChecksumWrongSeq,
+            DecoySpec::LowTtl(DecoyTtlMode::AutoCalibrated) => {
+                calibrator.recommended_fake_mode(dst_ip, 3)
+            }
+            DecoySpec::LowTtl(DecoyTtlMode::Fixed(t)) => FakePacketMode::LowTtl(*t),
+            DecoySpec::LowTtlWrongSeq(DecoyTtlMode::AutoCalibrated) => {
+                FakePacketMode::LowTtlWrongSeq(safe_hops_ttl)
+            }
+            DecoySpec::LowTtlWrongSeq(DecoyTtlMode::Fixed(t)) => FakePacketMode::LowTtlWrongSeq(*t),
+        })
+        .collect();
+
+    let decoy_payload = if is_http {
+        build_benign_fake_http_request(&plan.decoy_sni)
+    } else {
+        build_benign_fake_client_hello(&plan.decoy_sni)
+    };
+
+    if cuts.is_empty() {
+        return Some(vec![DesyncPacket {
+            bytes: source_pkt,
+            preserve_bad_tcp_checksum: false,
+        }]);
+    }
+
+    build_turkey_desync_packets(&source_pkt, &cuts, &fakes, &decoy_payload, plan.disorder)
 }
 
 #[cfg(test)]

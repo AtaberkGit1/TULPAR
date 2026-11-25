@@ -1,0 +1,57 @@
+# Conservative mobile-first strategy (native on Android VpnService, also valid on Windows/Linux).
+strategy "mobile-conservative" {
+  version = "1.0.0"
+  author = "TULPAR Contributors"
+  description = "Low-wire-overhead strategy safe on strict battery & Anycast mobile networks"
+  min_core_version = "0.4.0"
+  requires_raw_fallback = "auto_degrade"
+
+  rollback {
+    max_consecutive_failures = 4
+    min_samples = 6
+    max_failure_pct = 60
+  }
+
+  rule tls_mobile_primary {
+    priority = 100
+    match proto == tls, port in [443, 8443], min_payload = 9
+    raw_actions {
+      tcp_split = [2, sni_mid]
+      disorder = true
+      decoy_sni = "example.org"
+      decoys = [bad_checksum_wrong_seq]
+    }
+    socket_actions {
+      tls_record = small_chunks(24)
+      paced_flush = true
+    }
+  }
+
+  rule http_mobile {
+    priority = 80
+    match proto == http, port in [80, 8080]
+    raw_actions {
+      http_split_host = true
+      http_host_case = false
+      tcp_split = [2, host_mid]
+      disorder = false
+      decoy_sni = "example.org"
+    }
+    socket_actions {
+      http_split_host = true
+      http_host_case = true
+      tcp_split = [host_mid]
+    }
+  }
+
+  rule quic_fallback {
+    priority = 70
+    match proto == quic, port == 443
+    quic_mode = block_fallback_tcp
+  }
+
+  lab_assert {
+    expect_pass = [shallow_sni_reset, stateful_sni_reassembly, hop_sensitive_inline_dpi, http_host_block, quic_throttle]
+    expect_honest_unbypassable = [hard_ip_blackhole]
+  }
+}

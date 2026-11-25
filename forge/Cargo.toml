@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tulpar-forge",
+    "crates/tulpar-forge-lab",
+    "crates/tulpar-forge-cli",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

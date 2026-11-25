@@ -1,9 +1,9 @@
 # TULPAR UI & Design Specification
 
-TULPAR uses an identical, ultra-minimalist Turkish visual language across Android, iOS, and Windows.
+TULPAR uses an identical, ultra-minimalist Turkish visual language on Android and Windows (plus a clean CLI/systemd workflow on Linux).
 
 ## 1. Main Screen
-- **Background**: Pure `#000000` across the entire viewport (including system status/navigation bars on Android/iOS and DWM dark titlebar on Windows).
+- **Background**: Pure `#000000` across the entire viewport (including system status/navigation bars on Android and DWM dark titlebar on Windows).
 - **Center Element**: Single circular toggle button (`diameter = clamp(min(w,h)*0.42, 160, 220)` dp/pt/px).
 - **Top-Right Corner**: Small minimalist settings gear icon (`#7A7A7A`, accessible label `Ayarlar`) opening the Settings screen.
 - **First-Launch Security Warning**: Shown once on first open on `#000000` with exact Turkish text:

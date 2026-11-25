@@ -3,7 +3,7 @@ name = "yolac-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "YOLAÇ core orchestrator, adaptive DPI strategy selector, and zero-logging engine lifecycle"
+description = "TULPAR core orchestrator, adaptive DPI strategy selector, and zero-logging engine lifecycle"
 
 [dependencies]
 tokio.workspace = true
@@ -14,6 +14,7 @@ yolac-dpi = { path = "../yolac-dpi" }
 yolac-blocklist = { path = "../yolac-blocklist" }
 yolac-dns = { path = "../yolac-dns" }
 yolac-net = { path = "../yolac-net" }
+tulpar-forge = { path = "../../../forge/crates/tulpar-forge" }
 
 [dev-dependencies]
 rand.workspace = true

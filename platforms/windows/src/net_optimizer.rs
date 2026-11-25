@@ -47,10 +47,9 @@ pub fn cleanup_stale_windivert_service() -> bool {
                 let mut status: SERVICE_STATUS = std::mem::zeroed();
                 if QueryServiceStatus(svc, &mut status) != 0
                     && status.dwCurrentState == SERVICE_STOPPED
+                    && DeleteService(svc) != 0
                 {
-                    if DeleteService(svc) != 0 {
-                        cleaned = true;
-                    }
+                    cleaned = true;
                 }
                 CloseServiceHandle(svc);
             }

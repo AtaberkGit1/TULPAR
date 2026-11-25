@@ -1,4 +1,4 @@
-//! Unified TULPAR Turbo DNS Engine:
+//! Unified TULPAR Encrypted DNS Engine:
 //! - Local blocklist + CNAME/HTTPS uncloaking (<5 µs)
 //! - Bounded O(1) RAM LRU + Stale-While-Revalidate (RFC 8767) + negative caching (<0.1 ms hits)
 //! - Singleflight in-flight query coalescing

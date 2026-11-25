@@ -72,6 +72,11 @@ int32_t yolac_check_updates_json(YolacHandle *handle, char *out_buf, size_t out_
 /* Reports a real platform-level error (e.g. OS VPN permission denied = 1) into health state. */
 int32_t yolac_report_platform_error(YolacHandle *handle, uint8_t error_code);
 
+/* TULPAR Forge dynamic strategy package loading (zero recompile, SHA-256 + verifier checked) */
+int32_t yolac_load_forge_package(YolacHandle *handle, const uint8_t *data, size_t len);
+int32_t yolac_unload_forge_package(YolacHandle *handle);
+int32_t yolac_get_forge_status_json(YolacHandle *handle, char *out_buf, size_t out_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -17,6 +17,7 @@ yolac-dpi = { path = "../../core/crates/yolac-dpi" }
 yolac-dns = { path = "../../core/crates/yolac-dns" }
 yolac-net = { path = "../../core/crates/yolac-net" }
 yolac-blocklist = { path = "../../core/crates/yolac-blocklist" }
+tulpar-forge = { path = "../../forge/crates/tulpar-forge" }
 
 [profile.release]
 opt-level = 3

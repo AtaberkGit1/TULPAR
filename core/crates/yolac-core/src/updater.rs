@@ -17,9 +17,10 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SECURITY_WARNING_TR: &str = "GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! Üçüncü taraf kaynaklardan indirilen dosyalar değiştirilmiş veya zararlı olabilir.";
 
 /// Returns the verified official GitHub `owner/repo` slug detected at build time from
-/// `YOLAC_GITHUB_REPO` or `git remote origin`. Returns `None` if unconfigured (never fabricates a URL).
+/// `TULPAR_GITHUB_REPO` (or legacy `YOLAC_GITHUB_REPO`) or `git remote origin`.
+/// Returns `None` if unconfigured (never fabricates a URL).
 pub fn official_github_repo() -> Option<&'static str> {
-    option_env!("YOLAC_DETECTED_GITHUB_REPO")
+    option_env!("TULPAR_DETECTED_GITHUB_REPO").or(option_env!("YOLAC_DETECTED_GITHUB_REPO"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,7 +107,7 @@ pub async fn check_github_release_with_protector(
         Some(r) => r,
         None => {
             return UpdateCheckResult::Error(
-                "Resmî GitHub depo adresi yapılandırılmadı (YOLAC_GITHUB_REPO veya git remote origin tanımlı değil)."
+                "Resmî GitHub depo adresi yapılandırılmadı (TULPAR_GITHUB_REPO veya git remote origin tanımlı değil)."
                     .into(),
             );
         }

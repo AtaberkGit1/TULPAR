@@ -3,7 +3,7 @@ name = "yolac-ffi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Panic-safe C-ABI (iOS/C) and Android JNI bindings for YOLAÇ"
+description = "Panic-safe Android JNI and C-ABI bindings for TULPAR"
 
 [lib]
 crate-type = ["staticlib", "cdylib", "rlib"]

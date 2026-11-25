@@ -3,6 +3,6 @@ name = "yolac-blocklist"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Ultra-low-RAM contiguous-arena domain blocklist engine for YOLAÇ"
+description = "Ultra-low-RAM contiguous-arena domain blocklist engine for TULPAR"
 
 [dependencies]

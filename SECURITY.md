@@ -1,20 +1,30 @@
 # TULPAR Security & Privacy Model
 
-## 1. Zero-Server & Zero-Telemetry Guarantee
-- TULPAR operates **100% on-device**. There are no TULPAR-operated servers, relays, telemetry endpoints, crash-reporting SDKs, analytics libraries, or user accounts.
-- No connection history, DNS queries, visited domains, SNI hostnames, or destination IP addresses are ever written to disk or transmitted to any third party.
-- All ephemeral state (DNS LRU cache, per-destination adaptive DPI strategy map, SYN-ACK hop calibrator) lives strictly in RAM, uses salted ephemeral hashes where applicable, and is immediately zeroed/dropped when protection stops.
+## 1. Zero-Server Operation, Local Processing & External DNS Transparency
+- **Zero TULPAR Infrastructure & Zero Telemetry**: TULPAR operates with **zero central servers, zero relays, zero telemetry endpoints, zero analytics SDKs, zero crash-reporting libraries, and zero user accounts**. Your traffic is never routed through a server operated by TULPAR developers.
+- **Zero Disk Logging**: Connection histories, DNS query logs, SNI hostnames, and destination IP addresses are **never written to disk**. All ephemeral runtime state (in-memory DNS LRU cache, per-destination adaptive DPI strategy map using salted SipHash keys, SYN-ACK hop calibrator) lives strictly in volatile RAM and is immediately dropped/cleared when protection stops.
+- **Transparency on External Public DNS Providers (DoH / DoT)**:
+  - **Blocked domains** matched by the local on-device ad/tracker/malware blocklist (`yolac-blocklist`) are answered locally in RAM (`0.0.0.0` / `::`) and **are never sent outside the device**.
+  - **Unblocked domains** not already served from the in-memory LRU DNS cache are resolved over encrypted **DNS-over-HTTPS (DoH, port 443)** or **DNS-over-TLS (DoT, port 853)** directly from your device to the external third-party public DNS providers configured in `default_public_upstreams()`:
+    - **Cloudflare DNS**: `1.1.1.1:443` (`cloudflare-dns.com`), `1.0.0.1:853` (`1dot1dot1dot1.cloudflare-dns.com`), `2606:4700:4700::1111:443`
+    - **Quad9 DNS**: `9.9.9.9:853` (`dns.quad9.net`)
+    - **Mullvad DNS**: `194.242.2.2:853` (`dns.mullvad.net`)
+    - **Google Public DNS**: `8.8.8.8:443` (`dns.google`)
+  - **What External Resolvers Receive**: While encrypted DoH/DoT hides DNS queries from your local ISP and on-path passive observers, **the active external DNS provider necessarily receives your client IP address and the queried domain name** in order to resolve the query, subject to that provider's own privacy policy.
+  - **Connectivity & Health Probes**: On startup, network changes, or manual diagnostics, TULPAR probes configured public DNS resolvers (`one.one.one.one` A query over DoH/DoT) to select the lowest-latency healthy upstream and checks IPv6 socket reachability (`[2606:4700:4700::1111]:443` and `[2001:4860:4860::8888]:443`).
+  - **Manual GitHub Release Check**: Only when the user explicitly triggers an update check in Settings does TULPAR connect over HTTPS to `api.github.com` (`/repos/<owner>/<repo>/releases/latest`) to compare version tags. No background update checks are performed.
 
-## 2. Memory Safety & Auditable Core
-- The shared network core (`core/crates/*`) is written in safe Rust (`#![forbid(unsafe_code)]` in `yolac-dpi`, `yolac-blocklist`, `yolac-dns`, `yolac-core`).
-- `unsafe` is strictly isolated to OS FFI/socket boundaries (`yolac-net` socket FD protection, `yolac-ffi` C-ABI/JNI boundary, `platforms/windows` Win32/WinDivert bindings) with explicit bounds checks and null-pointer guards.
+## 2. Memory Safety & Privilege Boundaries
+- The shared network core (`core/crates/*`) is written in Rust (`#![forbid(unsafe_code)]` in `yolac-dpi`, `yolac-blocklist`, `yolac-dns`, `yolac-core`).
+- `unsafe` is strictly isolated to OS FFI/socket/packet boundaries (`yolac-net` socket FD protection, `yolac-ffi` C-ABI/JNI boundary, `platforms/windows` Win32/WinDivert bindings, `platforms/linux` Netlink `NFQUEUE`/`IPPROTO_RAW` bindings) with explicit bounds checks and null-pointer guards.
 - Pure-Rust TLS (`rustls` + `webpki-roots`) avoids C/C++ OpenSSL memory-corruption surfaces.
+- **Linux Privilege Boundary (`platforms/linux`)**: Uses `CAP_NET_ADMIN` / `root` for Netlink `NFQUEUE` (with `--queue-bypass` fail-open semantics) and `IPPROTO_RAW` (`IP_HDRINCL`/`IPV6_HDRINCL`), isolating outbound traffic in a dedicated `table inet tulpar` / `tulpar_output` chain and tearing down firewall rules and captive local DNS listeners cleanly on `SIGINT`/`SIGTERM`.
 
 ## 3. Leak Prevention & Binary Integrity
-- **DNS Leak Prevention**: All IPv4 & IPv6 UDP/53 and TCP/53 traffic is captured and resolved locally through `yolac-dns` (local blocklist + persistent keep-alive encrypted DoH/DoT with hardcoded bootstrap IPs). Plaintext ISP fallback is strictly disabled (fail-closed).
-- **Balanced Fail-Closed IPv6 Protection**: `probe_ipv6_leak_mode` checks protected IPv6 reachability; if IPv6 is broken or unguarded, YOLAÇ automatically switches to `BlockUnprotectedIpv6` + `AAAA` suppression so host IPv6 cannot leak.
-- **Windows DLL Hijacking Protection**: Elevated `tulpar.exe` loads `WinDivert.dll` strictly from the executable directory (`LOAD_LIBRARY_SEARCH_APPLICATION_DIR`) ONLY after verifying official WinDivert 2.2.2 SHA-256 digests (`WinDivert.dll` + `WinDivert64.sys`) and Windows Authenticode signature (`WinVerifyTrust`).
-- **Bounded Captive Portal Safety**: Temporary local-LAN portal allowance activates only on consecutive encrypted DNS failures alongside OS portal checks, is strictly capped at 90 seconds, and automatically closes the instant encrypted DNS succeeds again.
+- **DNS Leak Prevention**: All IPv4 & IPv6 UDP/53 and TCP/53 traffic is captured and resolved locally through `yolac-dns` (local blocklist + persistent keep-alive encrypted DoH/DoT with hardcoded bootstrap IPs). Plaintext ISP fallback is disabled (fail-closed), except for bounded local-LAN captive portal recovery.
+- **Balanced Fail-Closed IPv6 Protection**: `probe_ipv6_leak_mode` checks protected IPv6 reachability; if IPv6 is broken or unguarded, TULPAR automatically switches to `BlockUnprotectedIpv6` + `AAAA` suppression so host IPv6 cannot leak.
+- **Windows DLL & Driver Integrity Protection**: Elevated `tulpar.exe` verifies exact SHA-256 digests (`WinDivert.dll` and `WinDivert64.sys`), rejects NTFS reparse-point / junction tampering, stages verified driver files under `%ProgramData%\Tulpar\driver\2.2.2`, holds read-shared (`FILE_SHARE_READ`) locks to prevent concurrent replacement, and loads `WinDivert.dll` with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32`.
+- **Bounded Captive Portal Safety**: Temporary local-LAN portal allowance activates only on consecutive encrypted DNS failures alongside captive portal indicators, is strictly capped at 90 seconds, and automatically closes when encrypted DNS succeeds again.
 - **Release Checksums**: Tag-triggered releases (`v*`) publish `SHA256SUMS.txt` alongside all artifacts on `https://github.com/AtaberkGit1/TULPAR/releases`.
 - **DoS / OOM Caps**: `TunEngine` enforces bounded concurrent DNS semaphores, strict max packet size (`<= 65535`), bounded TCP flow caps, and LRU UDP NAT eviction.
 

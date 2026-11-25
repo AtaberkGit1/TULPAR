@@ -14,7 +14,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use yolac_core::{AdaptiveController, ErrorCode};
+use tulpar_forge::MatchProtocol;
+use yolac_core::{execute_raw_forge_tcp, AdaptiveController, ErrorCode};
 use yolac_dns::DnsEngine;
 use yolac_dpi::{
     build_benign_fake_client_hello, build_benign_fake_http_request,
@@ -48,9 +49,10 @@ struct PendingFlow {
     dst: SocketAddr,
     sni: Option<String>,
     strategy: DpiStrategy,
+    used_forge: bool,
+    retransmit_count: u8,
     ch_seq: u32,
     ch_seq_end: u32,
-    syn_ack_ttl: Option<u8>,
     sent_at: Instant,
 }
 
@@ -140,20 +142,23 @@ impl FlowTracker {
         local_port: u16,
         dst: SocketAddr,
         sni: Option<String>,
-        seq: u32,
-        total_ch_len: usize,
+        seq_span: (u32, usize),
         strategy: DpiStrategy,
-    ) -> Option<DpiStrategy> {
+        used_forge: bool,
+    ) -> Option<(DpiStrategy, bool, u8)> {
+        let (seq, total_ch_len) = seq_span;
         let key = self.flow_key(local_port, dst.ip(), dst.port());
-        let syn_ttl = self.syn_ack_ttl(local_port, dst.ip(), dst.port());
         let mut guard = self.pending.lock().ok()?;
 
         if let Some(prev) = guard.get_mut(&key) {
             if prev.ch_seq == seq && prev.sent_at.elapsed() >= Duration::from_millis(40) {
                 let failed_strategy = prev.strategy;
+                let prev_forge = prev.used_forge;
                 prev.strategy = strategy;
+                prev.used_forge = used_forge;
                 prev.sent_at = Instant::now();
-                return Some(failed_strategy);
+                prev.retransmit_count = prev.retransmit_count.saturating_add(1);
+                return Some((failed_strategy, prev_forge, prev.retransmit_count));
             }
         }
 
@@ -173,20 +178,28 @@ impl FlowTracker {
                 dst,
                 sni,
                 strategy,
+                used_forge,
+                retransmit_count: 0,
                 ch_seq: seq,
                 ch_seq_end: seq.wrapping_add(total_ch_len as u32),
-                syn_ack_ttl: syn_ttl,
                 sent_at: Instant::now(),
             },
         );
         None
     }
 
-    pub fn update_pending_strategy(&self, local_port: u16, dst: SocketAddr, strategy: DpiStrategy) {
+    pub fn update_pending_strategy(
+        &self,
+        local_port: u16,
+        dst: SocketAddr,
+        strategy: DpiStrategy,
+        used_forge: bool,
+    ) {
         let key = self.flow_key(local_port, dst.ip(), dst.port());
         if let Ok(mut guard) = self.pending.lock() {
             if let Some(prev) = guard.get_mut(&key) {
                 prev.strategy = strategy;
+                prev.used_forge = used_forge;
             }
         }
     }
@@ -197,14 +210,14 @@ impl FlowTracker {
         remote_ip: IpAddr,
         remote_port: u16,
         seq: u32,
-    ) -> Option<(SocketAddr, Option<String>, DpiStrategy)> {
+    ) -> Option<(SocketAddr, Option<String>, DpiStrategy, bool)> {
         let key = self.flow_key(local_port, remote_ip, remote_port);
         let mut guard = self.pending.lock().ok()?;
         let entry = guard.get(&key)?;
         let advanced = seq.wrapping_sub(entry.ch_seq_end) < 0x8000_0000;
         if advanced {
             let removed = guard.remove(&key)?;
-            return Some((removed.dst, removed.sni, removed.strategy));
+            return Some((removed.dst, removed.sni, removed.strategy, removed.used_forge));
         }
         if entry.sent_at.elapsed() >= Duration::from_secs(12) {
             guard.remove(&key);
@@ -217,11 +230,11 @@ impl FlowTracker {
         local_port: u16,
         remote_ip: IpAddr,
         remote_port: u16,
-    ) -> Option<(SocketAddr, Option<String>, DpiStrategy)> {
+    ) -> Option<(SocketAddr, Option<String>, DpiStrategy, bool)> {
         let key = self.flow_key(local_port, remote_ip, remote_port);
         let mut guard = self.pending.lock().ok()?;
         let entry = guard.remove(&key)?;
-        Some((entry.dst, entry.sni, entry.strategy))
+        Some((entry.dst, entry.sni, entry.strategy, entry.used_forge))
     }
 
     pub fn take_pending_failure(
@@ -229,7 +242,7 @@ impl FlowTracker {
         local_port: u16,
         remote_ip: IpAddr,
         remote_port: u16,
-    ) -> Option<(SocketAddr, Option<String>, DpiStrategy, Option<u8>)> {
+    ) -> Option<(SocketAddr, Option<String>, DpiStrategy, bool)> {
         let key = self.flow_key(local_port, remote_ip, remote_port);
         let mut guard = self.pending.lock().ok()?;
         let entry = guard.get(&key)?;
@@ -237,7 +250,12 @@ impl FlowTracker {
             guard.remove(&key);
             return None;
         }
-        let info = (entry.dst, entry.sni.clone(), entry.strategy, entry.syn_ack_ttl);
+        let info = (
+            entry.dst,
+            entry.sni.clone(),
+            entry.strategy,
+            entry.used_forge,
+        );
         guard.remove(&key);
         Some(info)
     }
@@ -335,24 +353,32 @@ pub fn process_packet(
                 && tcp.payload[1] == 0x03
                 && tcp.payload[5] == 0x02
             {
-                if let Some((dst, sni, strat)) =
+                if let Some((dst, sni, strat, used_forge)) =
                     flows.confirm_server_hello(tcp.dst_port, ip.src_ip, tcp.src_port)
                 {
-                    adaptive.report_outcome(dst, sni.as_deref(), strat, FlowOutcome::Success);
+                    if used_forge {
+                        adaptive.report_forge_outcome(dst, sni.as_deref(), true);
+                    } else {
+                        adaptive.report_outcome(dst, sni.as_deref(), strat, FlowOutcome::Success);
+                    }
                 }
                 return PacketVerdict::Accept;
             }
 
             if (tcp.flags & (ParsedTcp::RST | ParsedTcp::FIN)) != 0 {
-                if let Some((dst, sni, failed_strat, _)) =
+                if let Some((dst, sni, failed_strat, used_forge)) =
                     flows.take_pending_failure(tcp.dst_port, ip.src_ip, tcp.src_port)
                 {
-                    adaptive.report_outcome(
-                        dst,
-                        sni.as_deref(),
-                        failed_strat,
-                        FlowOutcome::ResetOrEofDuringHandshake,
-                    );
+                    if used_forge {
+                        adaptive.report_forge_outcome(dst, sni.as_deref(), false);
+                    } else {
+                        adaptive.report_outcome(
+                            dst,
+                            sni.as_deref(),
+                            failed_strat,
+                            FlowOutcome::ResetOrEofDuringHandshake,
+                        );
+                    }
                 }
             }
         }
@@ -365,25 +391,36 @@ pub fn process_packet(
                 return PacketVerdict::Accept;
             };
             if udp.dst_port == 443
-                && adaptive.recommended_quic_policy() == QuicPolicy::BlockFallbackToTcp
+                && adaptive.effective_quic_policy(udp.dst_port) == QuicPolicy::BlockFallbackToTcp
                 && detect_quic_initial(udp.payload).is_some()
             {
                 return PacketVerdict::Drop;
             }
             if !is_local_lan_ip(ip.dst_ip)
-                && detect_udp_desync_target(udp.payload, udp.dst_port).is_some()
                 && flows.should_desync_udp_flow(udp.src_port, ip.dst_ip, udp.dst_port)
             {
-                let fake_ttl = match calibrator.recommended_fake_mode(ip.dst_ip, 3) {
-                    FakePacketMode::LowTtl(t) | FakePacketMode::LowTtlWrongSeq(t) => t,
-                    _ => 3,
-                };
-                if let Some(decoys) = build_udp_desync_decoys(raw_packet, fake_ttl) {
-                    let injected = decoys
-                        .into_iter()
-                        .map(|d| InjectedPacket { bytes: d.bytes })
-                        .collect();
-                    return PacketVerdict::InjectDecoysThenAccept(injected);
+                if let Some(kind) = detect_udp_desync_target(udp.payload, udp.dst_port) {
+                    let match_proto = match kind {
+                        yolac_dpi::UdpDesyncKind::RobloxRakNet => MatchProtocol::UdpRakNet,
+                        _ => MatchProtocol::UdpStun,
+                    };
+                    let fake_ttl = if let Some((t, _)) =
+                        adaptive.effective_udp_desync(match_proto, udp.dst_port)
+                    {
+                        t
+                    } else {
+                        match calibrator.recommended_fake_mode(ip.dst_ip, 3) {
+                            FakePacketMode::LowTtl(t) | FakePacketMode::LowTtlWrongSeq(t) => t,
+                            _ => 3,
+                        }
+                    };
+                    if let Some(decoys) = build_udp_desync_decoys(raw_packet, fake_ttl) {
+                        let injected = decoys
+                            .into_iter()
+                            .map(|d| InjectedPacket { bytes: d.bytes })
+                            .collect();
+                        return PacketVerdict::InjectDecoysThenAccept(injected);
+                    }
                 }
             }
             PacketVerdict::Accept
@@ -405,12 +442,20 @@ pub fn process_packet(
             if tcp.is_syn_only()
                 && (tcp.dst_port == 443 || tcp.dst_port == 80)
                 && !is_local_lan_ip(ip.dst_ip)
-                && adaptive.select_strategy(dst, None) == DpiStrategy::TurkeyDesyncAggressive
             {
-                if let Some(clamped) = clamp_syn_mss(raw_packet, 536) {
-                    return PacketVerdict::ReplaceWithInjected(vec![InjectedPacket {
-                        bytes: clamped,
-                    }]);
+                let mss_clamp = adaptive
+                    .select_raw_forge_plan(MatchProtocol::Tls, tcp.dst_port, None, 0, false, 0)
+                    .and_then(|p| p.syn_mss_clamp)
+                    .or_else(|| {
+                        (adaptive.select_strategy(dst, None) == DpiStrategy::TurkeyDesyncAggressive)
+                            .then_some(536)
+                    });
+                if let Some(mss) = mss_clamp {
+                    if let Some(clamped) = clamp_syn_mss(raw_packet, mss) {
+                        return PacketVerdict::ReplaceWithInjected(vec![InjectedPacket {
+                            bytes: clamped,
+                        }]);
+                    }
                 }
             }
 
@@ -429,32 +474,53 @@ pub fn process_packet(
                 if let Some(ch) = parse_client_hello_prefix(tcp.payload) {
                     let sni_opt = ch.sni.as_deref();
                     let is_sensitive = sni_opt.map(is_sensitive_unblocked_domain).unwrap_or(false);
+                    let mut forge_plan = adaptive.select_raw_forge_plan(
+                        MatchProtocol::Tls,
+                        tcp.dst_port,
+                        sni_opt,
+                        tcp.payload.len(),
+                        is_sensitive,
+                        0,
+                    );
                     let mut strategy = if is_sensitive {
                         adaptive.select_strategy_with_default(dst, sni_opt, DpiStrategy::Passthrough)
                     } else {
                         adaptive.select_strategy(dst, sni_opt)
                     };
 
-                    if let Some(failed_strat) = flows.record_client_hello(
+                    if let Some((failed_strat, prev_forge, retry_n)) = flows.record_client_hello(
                         tcp.src_port,
                         dst,
                         ch.sni.clone(),
-                        tcp.seq,
-                        ch.record_total_len.max(tcp.payload.len()),
+                        (tcp.seq, ch.record_total_len.max(tcp.payload.len())),
                         strategy,
+                        forge_plan.is_some(),
                     ) {
-                        adaptive.report_outcome(
+                        if prev_forge {
+                            adaptive.report_forge_outcome(dst, sni_opt, false);
+                            forge_plan = adaptive.select_raw_forge_plan(
+                                MatchProtocol::Tls,
+                                tcp.dst_port,
+                                sni_opt,
+                                tcp.payload.len(),
+                                is_sensitive,
+                                retry_n,
+                            );
+                        } else {
+                            adaptive.report_outcome(
+                                dst,
+                                sni_opt,
+                                failed_strat,
+                                FlowOutcome::HandshakeTimeout,
+                            );
+                            strategy = adaptive.select_strategy(dst, sni_opt);
+                        }
+                        flows.update_pending_strategy(
+                            tcp.src_port,
                             dst,
-                            sni_opt,
-                            failed_strat,
-                            FlowOutcome::HandshakeTimeout,
+                            strategy,
+                            forge_plan.is_some(),
                         );
-                        strategy = adaptive.select_strategy(dst, sni_opt);
-                        flows.update_pending_strategy(tcp.src_port, dst, strategy);
-                    }
-
-                    if strategy == DpiStrategy::Passthrough {
-                        return PacketVerdict::Accept;
                     }
 
                     let sni_mid = if let Some((s, e)) = ch.sni_range {
@@ -463,6 +529,36 @@ pub fn process_packet(
                     } else {
                         (tcp.payload.len() / 2).max(2)
                     };
+
+                    if let Some(ref fplan) = forge_plan {
+                        if fplan.passthrough {
+                            return PacketVerdict::Accept;
+                        }
+                        if let Some(built) = execute_raw_forge_tcp(
+                            raw_packet,
+                            sni_mid,
+                            None,
+                            false,
+                            fplan,
+                            calibrator,
+                            ip.dst_ip,
+                        ) {
+                            if built.len() > 1 {
+                                return PacketVerdict::ReplaceWithInjected(
+                                    built
+                                        .into_iter()
+                                        .map(|d| InjectedPacket { bytes: d.bytes })
+                                        .collect(),
+                                );
+                            }
+                        }
+                        return PacketVerdict::Accept;
+                    }
+
+                    if strategy == DpiStrategy::Passthrough {
+                        return PacketVerdict::Accept;
+                    }
+
                     let decoy = build_benign_fake_client_hello("www.iana.org");
 
                     let built_opt = match strategy {
@@ -555,45 +651,85 @@ pub fn process_packet(
                     return PacketVerdict::Accept;
                 }
 
-                if let Some((dst, sni, strat)) =
+                if let Some((dst, sni, strat, used_forge)) =
                     flows.check_outbound_progress(tcp.src_port, ip.dst_ip, tcp.dst_port, tcp.seq)
                 {
-                    adaptive.report_outcome(dst, sni.as_deref(), strat, FlowOutcome::Success);
+                    if used_forge {
+                        adaptive.report_forge_outcome(dst, sni.as_deref(), true);
+                    } else {
+                        adaptive.report_outcome(dst, sni.as_deref(), strat, FlowOutcome::Success);
+                    }
                 }
                 return PacketVerdict::Accept;
             }
 
-            if tcp.dst_port == 80 && parse_http_host(tcp.payload).is_some() {
-                let source_pkt = if let Some(evaded) =
-                    evade_http_request(tcp.payload, HttpEvasionOptions::default())
-                {
-                    if evaded.len() == tcp.payload.len() {
-                        rebuild_tcp_payload_packet(&ip, &tcp, &evaded)
-                            .unwrap_or_else(|| raw_packet.to_vec())
+            if tcp.dst_port == 80 {
+                if let Some(http_info) = parse_http_host(tcp.payload) {
+                    let is_sensitive = is_sensitive_unblocked_domain(&http_info.host);
+                    let host_mid = http_info.host_range.0
+                        + (http_info.host_range.1 - http_info.host_range.0) / 2;
+                    if let Some(fplan) = adaptive.select_raw_forge_plan(
+                        MatchProtocol::Http,
+                        tcp.dst_port,
+                        Some(&http_info.host),
+                        tcp.payload.len(),
+                        is_sensitive,
+                        0,
+                    ) {
+                        if fplan.passthrough {
+                            return PacketVerdict::Accept;
+                        }
+                        if let Some(desync) = execute_raw_forge_tcp(
+                            raw_packet,
+                            host_mid,
+                            Some(host_mid),
+                            true,
+                            &fplan,
+                            calibrator,
+                            ip.dst_ip,
+                        ) {
+                            if desync.len() > 1 {
+                                return PacketVerdict::ReplaceWithInjected(
+                                    desync
+                                        .into_iter()
+                                        .map(|d| InjectedPacket { bytes: d.bytes })
+                                        .collect(),
+                                );
+                            }
+                        }
+                        return PacketVerdict::Accept;
+                    }
+                    let source_pkt = if let Some(evaded) =
+                        evade_http_request(tcp.payload, HttpEvasionOptions::default())
+                    {
+                        if evaded.len() == tcp.payload.len() {
+                            rebuild_tcp_payload_packet(&ip, &tcp, &evaded)
+                                .unwrap_or_else(|| raw_packet.to_vec())
+                        } else {
+                            raw_packet.to_vec()
+                        }
                     } else {
                         raw_packet.to_vec()
-                    }
-                } else {
-                    raw_packet.to_vec()
-                };
-                let split_mid = plan_tcp_splits(tcp.payload)
-                    .map(|s| s.split_at)
-                    .unwrap_or(2);
-                let fake_http = build_benign_fake_http_request("www.iana.org");
-                let fakes = [
-                    FakePacketMode::LowTtlWrongSeq(3),
-                    FakePacketMode::BadChecksumWrongSeq,
-                ];
-                if let Some(desync) =
-                    build_turkey_desync_packets(&source_pkt, &[2, split_mid], &fakes, &fake_http, true)
-                {
-                    if desync.len() > 1 {
-                        return PacketVerdict::ReplaceWithInjected(
-                            desync
-                                .into_iter()
-                                .map(|d| InjectedPacket { bytes: d.bytes })
-                                .collect(),
-                        );
+                    };
+                    let split_mid = plan_tcp_splits(tcp.payload)
+                        .map(|s| s.split_at)
+                        .unwrap_or(2);
+                    let fake_http = build_benign_fake_http_request("www.iana.org");
+                    let fakes = [
+                        FakePacketMode::LowTtlWrongSeq(3),
+                        FakePacketMode::BadChecksumWrongSeq,
+                    ];
+                    if let Some(desync) =
+                        build_turkey_desync_packets(&source_pkt, &[2, split_mid], &fakes, &fake_http, true)
+                    {
+                        if desync.len() > 1 {
+                            return PacketVerdict::ReplaceWithInjected(
+                                desync
+                                    .into_iter()
+                                    .map(|d| InjectedPacket { bytes: d.bytes })
+                                    .collect(),
+                            );
+                        }
                     }
                 }
             }
@@ -838,6 +974,37 @@ mod tests {
         match process_packet(&stun_pkt, true, &dns, &adaptive, &calibrator, &flows) {
             PacketVerdict::InjectDecoysThenAccept(d) => assert_eq!(d.len(), 2),
             other => panic!("Expected InjectDecoysThenAccept, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn linux_engine_executes_forge_package_without_recompiling() {
+        let (dns, adaptive) = test_engines(DpiStrategy::Passthrough);
+        let pkg = include_bytes!("../../../forge/examples/turkey_balanced.tulpar");
+        adaptive.load_forge_package_bytes(pkg).expect("valid .tulpar loads on Linux");
+
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+        let ch = sample_tls_client_hello("blocked.linux-forge.test");
+        let pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(93, 184, 216, 34),
+            53000,
+            443,
+            1000,
+            2000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &ch,
+        );
+        match process_packet(&pkt, true, &dns, &adaptive, &calibrator, &flows) {
+            PacketVerdict::ReplaceWithInjected(pkts) => {
+                assert!(pkts.len() >= 4, "Forge turkey-balanced decoys+splits must emit >=4 packets");
+            }
+            other => panic!("Expected Forge ReplaceWithInjected verdict, got {other:?}"),
         }
     }
 }

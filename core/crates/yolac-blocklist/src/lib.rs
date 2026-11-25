@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! YOLAÇ Local Ad, Tracker & Malware Blocklist Engine.
+//! TULPAR Local Ad, Tracker & Malware Blocklist Engine.
 //!
 //! Stores normalized domains in reversed-label order inside a single contiguous
 //! byte arena (`Vec<u8>`) indexed by `u32` offsets (`Vec<u32>`).

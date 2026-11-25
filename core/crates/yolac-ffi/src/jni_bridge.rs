@@ -13,10 +13,12 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
-use jni::objects::{GlobalRef, JClass, JObject, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JValue};
 use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
-use yolac_core::{health_reports_to_json, ErrorCode, YolacConfig, YolacEngine};
+use yolac_core::{
+    forge_status_to_json, health_reports_to_json, ErrorCode, YolacConfig, YolacEngine,
+};
 use yolac_net::SocketProtector;
 
 struct JniVpnProtector {
@@ -147,10 +149,7 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeStartTun(
         }
 
         let state_service_ref = service_ref.clone();
-        let state_jvm = match env.get_java_vm() {
-            Ok(j) => Some(j),
-            Err(_) => None,
-        };
+        let state_jvm = env.get_java_vm().ok();
 
         let protector = Arc::new(JniVpnProtector {
             jvm,
@@ -375,4 +374,69 @@ pub extern "system" fn Java_org_yolac_app_YolacNative_nativeReportPlatformError(
             }
         }
     }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeLoadForgePackage(
+    env: JNIEnv,
+    _class: JClass,
+    package_bytes: JByteArray,
+) -> jstring {
+    catch_unwind(AssertUnwindSafe(|| {
+        let ok = if let Ok(bytes) = env.convert_byte_array(&package_bytes) {
+            if let Some(holder) = get_or_init_holder() {
+                if let Ok(guard) = holder.engine.lock() {
+                    match guard.load_forge_package_bytes(&bytes) {
+                        Ok(_) => forge_status_to_json(&guard.forge_status()),
+                        Err(e) => {
+                            let esc = e.replace('\\', "\\\\").replace('"', "\\\"");
+                            format!("{{\"status\":\"error\",\"reason\":\"{esc}\"}}")
+                        }
+                    }
+                } else {
+                    "{\"status\":\"error\",\"reason\":\"engine_lock_failed\"}".into()
+                }
+            } else {
+                "{\"status\":\"error\",\"reason\":\"runtime_init_failed\"}".into()
+            }
+        } else {
+            "{\"status\":\"error\",\"reason\":\"invalid_byte_array\"}".into()
+        };
+        new_jstring_or_empty(&env, &ok)
+    }))
+    .unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeUnloadForgePackage(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(holder) = try_get_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                guard.unload_forge_package();
+            }
+        }
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_yolac_app_YolacNative_nativeGetForgeStatusJson(
+    env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    catch_unwind(AssertUnwindSafe(|| {
+        let json = if let Some(holder) = try_get_holder() {
+            if let Ok(guard) = holder.engine.lock() {
+                forge_status_to_json(&guard.forge_status())
+            } else {
+                "{\"status\":\"baseline\"}".into()
+            }
+        } else {
+            "{\"status\":\"baseline\"}".into()
+        };
+        new_jstring_or_empty(&env, &json)
+    }))
+    .unwrap_or(std::ptr::null_mut())
 }

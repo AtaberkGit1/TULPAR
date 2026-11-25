@@ -1,0 +1,26 @@
+# NEGATIVE AUDIT FIXTURE (Intentionally unsafe — rejected by `tulpar-forge check` / `ForgeVerifier`).
+# Demonstrates how Forge prevents victim-attribution decoys, amplification, and disabling rollback.
+strategy "unsafe-rejected-demo" {
+  version = "1.0.0"
+  author = "Security Audit"
+  description = "Should ALWAYS fail ForgeVerifier checks"
+  requires_raw_fallback = "auto_degrade"
+
+  rollback {
+    max_consecutive_failures = 200
+    min_samples = 6
+    max_failure_pct = 99
+  }
+
+  rule abusive_decoy {
+    priority = 100
+    match proto == tls, port == 443
+    raw_actions {
+      tcp_split = [2, sni_mid]
+      disorder = true
+      decoy_sni = "unrelated-victim.invalid"
+      decoys = [bad_checksum, bad_checksum, bad_checksum, bad_checksum, bad_checksum]
+      syn_mss_clamp = 64
+    }
+  }
+}

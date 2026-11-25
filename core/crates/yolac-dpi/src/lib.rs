@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! YOLAÇ DPI Inspection & Circumvention Engine
+//! TULPAR DPI Inspection & Circumvention Engine
 //!
 //! Pure, zero-panic parsers and payload/packet circumvention transforms for:
 //! - IPv4 / IPv6 + TCP / UDP packet inspection and RFC 1071 checksum calculation

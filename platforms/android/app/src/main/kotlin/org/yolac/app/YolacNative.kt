@@ -51,4 +51,13 @@ object YolacNative {
 
     @JvmStatic
     external fun nativeReportPlatformError(errorCode: Int)
+
+    @JvmStatic
+    external fun nativeLoadForgePackage(packageBytes: ByteArray): String
+
+    @JvmStatic
+    external fun nativeUnloadForgePackage()
+
+    @JvmStatic
+    external fun nativeGetForgeStatusJson(): String
 }

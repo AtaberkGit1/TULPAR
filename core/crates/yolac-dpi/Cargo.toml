@@ -3,6 +3,6 @@ name = "yolac-dpi"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Zero-panic IP/TCP/UDP/TLS/HTTP/QUIC parser and DPI circumvention transforms for YOLAÇ"
+description = "Zero-panic IP/TCP/UDP/TLS/HTTP/QUIC parser and DPI circumvention transforms for TULPAR"
 
 [dependencies]

@@ -1,7 +1,7 @@
 use std::process::Command;
 
-/// Extracts a verified `owner/repo` slug ONLY from an explicit `YOLAC_GITHUB_REPO` env var
-/// or the real `git remote get-url origin` if it points to `github.com`.
+/// Extracts a verified `owner/repo` slug ONLY from an explicit `TULPAR_GITHUB_REPO`
+/// (or legacy `YOLAC_GITHUB_REPO`) env var or the real `git remote get-url origin` if it points to `github.com`.
 /// NEVER invents or fabricates a repository address.
 fn parse_github_slug(raw: &str) -> Option<String> {
     let trimmed = raw.trim().trim_end_matches('/').trim_end_matches(".git");
@@ -32,12 +32,18 @@ fn parse_github_slug(raw: &str) -> Option<String> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=TULPAR_GITHUB_REPO");
     println!("cargo:rerun-if-env-changed=YOLAC_GITHUB_REPO");
     println!("cargo:rerun-if-changed=../../../.git/config");
 
-    let detected = std::env::var("YOLAC_GITHUB_REPO")
+    let detected = std::env::var("TULPAR_GITHUB_REPO")
         .ok()
         .and_then(|v| parse_github_slug(&v))
+        .or_else(|| {
+            std::env::var("YOLAC_GITHUB_REPO")
+                .ok()
+                .and_then(|v| parse_github_slug(&v))
+        })
         .or_else(|| {
             let out = Command::new("git")
                 .args(["remote", "get-url", "origin"])
@@ -51,6 +57,7 @@ fn main() {
         });
 
     if let Some(slug) = detected {
+        println!("cargo:rustc-env=TULPAR_DETECTED_GITHUB_REPO={slug}");
         println!("cargo:rustc-env=YOLAC_DETECTED_GITHUB_REPO={slug}");
     }
 }

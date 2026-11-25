@@ -3,13 +3,14 @@ name = "yolac-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Userspace smoltcp TUN packet router, protected DPI TCP relay, UDP NAT, and leak guard for YOLAÇ"
+description = "Userspace smoltcp TUN packet router, protected DPI TCP relay, UDP NAT, and leak guard for TULPAR"
 
 [dependencies]
 tokio.workspace = true
 smoltcp.workspace = true
 yolac-dpi = { path = "../yolac-dpi" }
 yolac-dns = { path = "../yolac-dns" }
+tulpar-forge = { path = "../../../forge/crates/tulpar-forge" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

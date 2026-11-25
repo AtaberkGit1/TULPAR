@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! YOLAÇ Encrypted DNS & Leak-Prevention Engine.
+//! TULPAR Encrypted DNS & Leak-Prevention Engine.
 //!
 //! Features:
 //! - Cycle-safe RFC 1035 DNS wire parser & blocked-response synthesizer

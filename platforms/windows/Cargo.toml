@@ -16,6 +16,7 @@ yolac-core = { path = "../../core/crates/yolac-core" }
 yolac-dpi = { path = "../../core/crates/yolac-dpi" }
 yolac-dns = { path = "../../core/crates/yolac-dns" }
 yolac-net = { path = "../../core/crates/yolac-net" }
+tulpar-forge = { path = "../../forge/crates/tulpar-forge" }
 
 [dev-dependencies]
 yolac-blocklist = { path = "../../core/crates/yolac-blocklist" }

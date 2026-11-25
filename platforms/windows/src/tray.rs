@@ -54,7 +54,7 @@ mod win_impl {
 
     unsafe fn load_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
         let hinst = GetModuleHandleW(std::ptr::null());
-        let embedded = LoadIconW(hinst, 1usize as *const u16);
+        let embedded = LoadIconW(hinst, std::ptr::without_provenance::<u16>(1));
         if !embedded.is_null() {
             embedded
         } else {

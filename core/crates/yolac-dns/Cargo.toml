@@ -3,7 +3,7 @@ name = "yolac-dns"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Encrypted DNS (DoH/DoT), local blocklist/CNAME uncloaking, poisoning detection, and RAM-only LRU cache for YOLAÇ"
+description = "Encrypted DNS (DoH/DoT), local blocklist/CNAME uncloaking, poisoning detection, and RAM-only LRU cache for TULPAR"
 
 [dependencies]
 tokio.workspace = true

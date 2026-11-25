@@ -14,6 +14,11 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+  TULPAR_GITHUB_REPO: ${{ github.repository }}
+  YOLAC_GITHUB_REPO: ${{ github.repository }}
+
 jobs:
   build-windows-release:
     runs-on: windows-latest
@@ -23,6 +28,7 @@ jobs:
       - name: Build & Test TULPAR Windows (.exe + verified WinDivert 2.2.2 .zip)
         shell: pwsh
         env:
+          TULPAR_GITHUB_REPO: ${{ github.repository }}
           YOLAC_GITHUB_REPO: ${{ github.repository }}
         run: |
           cd platforms/windows
@@ -52,11 +58,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
-      - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.10.2"
@@ -65,12 +70,15 @@ jobs:
           targets: aarch64-linux-android,x86_64-linux-android
       - name: Build Android Rust JNI + JUnit Tests + Lint + APK (.apk)
         env:
+          TULPAR_GITHUB_REPO: ${{ github.repository }}
           YOLAC_GITHUB_REPO: ${{ github.repository }}
         run: |
           export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          CMDLINE_BIN="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin 2>/dev/null | sort -V | tail -n 1)"
+          export PATH="${CMDLINE_BIN:-$ANDROID_HOME/cmdline-tools/latest/bin}:$ANDROID_HOME/platform-tools:$PATH"
           yes | sdkmanager --licenses >/dev/null || true
-          yes | sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" >/dev/null || sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
           NDK_BIN="$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android26-clang"
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
@@ -110,6 +118,7 @@ jobs:
       - name: Build Static Zero-Dependency TULPAR Linux (x86_64)
         working-directory: platforms/linux
         env:
+          TULPAR_GITHUB_REPO: ${{ github.repository }}
           YOLAC_GITHUB_REPO: ${{ github.repository }}
         run: |
           cargo test
@@ -126,7 +135,7 @@ jobs:
 
   publish-github-release:
     needs: [build-windows-release, build-android-release, build-linux-release]
-    if: ${{ always() && (needs.build-windows-release.result == 'success' || needs.build-android-release.result == 'success' || needs.build-linux-release.result == 'success') }}
+    if: ${{ needs.build-windows-release.result == 'success' && needs.build-android-release.result == 'success' && needs.build-linux-release.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -139,13 +148,13 @@ jobs:
           ls -lh
           find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -exec sha256sum {} + | sed 's| \./| |' > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - name: Publish Official GitHub Release (Windows + Android)
+      - name: Publish Official GitHub Release (Windows + Android + Linux)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
           REPO="${{ github.repository }}"
-          NOTES="GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! İndirdiğiniz dosyaların bütünlüğünü SHA256SUMS.txt ile doğrulayın. Windows'ta doğrudan tulpar.exe dosyasını veya tulpar-windows-x64.zip paketini kullanabilirsiniz. Android için tulpar.apk dosyasını kurun."
+          NOTES="GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin! İndirdiğiniz dosyaların bütünlüğünü SHA256SUMS.txt ile doğrulayın. Windows'ta doğrudan tulpar.exe veya tulpar-windows-x64.zip, Android'de tulpar.apk, Linux'ta tulpar-linux-x64 dosyasını kullanabilirsiniz."
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             gh release upload "$TAG" release-assets/* --repo "$REPO" --clobber
             gh release edit "$TAG" --repo "$REPO" --title "TULPAR $TAG" --notes "$NOTES"

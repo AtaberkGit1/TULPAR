@@ -560,6 +560,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tulpar-forge"
+version = "0.4.0"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -801,6 +805,7 @@ dependencies = [
  "rustls",
  "tokio",
  "tokio-rustls",
+ "tulpar-forge",
  "webpki-roots 0.26.11",
  "yolac-blocklist",
  "yolac-dns",
@@ -842,6 +847,7 @@ dependencies = [
  "libc",
  "smoltcp",
  "tokio",
+ "tulpar-forge",
  "yolac-dns",
  "yolac-dpi",
 ]

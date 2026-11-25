@@ -1,0 +1,83 @@
+# TULPAR Strategy Language (TSL v1)
+# Balanced cross-platform strategy for Windows (WinDivert), Linux (NFQUEUE), and Android (VpnService).
+strategy "turkey-balanced" {
+  version = "1.0.0"
+  author = "TULPAR Contributors"
+  description = "Balanced server-safe decoy + reverse split on raw OS, multi-record SNI split on mobile"
+  min_core_version = "0.4.0"
+  requires_raw_fallback = "auto_degrade"
+
+  rollback {
+    max_consecutive_failures = 4
+    min_samples = 6
+    max_failure_pct = 65
+  }
+
+  rule tls_baseline {
+    priority = 100
+    match proto == tls, port in [443, 8443, 2053, 2083, 2087, 2096], min_payload = 9
+    raw_actions {
+      tcp_split = [2, sni_mid]
+      disorder = true
+      decoy_sni = "www.iana.org"
+      decoys = [bad_checksum, low_ttl_wrong_seq(auto), bad_checksum_wrong_seq]
+    }
+    socket_actions {
+      tls_record = small_chunks(24)
+      paced_flush = true
+    }
+  }
+
+  rule tls_strict_retry {
+    priority = 95
+    when on_retry >= 1
+    match proto == tls, port in [443, 8443]
+    raw_actions {
+      tcp_split = [1, 2, sni_mid]
+      disorder = true
+      decoy_sni = "www.iana.org"
+      decoys = [low_ttl_wrong_seq(auto), low_ttl_wrong_seq(5), bad_checksum, bad_checksum_wrong_seq]
+      syn_mss_clamp = 536
+    }
+    socket_actions {
+      tls_record = small_chunks(20)
+      tcp_oob = true
+    }
+  }
+
+  rule http_plain_evasion {
+    priority = 80
+    match proto == http, port in [80, 8080]
+    raw_actions {
+      http_split_host = true
+      http_host_case = true
+      tcp_split = [2, host_mid]
+      disorder = true
+      decoy_sni = "www.iana.org"
+      decoys = [low_ttl_wrong_seq(3), bad_checksum_wrong_seq]
+    }
+    socket_actions {
+      http_split_host = true
+      http_host_case = true
+      tcp_split = [host_mid]
+    }
+  }
+
+  rule quic_tcp_fallback {
+    priority = 70
+    match proto == quic, port == 443
+    quic_mode = block_fallback_tcp
+  }
+
+  rule realtime_udp_desync {
+    priority = 60
+    match proto in [udp_stun, udp_raknet]
+    udp_desync_ttl = 3
+    udp_bad_checksum_decoy = true
+  }
+
+  lab_assert {
+    expect_pass = [shallow_sni_reset, stateful_sni_reassembly, hop_sensitive_inline_dpi, passive_optical_rst, http_host_block, quic_throttle, protocol_throttler, dns_poisoning_and_adblock]
+    expect_honest_unbypassable = [hard_ip_blackhole]
+  }
+}

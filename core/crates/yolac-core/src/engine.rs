@@ -1,12 +1,14 @@
 //! Unified TULPAR engine orchestrator (Windows & Android).
 
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
+use tulpar_forge::{ForgeRuntime, ForgeStatusSnapshot, VerifyReport};
 use yolac_blocklist::Blocklist;
 use yolac_dns::{default_public_upstreams, DnsConfig, DnsEngine};
 use yolac_dpi::{DpiStrategy, PlatformCapabilities, QuicPolicy};
@@ -181,6 +183,26 @@ impl YolacEngine {
         &self.health
     }
 
+    pub fn forge(&self) -> &Arc<ForgeRuntime> {
+        self.adaptive.forge()
+    }
+
+    pub fn load_forge_package_bytes(&self, bytes: &[u8]) -> Result<VerifyReport, String> {
+        self.adaptive.load_forge_package_bytes(bytes)
+    }
+
+    pub fn load_forge_package_file(&self, path: &Path) -> Result<VerifyReport, String> {
+        self.adaptive.load_forge_package_file(path)
+    }
+
+    pub fn unload_forge_package(&self) {
+        self.adaptive.unload_forge_package();
+    }
+
+    pub fn forge_status(&self) -> ForgeStatusSnapshot {
+        self.adaptive.forge_status()
+    }
+
     pub fn set_state(&self, new_state: EngineState) {
         if let EngineState::Error(code) = new_state {
             self.health.record_platform_error(Some(code));
@@ -212,12 +234,13 @@ impl YolacEngine {
 
     /// Evaluates and returns real health reports for all 7 TULPAR modules.
     pub fn health_snapshot(&self) -> [ModuleHealthReport; 7] {
-        self.health.evaluate_all(
+        self.health.evaluate_all_with_forge(
             self.state(),
             self.config.capabilities,
             &self.blocklist,
             &self.dns,
             &self.captive_portal,
+            Some(&self.adaptive.forge_status()),
         )
     }
 

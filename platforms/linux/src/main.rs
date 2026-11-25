@@ -39,7 +39,8 @@ GÜVENLİK UYARISI: TULPAR'ı yalnızca resmî GitHub sayfamızdan indirin!
 Resmî Sürümler: https://github.com/AtaberkGit1/TULPAR/releases
 
 Kullanım:
-  sudo tulpar start       Korumayı ön planda başlatır (Ctrl+C ile tüm kuralları temizleyip çıkar)
+  sudo tulpar start [--strategy <file.tulpar>]
+                          Korumayı ön planda başlatır (Ctrl+C ile tüm kuralları temizleyip çıkar)
   sudo tulpar install     /usr/local/bin/tulpar + systemd servisini kurar ve hemen başlatır
   sudo tulpar uninstall   Systemd servisini, güvenlik duvarı kurallarını ve kurulumu kaldırır
   tulpar test             Canlı şifreli DNS gecikmesi (ms), IPv6 ve DPI öz-denetimi yapar
@@ -297,7 +298,7 @@ fn cmd_uninstall() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_start() -> ExitCode {
+fn cmd_start(strategy_path: Option<&Path>) -> ExitCode {
     if !is_root() {
         eprintln!("HATA: Paket yakalama için root yetkisi gerekir: sudo tulpar start");
         return ExitCode::FAILURE;
@@ -315,6 +316,29 @@ fn cmd_start() -> ExitCode {
     let protector = Arc::new(LinuxMarkProtector);
     let engine = Arc::new(YolacEngine::new(YolacConfig::linux_desktop(), Some(protector)));
 
+    // Load explicit --strategy <file.tulpar|.tlp> or optional root-managed /etc/tulpar/active.tulpar
+    let active_strategy = strategy_path.or_else(|| {
+        let p = Path::new("/etc/tulpar/active.tulpar");
+        p.is_file().then_some(p)
+    });
+    if let Some(spath) = active_strategy {
+        match engine.load_forge_package_file(spath) {
+            Ok(rep) => {
+                let snap = engine.forge_status();
+                println!(
+                    "TULPAR Forge Stratejisi Yüklendi: {} v{} [sha256:{}.., Linux={:?}]",
+                    snap.package_name.as_deref().unwrap_or("?"),
+                    snap.package_version.as_deref().unwrap_or("?"),
+                    snap.sha256_prefix.as_deref().unwrap_or(""),
+                    rep.compatibility.linux
+                );
+            }
+            Err(e) => {
+                eprintln!("UYARI: Forge stratejisi yüklenemedi ({e}); güvenli temel strateji kullanılacak.");
+            }
+        }
+    }
+
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -326,7 +350,7 @@ fn cmd_start() -> ExitCode {
 
     // Select fastest encrypted upstream before intercepting system DNS
     if let Some(_best_idx) = rt.block_on(engine.dns_engine().probe_fastest_upstream()) {
-        println!("TULPAR En Hızlı Şifreli DNS Otomatik Seçildi (Turbo Önbellek + SWR Aktif)");
+        println!("TULPAR En Düşük Gecikmeli Şifreli DNS Seçildi (RAM Önbellek + SWR Aktif)");
     }
 
     // Bind local DNS proxy listeners synchronously BEFORE touching firewall NAT rules!
@@ -429,7 +453,23 @@ fn main() -> ExitCode {
         "update" => cmd_update(),
         "install" => cmd_install(),
         "uninstall" => cmd_uninstall(),
-        "start" | "run" => cmd_start(),
+        "start" | "run" => {
+            let mut strat: Option<String> = None;
+            let mut i = 2usize;
+            while i < args.len() {
+                if args[i] == "--strategy" {
+                    if let Some(p) = args.get(i + 1) {
+                        strat = Some(p.clone());
+                        i += 2;
+                        continue;
+                    }
+                } else if let Some(p) = args[i].strip_prefix("--strategy=") {
+                    strat = Some(p.to_string());
+                }
+                i += 1;
+            }
+            cmd_start(strat.as_deref().map(Path::new))
+        }
         "stop-rules" => {
             if is_root() {
                 remove_firewall_rules();
