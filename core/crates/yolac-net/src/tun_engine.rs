@@ -92,7 +92,7 @@ impl TunConfig {
     }
 }
 
-const MAX_TUN_RX_BATCH: usize = 32;
+const MAX_TUN_RX_BATCH: usize = 64;
 
 /// Abstract L3 packet interface (backed by `AsyncFd` Android TUN fd or test channels).
 pub trait PacketDevice: Send + Sync {
@@ -453,9 +453,9 @@ impl TunEngine {
                 _ = tokio::time::sleep(poll_delay) => {}
                 _ = cleanup_tick.tick() => {
                     let now = Instant::now();
-                    udp_sessions.retain(|_, s| {
-                        !s.tx.is_closed() && now.duration_since(s.last_active) < Duration::from_secs(45)
-                    });
+                    // Spawner tasks already enforce a 40s bidirectional idle timer across send+recv;
+                    // checking `!s.tx.is_closed()` avoids killing long-lived receive-only UDP streams.
+                    udp_sessions.retain(|_, s| !s.tx.is_closed());
                     tcp_flows.retain(|_, flow| {
                         let idle = now.duration_since(flow.last_active);
                         if idle < Duration::from_secs(120) {
@@ -688,7 +688,7 @@ impl TunEngine {
                     }
                 }
 
-                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(32);
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
                 let _ = tx.try_send(udp.payload.to_vec());
                 udp_sessions.insert(
                     key,

@@ -204,6 +204,22 @@ impl DpiTcpRelay {
                             Err(e) => return Err(e), // Instant RST propagation to Happy Eyeballs!
                         }
                     }
+                    _ = async {
+                        if let Some(ref s) = speculative_upstream {
+                            let mut peek_byte = [0u8; 1];
+                            let _ = s.peek(&mut peek_byte).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if speculative_upstream.is_some() => {
+                        // Server spoke first on a web port (e.g. non-HTTP tunnel/proxy on 443/8080/8443):
+                        // do NOT stall 30s waiting on client.read(); enter bidirectional relay immediately!
+                        let mut upstream = speculative_upstream.take().expect("checked Some");
+                        let _ = tokio::io::copy_bidirectional_with_sizes(
+                            &mut client, &mut upstream, RELAY_COPY_BUF, RELAY_COPY_BUF,
+                        ).await?;
+                        return Ok(());
+                    }
                     r_res = &mut read_fut => {
                         match r_res {
                             Ok(Ok(0)) => return Ok(()),

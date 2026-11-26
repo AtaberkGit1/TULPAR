@@ -509,30 +509,70 @@ impl DnsEngine {
             }
         }
 
-        // Sequential fallback over remaining upstreams
-        let first_offset = if count == 1 {
+        // Failover over remaining upstreams in concurrent pairs so dead DoT/IPv6 paths
+        // never stall queries linearly (`~5s` worst-case vs `~12.75s` sequential).
+        let mut offset = if count == 1 {
             0
         } else if skipped_second {
             2
         } else {
             1
         };
-        for offset in first_offset..count {
-            let idx = (start + offset) % count;
-            let upstream = &upstreams[idx];
-            let started = Instant::now();
-            let Ok(resp_wire) = self.query_with_pool(idx, upstream, query_wire).await else {
-                continue;
-            };
-            if let Some(done) = self.evaluate_upstream_reply(
-                idx,
-                started.elapsed(),
-                query,
-                query_wire,
-                resp_wire,
-                &mut first_private_candidate,
-            ) {
-                return done;
+        while offset < count {
+            if offset + 1 < count {
+                let idx_a = (start + offset) % count;
+                let idx_b = (start + offset + 1) % count;
+                let t_a = Instant::now();
+                let t_b = Instant::now();
+                let fut_a = self.query_with_pool(idx_a, &upstreams[idx_a], query_wire);
+                let fut_b = self.query_with_pool(idx_b, &upstreams[idx_b], query_wire);
+                tokio::pin!(fut_a);
+                tokio::pin!(fut_b);
+
+                let mut done_a = false;
+                let mut done_b = false;
+                while !done_a || !done_b {
+                    tokio::select! {
+                        res_a = &mut fut_a, if !done_a => {
+                            done_a = true;
+                            if let Ok(resp_wire) = res_a {
+                                if let Some(done) = self.evaluate_upstream_reply(
+                                    idx_a, t_a.elapsed(), query, query_wire, resp_wire, &mut first_private_candidate,
+                                ) {
+                                    return done;
+                                }
+                            }
+                        }
+                        res_b = &mut fut_b, if !done_b => {
+                            done_b = true;
+                            if let Ok(resp_wire) = res_b {
+                                if let Some(done) = self.evaluate_upstream_reply(
+                                    idx_b, t_b.elapsed(), query, query_wire, resp_wire, &mut first_private_candidate,
+                                ) {
+                                    return done;
+                                }
+                            }
+                        }
+                    }
+                }
+                offset += 2;
+            } else {
+                let idx = (start + offset) % count;
+                let upstream = &upstreams[idx];
+                let started = Instant::now();
+                if let Ok(resp_wire) = self.query_with_pool(idx, upstream, query_wire).await {
+                    if let Some(done) = self.evaluate_upstream_reply(
+                        idx,
+                        started.elapsed(),
+                        query,
+                        query_wire,
+                        resp_wire,
+                        &mut first_private_candidate,
+                    ) {
+                        return done;
+                    }
+                }
+                offset += 1;
             }
         }
 

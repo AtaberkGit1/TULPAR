@@ -444,8 +444,15 @@ impl StrategyAdvisor for AdaptiveController {
                 } else if entry.strategy == DpiStrategy::TcpOobAndTlsSplit
                     && entry.consecutive_failures >= 3
                 {
-                    // Avoid locking forever on MSG_OOB if a strict L7 proxy rejects OOB bytes
-                    entry.strategy = DpiStrategy::TlsMultiRecordAndTcpSplit;
+                    // Avoid locking forever on MSG_OOB if a strict L7 proxy rejects OOB bytes;
+                    // drop to Passthrough after aggressive chunking + OOB both failed so clean
+                    // unblocked servers recover cleanly.
+                    entry.strategy = DpiStrategy::Passthrough;
+                    entry.consecutive_failures = 0;
+                } else if entry.consecutive_failures >= 3 {
+                    // Terminal strategy (e.g. TurkeyDesyncAggressive with MSS=536 + decoys + disorder)
+                    // repeatedly failed -> try Passthrough so strict WAFs/banks/games never stall 15 min!
+                    entry.strategy = DpiStrategy::Passthrough;
                     entry.consecutive_failures = 0;
                 }
             }
@@ -655,5 +662,29 @@ mod tests {
 
         ctrl.on_network_change();
         assert_eq!(ctrl.select_strategy(dst, Some("blocked.test")), DpiStrategy::Passthrough);
+    }
+
+    #[test]
+    fn falls_back_to_passthrough_when_terminal_strategy_keeps_failing() {
+        let ctrl = AdaptiveController::new(
+            PlatformCapabilities::WINDOWS_WINDIVERT,
+            DpiStrategy::TurkeyDesyncAggressive,
+            64,
+        );
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 443);
+
+        for _ in 0..3 {
+            ctrl.report_outcome(
+                dst,
+                Some("strict-bank-waf.example"),
+                DpiStrategy::TurkeyDesyncAggressive,
+                FlowOutcome::ResetOrEofDuringHandshake,
+            );
+        }
+        assert_eq!(
+            ctrl.select_strategy(dst, Some("strict-bank-waf.example")),
+            DpiStrategy::Passthrough,
+            "Strict servers rejecting MSS-536/disorder must recover to Passthrough"
+        );
     }
 }

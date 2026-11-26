@@ -358,7 +358,7 @@ impl YolacEngine {
                 let dns_probe = dns.probe_fastest_upstream();
                 if dual_stack {
                     let v6_probe =
-                        probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(600));
+                        probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(1200));
                     let (_, mode) = tokio::join!(dns_probe, v6_probe);
                     if probe_gen.load(Ordering::SeqCst) == gen {
                         let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;
@@ -419,7 +419,7 @@ impl YolacEngine {
                 let dns_probe = dns.probe_fastest_upstream();
                 if dual_stack {
                     let v6_probe =
-                        probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(600));
+                        probe_ipv6_leak_mode(protector.as_ref(), None, Duration::from_millis(1200));
                     let (_, mode) = tokio::join!(dns_probe, v6_probe);
                     if probe_gen.load(Ordering::SeqCst) == gen {
                         let should_block = mode == Ipv6LeakMode::BlockUnprotectedIpv6;

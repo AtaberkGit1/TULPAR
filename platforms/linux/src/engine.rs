@@ -28,7 +28,7 @@ use yolac_dpi::{
     plan_tcp_splits, segment_tcp_packet, DpiStrategy, FakePacketMode, HttpEvasionOptions,
     IpProtocol, ParsedIpPacket, ParsedTcp, QuicPolicy, TtlCalibrator,
 };
-use yolac_net::{is_local_lan_ip, FlowOutcome, StrategyAdvisor};
+use yolac_net::{is_captive_portal_probe_domain, is_local_lan_ip, FlowOutcome, StrategyAdvisor};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InjectedPacket {
@@ -83,6 +83,7 @@ pub struct FlowTracker {
     pending: Mutex<HashMap<u64, PendingFlow>>,
     udp_desynced: Mutex<HashMap<u64, Instant>>,
     pq_streams: Mutex<HashMap<u64, PqStreamBuf>>,
+    pq_bypass: Mutex<HashMap<u64, Instant>>,
 }
 
 impl Default for FlowTracker {
@@ -100,6 +101,22 @@ impl FlowTracker {
             pending: Mutex::new(HashMap::new()),
             udp_desynced: Mutex::new(HashMap::new()),
             pq_streams: Mutex::new(HashMap::new()),
+            pq_bypass: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn mark_pq_bypass(&self, key: u64) {
+        if let Ok(mut bp) = self.pq_bypass.lock() {
+            let now = Instant::now();
+            if bp.len() >= 128 && !bp.contains_key(&key) {
+                bp.retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(30));
+                if bp.len() >= 128 {
+                    if let Some(&evict) = bp.keys().next() {
+                        bp.remove(&evict);
+                    }
+                }
+            }
+            bp.insert(key, now);
         }
     }
 
@@ -113,16 +130,26 @@ impl FlowTracker {
         first_payload: &[u8],
     ) -> bool {
         let key = self.flow_key(local_port, dst.ip(), dst.port());
+        if let Ok(mut bp) = self.pq_bypass.lock() {
+            if let Some(&ts) = bp.get(&key) {
+                if ts.elapsed() < Duration::from_secs(30) {
+                    return false;
+                }
+                bp.remove(&key);
+            }
+        }
         let Ok(mut guard) = self.pq_streams.lock() else {
             return false;
         };
         if let Some(prev) = guard.get(&key) {
             if prev.start_seq == seq {
                 guard.remove(&key);
+                drop(guard);
+                self.mark_pq_bypass(key);
                 return false;
             }
         }
-        guard.retain(|_, v| v.started.elapsed() < Duration::from_millis(120));
+        guard.retain(|_, v| v.started.elapsed() < Duration::from_millis(450));
         if guard.len() >= 64 {
             if let Some(&evict) = guard.keys().next() {
                 guard.remove(&evict);
@@ -152,8 +179,10 @@ impl FlowTracker {
         let key = self.flow_key(local_port, dst.ip(), dst.port());
         let mut guard = self.pq_streams.lock().ok()?;
         let entry = guard.get_mut(&key)?;
-        if entry.started.elapsed() > Duration::from_millis(150) || seq != entry.next_seq {
+        if entry.started.elapsed() > Duration::from_millis(450) || seq != entry.next_seq {
             guard.remove(&key);
+            drop(guard);
+            self.mark_pq_bypass(key);
             return None;
         }
         let room = entry.expected_len.saturating_sub(entry.payload.len());
@@ -361,6 +390,9 @@ impl FlowTracker {
             g.clear();
         }
         if let Ok(mut g) = self.pq_streams.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pq_bypass.lock() {
             g.clear();
         }
     }
@@ -677,7 +709,8 @@ pub fn process_packet(
 
             if tcp.dst_port == 80 {
                 if let Some(http_info) = parse_http_host(tcp.payload) {
-                    let is_sensitive = is_sensitive_unblocked_domain(&http_info.host);
+                    let is_sensitive = is_sensitive_unblocked_domain(&http_info.host)
+                        || is_captive_portal_probe_domain(&http_info.host);
                     let host_mid = http_info.host_range.0
                         + (http_info.host_range.1 - http_info.host_range.0) / 2;
                     if let Some(fplan) = adaptive.select_raw_forge_plan(
@@ -709,6 +742,18 @@ pub fn process_packet(
                                 );
                             }
                         }
+                        return PacketVerdict::Accept;
+                    }
+                    let http_strategy = if is_sensitive {
+                        adaptive.select_strategy_with_default(
+                            dst,
+                            Some(&http_info.host),
+                            DpiStrategy::Passthrough,
+                        )
+                    } else {
+                        adaptive.select_strategy(dst, Some(&http_info.host))
+                    };
+                    if http_strategy == DpiStrategy::Passthrough {
                         return PacketVerdict::Accept;
                     }
                     let source_pkt = if let Some(evaded) =
@@ -1358,5 +1403,59 @@ mod tests {
             process_packet(&dot_bootstrap, true, &dns, &adaptive, &calibrator, &flows),
             PacketVerdict::Accept
         );
+    }
+
+    #[test]
+    fn http80_preserves_captive_portals_sensitive_domains_and_pq_retransmit_never_double_drops() {
+        let (dns, adaptive) = test_engines(DpiStrategy::TurkeyDesyncAuto);
+        let calibrator = TtlCalibrator::default();
+        let flows = FlowTracker::default();
+
+        // Captive portal & sensitive domains on port 80 must pass untouched
+        for host in ["connectivitycheck.gstatic.com", "www.turkiye.gov.tr"] {
+            let req = format!("GET /generate_204 HTTP/1.1\r\nHost: {host}\r\n\r\n");
+            let pkt = build_ipv4_tcp_packet(
+                Ipv4Addr::new(192, 168, 1, 20),
+                Ipv4Addr::new(93, 184, 216, 34),
+                54200,
+                80,
+                100,
+                200,
+                ParsedTcp::ACK | ParsedTcp::PSH,
+                65535,
+                64,
+                1,
+                &[],
+                req.as_bytes(),
+            );
+            assert_eq!(
+                process_packet(&pkt, true, &dns, &adaptive, &calibrator, &flows),
+                PacketVerdict::Accept,
+                "Sensitive/captive HTTP host {host} must not have headers mangled"
+            );
+        }
+
+        // Retransmitted PQ segment 1 must bypass reassembly buffering instead of looping drops
+        let pq_dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(142, 250, 187, 174)), 443);
+        let seg1_payload = [0x16u8, 0x03, 0x01, 0x07, 0x00, 0x01, 0x00, 0x06, 0xFC];
+        let seg1_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 20),
+            Ipv4Addr::new(142, 250, 187, 174),
+            54201,
+            443,
+            30_000,
+            1_000,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            &seg1_payload,
+        );
+        assert!(flows.begin_pq_stream(54201, pq_dst, 30_000, 1800, &seg1_pkt, &seg1_payload));
+        // Duplicate/retransmit triggers pq_bypass
+        assert!(!flows.begin_pq_stream(54201, pq_dst, 30_000, 1800, &seg1_pkt, &seg1_payload));
+        // Any subsequent retry on the same flow skips buffering immediately
+        assert!(!flows.begin_pq_stream(54201, pq_dst, 30_000, 1800, &seg1_pkt, &seg1_payload));
     }
 }

@@ -75,6 +75,14 @@ async fn serve_udp(sock: Arc<UdpSocket>, dns: Arc<DnsEngine>, mut shutdown: watc
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                if let Some(q) = parse_dns_query(&buf[..n]) {
+                    if is_local_lan_hostname(&q.qname) {
+                        if let Some(reply) = build_blocked_response(&buf[..n], true) {
+                            let _ = sock.send_to(&reply, peer).await;
+                        }
+                        continue;
+                    }
+                }
                 // Fast-path synchronous RAM cache / ad-block / AAAA suppression without spawning a task
                 if let Some((resp_opt, _)) = dns.try_resolve_local(&buf[..n]) {
                     if let Some(reply) = resp_opt {

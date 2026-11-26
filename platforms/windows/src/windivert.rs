@@ -165,6 +165,7 @@ pub struct FlowTracker {
     pending: Mutex<HashMap<u64, PendingFlow>>,
     udp_desynced: Mutex<HashMap<u64, Instant>>,
     pq_streams: Mutex<HashMap<u64, PqStreamBuf>>,
+    pq_bypass: Mutex<HashMap<u64, Instant>>,
 }
 
 impl FlowTracker {
@@ -176,6 +177,22 @@ impl FlowTracker {
             pending: Mutex::new(HashMap::new()),
             udp_desynced: Mutex::new(HashMap::new()),
             pq_streams: Mutex::new(HashMap::new()),
+            pq_bypass: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn mark_pq_bypass(&self, key: u64) {
+        if let Ok(mut bp) = self.pq_bypass.lock() {
+            let now = Instant::now();
+            if bp.len() >= 128 && !bp.contains_key(&key) {
+                bp.retain(|_, ts| now.duration_since(*ts) < Duration::from_secs(30));
+                if bp.len() >= 128 {
+                    if let Some(&evict) = bp.keys().next() {
+                        bp.remove(&evict);
+                    }
+                }
+            }
+            bp.insert(key, now);
         }
     }
 
@@ -189,6 +206,14 @@ impl FlowTracker {
         first_payload: &[u8],
     ) -> bool {
         let key = self.flow_key(local_port, dst.ip(), dst.port());
+        if let Ok(mut bp) = self.pq_bypass.lock() {
+            if let Some(&ts) = bp.get(&key) {
+                if ts.elapsed() < Duration::from_secs(30) {
+                    return false;
+                }
+                bp.remove(&key);
+            }
+        }
         let Ok(mut guard) = self.pq_streams.lock() else {
             return false;
         };
@@ -196,10 +221,12 @@ impl FlowTracker {
             if prev.start_seq == seq {
                 // Retransmission of initial PQ segment: stop delaying and let normal path send immediately.
                 guard.remove(&key);
+                drop(guard);
+                self.mark_pq_bypass(key);
                 return false;
             }
         }
-        guard.retain(|_, v| v.started.elapsed() < Duration::from_millis(120));
+        guard.retain(|_, v| v.started.elapsed() < Duration::from_millis(450));
         if guard.len() >= 64 {
             if let Some(&evict) = guard.keys().next() {
                 guard.remove(&evict);
@@ -229,12 +256,16 @@ impl FlowTracker {
         let key = self.flow_key(local_port, dst.ip(), dst.port());
         let mut guard = self.pq_streams.lock().ok()?;
         let entry = guard.get_mut(&key)?;
-        if entry.started.elapsed() > Duration::from_millis(150) {
+        if entry.started.elapsed() > Duration::from_millis(450) {
             guard.remove(&key);
+            drop(guard);
+            self.mark_pq_bypass(key);
             return None;
         }
         if seq != entry.next_seq {
             guard.remove(&key);
+            drop(guard);
+            self.mark_pq_bypass(key);
             return None;
         }
         let room = entry.expected_len.saturating_sub(entry.payload.len());
@@ -453,6 +484,9 @@ impl FlowTracker {
             g.clear();
         }
         if let Ok(mut g) = self.pq_streams.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.pq_bypass.lock() {
             g.clear();
         }
     }
@@ -695,7 +729,7 @@ impl WindowsPacketEngine {
         // HTTP verbs/3xx redirects, DNS (53), rogue DoT (853), QUIC (443), Discord IP Discovery (74B),
         // STUN Binding (0x2112A442), and Roblox RakNet while keeping download ACKs in kernel!
         let kernel_fast_filter = CString::new(
-            "not loopback and ((outbound and ((tcp.DstPort == 443 and ((tcp.Syn and not tcp.Ack) or tcp.PayloadLength > 0)) or (tcp.DstPort == 80 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 16 and (tcp.Payload[0] == 0x47 or tcp.Payload[0] == 0x50 or tcp.Payload[0] == 0x48 or tcp.Payload[0] == 0x44 or tcp.Payload[0] == 0x4F)))) or udp.DstPort == 53 or tcp.DstPort == 53 or tcp.DstPort == 853 or udp.DstPort == 443 or (udp.DstPort >= 10000 and udp.PayloadLength == 74 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[2] == 0x00 and udp.Payload[3] == 0x46) or ((udp.DstPort >= 10000 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599)) and udp.PayloadLength >= 20 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[4] == 0x21 and udp.Payload[5] == 0x12 and udp.Payload[6] == 0xA4 and udp.Payload[7] == 0x42) or (udp.DstPort >= 49152 and udp.PayloadLength >= 17 and udp.Payload[0] == 0x05 and udp.Payload[1] == 0x00 and udp.Payload[2] == 0xFF and udp.Payload[3] == 0xFF and udp.Payload[4] == 0x00 and udp.Payload[5] == 0xFE))) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 6 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x02))) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50 and tcp.Payload[9] == 0x33))))))",
+            "not loopback and ((outbound and ((tcp.DstPort == 443 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength > 0 and not (tcp.PayloadLength >= 5 and tcp.Payload[0] == 0x17 and tcp.Payload[1] == 0x03 and tcp.Payload[2] >= 0x01 and tcp.Payload[2] <= 0x04)))) or (tcp.DstPort == 80 and ((tcp.Syn and not tcp.Ack) or (tcp.PayloadLength >= 16 and (tcp.Payload[0] == 0x47 or tcp.Payload[0] == 0x50 or tcp.Payload[0] == 0x48 or tcp.Payload[0] == 0x44 or tcp.Payload[0] == 0x4F)))) or udp.DstPort == 53 or tcp.DstPort == 53 or tcp.DstPort == 853 or udp.DstPort == 443 or (udp.DstPort >= 10000 and udp.PayloadLength == 74 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[2] == 0x00 and udp.Payload[3] == 0x46) or ((udp.DstPort >= 10000 or udp.DstPort == 3478 or udp.DstPort == 5349 or udp.DstPort == 1400 or (udp.DstPort >= 596 and udp.DstPort <= 599)) and udp.PayloadLength >= 20 and udp.Payload[0] == 0x00 and udp.Payload[1] == 0x01 and udp.Payload[4] == 0x21 and udp.Payload[5] == 0x12 and udp.Payload[6] == 0xA4 and udp.Payload[7] == 0x42) or (udp.DstPort >= 49152 and udp.PayloadLength >= 17 and udp.Payload[0] == 0x05 and udp.Payload[1] == 0x00 and udp.Payload[2] == 0xFF and udp.Payload[3] == 0xFF and udp.Payload[4] == 0x00 and udp.Payload[5] == 0xFE))) or (inbound and ((tcp.SrcPort == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 6 and tcp.Payload[0] == 0x16 and tcp.Payload[1] == 0x03 and tcp.Payload[5] == 0x02))) or (tcp.SrcPort == 80 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength >= 16 and tcp.Payload[0] == 0x48 and tcp.Payload[1] == 0x54 and tcp.Payload[2] == 0x54 and tcp.Payload[3] == 0x50 and tcp.Payload[9] == 0x33))))))",
         )
         .map_err(|_| (ErrorCode::InternalError, "WinDivert filtre derleme hatası.".into()))?;
         let fallback_filter = CString::new(
@@ -777,7 +811,7 @@ impl WindowsPacketEngine {
                 rt.spawn(async move {
                     let (_, v6_mode) = tokio::join!(
                         dns_init.probe_fastest_upstream(),
-                        probe_ipv6_leak_mode(&NoopProtector, None, Duration::from_millis(600))
+                        probe_ipv6_leak_mode(&NoopProtector, None, Duration::from_millis(1200))
                     );
                     dns_init.set_suppress_aaaa(v6_mode == Ipv6LeakMode::BlockUnprotectedIpv6);
                 });
@@ -1379,7 +1413,7 @@ fn process_outbound_inner(
             if udp.dst_port == 443 && !is_local_lan_ip(ip.dst_ip) {
                 let policy = adaptive.effective_quic_policy(udp.dst_port);
                 if policy == QuicPolicy::BlockFallbackToTcp
-                    && (detect_quic_initial(udp.payload).is_some() || !udp.payload.is_empty())
+                    && detect_quic_initial(udp.payload).is_some()
                 {
                     return vec![];
                 }
@@ -1572,7 +1606,8 @@ fn process_outbound_inner(
                         return out;
                     }
                 } else if let Some(http_info) = parse_http_host(tcp.payload) {
-                    let is_sensitive = is_sensitive_unblocked_domain(&http_info.host);
+                    let is_sensitive = is_sensitive_unblocked_domain(&http_info.host)
+                        || yolac_net::is_captive_portal_probe_domain(&http_info.host);
                     let host_mid = http_info.host_range.0
                         + (http_info.host_range.1 - http_info.host_range.0) / 2;
                     if let Some(fplan) = adaptive.select_raw_forge_plan(
@@ -1611,6 +1646,18 @@ fn process_outbound_inner(
                                     .collect();
                             }
                         }
+                        return vec![passthrough(pkt.to_vec(), addr)];
+                    }
+                    let http_strategy = if is_sensitive {
+                        adaptive.select_strategy_with_default(
+                            dst,
+                            Some(&http_info.host),
+                            DpiStrategy::Passthrough,
+                        )
+                    } else {
+                        adaptive.select_strategy(dst, Some(&http_info.host))
+                    };
+                    if http_strategy == DpiStrategy::Passthrough {
                         return vec![passthrough(pkt.to_vec(), addr)];
                     }
                     // Plaintext HTTP port 80: mix Host case + benign fake HTTP decoy + reverse-frag `-f 2` split
@@ -2589,5 +2636,39 @@ mod tests {
         let q_out = process_packet_with_tracker(&quic_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
         assert_eq!(q_out.len(), 3, "DesyncFragment must emit LowTtl + BadCsum QUIC decoys + real packet");
         assert_eq!(q_out[1].checksum, ChecksumAction::PreserveBadUdpChecksum);
+
+        // Non-QUIC UDP/443 (e.g. WireGuard / TURN / WebRTC) must pass even under BlockFallbackToTcp
+        adaptive.set_quic_policy(QuicPolicy::BlockFallbackToTcp);
+        let non_quic_udp443 = build_ipv4_udp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(198, 51, 100, 44),
+            56305,
+            443,
+            64,
+            &[0x01, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44],
+        );
+        let nq_out = process_packet_with_tracker(&non_quic_udp443, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(nq_out.len(), 1, "Non-QUIC UDP/443 must never be blackholed");
+        assert_eq!(nq_out[0].checksum, ChecksumAction::Passthrough);
+
+        // Captive portal & sensitive HTTP/80 domains must pass unmodified
+        let captive_http = b"GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\n\r\n";
+        let captive_pkt = build_ipv4_tcp_packet(
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(142, 250, 187, 174),
+            56306,
+            80,
+            100,
+            200,
+            ParsedTcp::ACK | ParsedTcp::PSH,
+            65535,
+            64,
+            1,
+            &[],
+            captive_http,
+        );
+        let cap_out = process_packet_with_tracker(&captive_pkt, out_addr, &rt, &dns, &adaptive, &calibrator, &flows, &portal);
+        assert_eq!(cap_out.len(), 1);
+        assert_eq!(cap_out[0].checksum, ChecksumAction::Passthrough);
     }
 }
