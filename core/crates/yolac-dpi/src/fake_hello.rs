@@ -44,48 +44,8 @@ pub fn build_benign_fake_client_hello(benign_sni: &str) -> Vec<u8> {
 
     // Build realistic TLS 1.3 + 1.2 extensions: SNI (0x0000), supported_groups (0x000a),
     // ec_point_formats (0x000b), signature_algorithms (0x000d), ALPN (0x0010),
-    // supported_versions (0x002b), key_share (0x0033 with 32-byte x25519 pubkey).
-    let mut exts = Vec::with_capacity(160 + sni_bytes.len());
-
-    // 1. server_name (0x0000)
-    exts.extend_from_slice(&0x0000u16.to_be_bytes());
-    exts.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
-    exts.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
-    exts.push(0x00); // host_name
-    exts.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
-    exts.extend_from_slice(sni_bytes);
-
-    // 2. supported_groups (0x000a): x25519 (0x001d), secp256r1 (0x0017)
-    exts.extend_from_slice(&[0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17]);
-
-    // 3. ec_point_formats (0x000b): uncompressed
-    exts.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
-
-    // 4. signature_algorithms (0x000d)
-    exts.extend_from_slice(&[
-        0x00, 0x0d, 0x00, 0x0a, 0x00, 0x08, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03,
-    ]);
-
-    // 5. ALPN (0x0010): h2, http/1.1
-    exts.extend_from_slice(&[
-        0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/',
-        b'1', b'.', b'1',
-    ]);
-
-    // 6. supported_versions (0x002b): TLS 1.3 (0x0304), TLS 1.2 (0x0303)
-    exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03]);
-
-    // 7. key_share (0x0033): x25519 (0x001d) 32-byte key
-    exts.extend_from_slice(&[0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
-    exts.extend_from_slice(&key_share);
-
-    // ClientHello body
-    let mut body = Vec::with_capacity(96 + exts.len());
-    body.extend_from_slice(&[0x03, 0x03]); // legacy TLS 1.2
-    body.extend_from_slice(&client_random); // High-entropy Client Random
-    body.push(32); // Session ID len = 32 (TLS 1.3 middlebox compatibility)
-    body.extend_from_slice(&session_id); // High-entropy Session ID
-    // Standard Chrome/Firefox cipher suites
+    // supported_versions (0x002b), key_share (0x0033 with 32-byte x25519 pubkey)
+    // in a single contiguous buffer allocation.
     let ciphers: &[u8] = &[
         0x13, 0x01, // TLS_AES_128_GCM_SHA256
         0x13, 0x02, // TLS_AES_256_GCM_SHA384
@@ -94,22 +54,61 @@ pub fn build_benign_fake_client_hello(benign_sni: &str) -> Vec<u8> {
         0xc0, 0x2b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
         0xc0, 0x30, // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
     ];
-    body.extend_from_slice(&(ciphers.len() as u16).to_be_bytes());
-    body.extend_from_slice(ciphers);
-    body.extend_from_slice(&[0x01, 0x00]); // Compression: null
-    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
-    body.extend_from_slice(&exts);
+    let exts_len = (4 + sni_ext_data_len) + 10 + 6 + 14 + 18 + 9 + 42;
+    let body_len = 2 + 32 + 1 + 32 + 2 + ciphers.len() + 2 + 2 + exts_len;
+    let mut rec = Vec::with_capacity(9 + body_len);
 
-    let hs_len = body.len();
-    let mut rec = Vec::with_capacity(9 + hs_len);
     rec.push(0x16); // Handshake
     rec.extend_from_slice(&[0x03, 0x01]); // TLS 1.0 record layer version
-    rec.extend_from_slice(&((4 + hs_len) as u16).to_be_bytes());
+    rec.extend_from_slice(&((4 + body_len) as u16).to_be_bytes());
     rec.push(0x01); // ClientHello
-    rec.push(((hs_len >> 16) & 0xFF) as u8);
-    rec.push(((hs_len >> 8) & 0xFF) as u8);
-    rec.push((hs_len & 0xFF) as u8);
-    rec.extend_from_slice(&body);
+    rec.push(((body_len >> 16) & 0xFF) as u8);
+    rec.push(((body_len >> 8) & 0xFF) as u8);
+    rec.push((body_len & 0xFF) as u8);
+
+    // ClientHello body
+    rec.extend_from_slice(&[0x03, 0x03]); // legacy TLS 1.2
+    rec.extend_from_slice(&client_random); // High-entropy Client Random
+    rec.push(32); // Session ID len = 32 (TLS 1.3 middlebox compatibility)
+    rec.extend_from_slice(&session_id); // High-entropy Session ID
+    rec.extend_from_slice(&(ciphers.len() as u16).to_be_bytes());
+    rec.extend_from_slice(ciphers);
+    rec.extend_from_slice(&[0x01, 0x00]); // Compression: null
+    rec.extend_from_slice(&(exts_len as u16).to_be_bytes());
+
+    // 1. server_name (0x0000)
+    rec.extend_from_slice(&0x0000u16.to_be_bytes());
+    rec.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+    rec.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
+    rec.push(0x00); // host_name
+    rec.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+    rec.extend_from_slice(sni_bytes);
+
+    // 2. supported_groups (0x000a): x25519 (0x001d), secp256r1 (0x0017)
+    rec.extend_from_slice(&[0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17]);
+
+    // 3. ec_point_formats (0x000b): uncompressed
+    rec.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+
+    // 4. signature_algorithms (0x000d)
+    rec.extend_from_slice(&[
+        0x00, 0x0d, 0x00, 0x0a, 0x00, 0x08, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03,
+    ]);
+
+    // 5. ALPN (0x0010): h2, http/1.1
+    rec.extend_from_slice(&[
+        0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, b'h', b'2', 0x08, b'h', b't', b't', b'p', b'/',
+        b'1', b'.', b'1',
+    ]);
+
+    // 6. supported_versions (0x002b): TLS 1.3 (0x0304), TLS 1.2 (0x0303)
+    rec.extend_from_slice(&[0x00, 0x2b, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03]);
+
+    // 7. key_share (0x0033): x25519 (0x001d) 32-byte key
+    rec.extend_from_slice(&[0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
+    rec.extend_from_slice(&key_share);
+
+    debug_assert_eq!(rec.len(), 9 + body_len);
     rec
 }
 

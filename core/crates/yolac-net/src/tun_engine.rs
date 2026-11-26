@@ -92,7 +92,7 @@ impl TunConfig {
     }
 }
 
-const MAX_TUN_RX_BATCH: usize = 8;
+const MAX_TUN_RX_BATCH: usize = 32;
 
 /// Abstract L3 packet interface (backed by `AsyncFd` Android TUN fd or test channels).
 pub trait PacketDevice: Send + Sync {
@@ -456,6 +456,27 @@ impl TunEngine {
                     udp_sessions.retain(|_, s| {
                         !s.tx.is_closed() && now.duration_since(s.last_active) < Duration::from_secs(45)
                     });
+                    tcp_flows.retain(|_, flow| {
+                        let idle = now.duration_since(flow.last_active);
+                        if idle < Duration::from_secs(120) {
+                            return true;
+                        }
+                        let sock = sockets.get_mut::<SmolTcpSocket>(flow.handle);
+                        if sock.state() == SmolTcpState::Closed
+                            || (idle >= Duration::from_secs(300)
+                                && matches!(
+                                    sock.state(),
+                                    SmolTcpState::TimeWait
+                                        | SmolTcpState::Closing
+                                        | SmolTcpState::LastAck
+                                ))
+                        {
+                            sockets.remove(flow.handle);
+                            false
+                        } else {
+                            true
+                        }
+                    });
                 }
             }
 
@@ -464,9 +485,11 @@ impl TunEngine {
                 // Record outbound smoltcp sequence numbers BEFORE pump_tcp_flows so any RST|ACK
                 // generated on connect_failed has the exact RFC 793/5961 post-SYN-ACK seq!
                 Self::track_outbound_tx_seqs(&vdev.tx_queue, &mut tcp_flows);
-                self.pump_tcp_flows(&mut sockets, &mut tcp_flows, &mut vdev);
-                iface.poll(SmolInstant::now(), &mut vdev, &mut sockets);
-                Self::track_outbound_tx_seqs(&vdev.tx_queue, &mut tcp_flows);
+                let did_tx = self.pump_tcp_flows(&mut sockets, &mut tcp_flows, &mut vdev);
+                if did_tx || !vdev.tx_queue.is_empty() {
+                    iface.poll(SmolInstant::now(), &mut vdev, &mut sockets);
+                    Self::track_outbound_tx_seqs(&vdev.tx_queue, &mut tcp_flows);
+                }
             }
 
             while let Some(out_pkt) = vdev.tx_queue.pop_front() {
@@ -902,8 +925,9 @@ impl TunEngine {
         sockets: &mut SocketSet<'_>,
         tcp_flows: &mut HashMap<FlowKey, ActiveTcpFlow>,
         vdev: &mut VirtualIpDevice,
-    ) {
+    ) -> bool {
         let mut to_remove = Vec::new();
+        let mut did_tx = false;
 
         for (key, flow) in tcp_flows.iter_mut() {
             let sock = sockets.get_mut::<SmolTcpSocket>(flow.handle);
@@ -917,7 +941,8 @@ impl TunEngine {
                     };
                     match tx.try_reserve() {
                         Ok(permit) => {
-                            let mut chunk = Vec::new();
+                            let hint = sock.recv_queue().min(65_536);
+                            let mut chunk = Vec::with_capacity(hint);
                             let _ = sock.recv(|data| {
                                 chunk.extend_from_slice(data);
                                 (data.len(), ())
@@ -977,6 +1002,7 @@ impl TunEngine {
                     Ok(sent) if sent > 0 => {
                         flow.pending_write_pos += sent;
                         flow.last_active = Instant::now();
+                        did_tx = true;
                     }
                     _ => break,
                 }
@@ -996,8 +1022,18 @@ impl TunEngine {
                     ) {
                         vdev.tx_queue.push_back(pkt);
                     }
-                } else {
+                    did_tx = true;
+                } else if !matches!(
+                    sock.state(),
+                    SmolTcpState::FinWait1
+                        | SmolTcpState::FinWait2
+                        | SmolTcpState::Closing
+                        | SmolTcpState::LastAck
+                        | SmolTcpState::TimeWait
+                        | SmolTcpState::Closed
+                ) {
                     sock.close();
+                    did_tx = true;
                 }
             }
 
@@ -1013,6 +1049,7 @@ impl TunEngine {
                 sockets.remove(flow.handle);
             }
         }
+        did_tx
     }
 
     #[allow(clippy::too_many_arguments)]

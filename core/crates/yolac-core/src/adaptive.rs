@@ -9,7 +9,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tulpar_forge::{
@@ -100,18 +100,23 @@ pub fn parse_user_rules_json(json: &str) -> UserRulesConfig {
 }
 
 fn match_domain_suffix(rules: &[String], sni: Option<&str>) -> bool {
+    if rules.is_empty() {
+        return false;
+    }
     let Some(raw) = sni else {
         return false;
     };
-    let norm = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let norm = raw.trim().trim_end_matches('.');
     if norm.is_empty() {
         return false;
     }
+    let nb = norm.as_bytes();
     rules.iter().any(|rule| {
-        norm == *rule
-            || (norm.len() > rule.len()
-                && norm.ends_with(rule.as_str())
-                && norm.as_bytes()[norm.len() - rule.len() - 1] == b'.')
+        let rb = rule.as_bytes();
+        (nb.len() == rb.len() && nb.eq_ignore_ascii_case(rb))
+            || (nb.len() > rb.len()
+                && nb[nb.len() - rb.len() - 1] == b'.'
+                && nb[nb.len() - rb.len()..].eq_ignore_ascii_case(rb))
     })
 }
 
@@ -136,10 +141,11 @@ pub struct AdaptiveController {
     initial_strategy: DpiStrategy,
     default_quic_blocked: bool,
     user_quic_policy: AtomicU8,
-    hash_builder: Mutex<RandomState>,
+    hash_builder: RwLock<RandomState>,
     max_entries: usize,
     /// Protected by std::sync::Mutex (critical sections are tiny O(1) map lookups).
     table: Mutex<HashMap<u64, DestinationState>>,
+    has_domain_rules: AtomicBool,
     excluded_dpi: Mutex<Vec<String>>,
     aggressive_dpi: Mutex<Vec<String>>,
     quic_throttled: AtomicBool,
@@ -179,9 +185,10 @@ impl AdaptiveController {
             initial_strategy: effective_initial,
             default_quic_blocked,
             user_quic_policy: AtomicU8::new(encode_quic_policy(quic_policy)),
-            hash_builder: Mutex::new(RandomState::new()),
+            hash_builder: RwLock::new(RandomState::new()),
             max_entries: max_entries.max(64),
             table: Mutex::new(HashMap::new()),
+            has_domain_rules: AtomicBool::new(false),
             excluded_dpi: Mutex::new(Vec::new()),
             aggressive_dpi: Mutex::new(Vec::new()),
             quic_throttled: AtomicBool::new(default_quic_blocked),
@@ -237,12 +244,16 @@ impl AdaptiveController {
     }
 
     pub fn set_user_domain_rules(&self, excluded: &[String], aggressive: &[String]) {
+        let norm_ex = normalize_domain_list(excluded);
+        let norm_ag = normalize_domain_list(aggressive);
+        let non_empty = !norm_ex.is_empty() || !norm_ag.is_empty();
         if let Ok(mut g) = self.excluded_dpi.lock() {
-            *g = normalize_domain_list(excluded);
+            *g = norm_ex;
         }
         if let Ok(mut g) = self.aggressive_dpi.lock() {
-            *g = normalize_domain_list(aggressive);
+            *g = norm_ag;
         }
+        self.has_domain_rules.store(non_empty, Ordering::Release);
     }
 
     pub fn domain_rule_counts(&self) -> (usize, usize) {
@@ -275,7 +286,7 @@ impl AdaptiveController {
     fn hash_target(&self, dst: SocketAddr, sni: Option<&str>) -> u64 {
         let mut h = self
             .hash_builder
-            .lock()
+            .read()
             .map(|b| b.build_hasher())
             .unwrap_or_else(|_| RandomState::new().build_hasher());
         if let Some(raw) = sni {
@@ -323,7 +334,7 @@ impl AdaptiveController {
         if let Ok(mut guard) = self.table.lock() {
             guard.clear();
         }
-        if let Ok(mut hb) = self.hash_builder.lock() {
+        if let Ok(mut hb) = self.hash_builder.write() {
             *hb = RandomState::new();
         }
     }
@@ -340,19 +351,22 @@ impl StrategyAdvisor for AdaptiveController {
         sni: Option<&str>,
         default_if_unseen: DpiStrategy,
     ) -> DpiStrategy {
-        if self
-            .excluded_dpi
-            .lock()
-            .map(|g| match_domain_suffix(&g, sni))
-            .unwrap_or(false)
-        {
-            return DpiStrategy::Passthrough;
-        }
-        let force_aggressive = self
-            .aggressive_dpi
-            .lock()
-            .map(|g| match_domain_suffix(&g, sni))
-            .unwrap_or(false);
+        let force_aggressive = if self.has_domain_rules.load(Ordering::Acquire) {
+            if self
+                .excluded_dpi
+                .lock()
+                .map(|g| match_domain_suffix(&g, sni))
+                .unwrap_or(false)
+            {
+                return DpiStrategy::Passthrough;
+            }
+            self.aggressive_dpi
+                .lock()
+                .map(|g| match_domain_suffix(&g, sni))
+                .unwrap_or(false)
+        } else {
+            false
+        };
         let key = self.hash_target(dst, sni);
         if let Ok(mut guard) = self.table.lock() {
             if let Some(entry) = guard.get(&key).copied() {

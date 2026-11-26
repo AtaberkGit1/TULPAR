@@ -812,24 +812,30 @@ fn desync_linux_tls_hello(
     } else {
         (ch_payload.len() / 2).max(2)
     };
-    let decoy = build_benign_fake_client_hello("www.iana.org");
 
     let build_segments = |split_points: &[usize],
                           fakes: &[FakePacketMode],
                           reverse: bool|
      -> Option<Vec<yolac_dpi::DesyncPacket>> {
+        let decoy_buf;
+        let decoy: &[u8] = if fakes.is_empty() {
+            &[]
+        } else {
+            decoy_buf = build_benign_fake_client_hello("www.iana.org");
+            &decoy_buf
+        };
         if is_reassembled {
             build_reassembled_desync_packets(
                 base_pkt,
                 ch_payload,
                 split_points,
                 fakes,
-                &decoy,
+                decoy,
                 reverse,
                 1380,
             )
         } else {
-            build_turkey_desync_packets(base_pkt, split_points, fakes, &decoy, reverse)
+            build_turkey_desync_packets(base_pkt, split_points, fakes, decoy, reverse)
         }
     };
 
@@ -970,10 +976,11 @@ pub fn run_nfqueue_loop(
     let calibrator = TtlCalibrator::default();
     let flows = FlowTracker::default();
     let mut buf = vec![0u8; 128 * 1024];
+    let mut pkts = Vec::with_capacity(16);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        let pkts = match nfq.recv_packets(&mut buf) {
-            Ok(p) => p,
+        let n = match nfq.recv_packets_into(&mut buf, &mut pkts) {
+            Ok(n) => n,
             Err(e)
                 if matches!(
                     e.raw_os_error(),
@@ -987,10 +994,11 @@ pub fn run_nfqueue_loop(
             }
         };
 
-        for pkt in pkts {
+        let frame = &buf[..n];
+        for pkt in pkts.drain(..) {
             let is_outbound = pkt.hook == NF_INET_LOCAL_OUT;
             match process_packet(
-                &pkt.payload,
+                &frame[pkt.start..pkt.end],
                 is_outbound,
                 &dns,
                 &adaptive,

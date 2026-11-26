@@ -45,8 +45,24 @@ async fn resolve_dns_wire(dns: &Arc<DnsEngine>, query_pkt: &[u8]) -> Option<Vec<
     dns.resolve_with_swr(query_pkt).await.0
 }
 
+fn maybe_truncate_udp_dns(query_pkt: &[u8], mut reply: Vec<u8>) -> Vec<u8> {
+    // RFC 1035 / EDNS0 safe truncation for oversized UDP responses -> client retries over TCP!
+    if reply.len() > 1232 && reply.len() >= 12 {
+        if let Some(q) = parse_dns_query(query_pkt) {
+            let mut trunc = Vec::with_capacity(q.question_end);
+            trunc.extend_from_slice(&reply[..12]);
+            trunc[2] |= 0x02; // TC=1
+            trunc[6..12].fill(0);
+            trunc.extend_from_slice(&query_pkt[12..q.question_end]);
+            reply = trunc;
+        }
+    }
+    reply
+}
+
 async fn serve_udp(sock: Arc<UdpSocket>, dns: Arc<DnsEngine>, mut shutdown: watch::Receiver<bool>) {
     let mut buf = [0u8; 4096];
+    let dns_sem = Arc::new(tokio::sync::Semaphore::new(64));
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -59,23 +75,25 @@ async fn serve_udp(sock: Arc<UdpSocket>, dns: Arc<DnsEngine>, mut shutdown: watc
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Fast-path synchronous RAM cache / ad-block / AAAA suppression without spawning a task
+                if let Some((resp_opt, _)) = dns.try_resolve_local(&buf[..n]) {
+                    if let Some(reply) = resp_opt {
+                        let wire = maybe_truncate_udp_dns(&buf[..n], reply);
+                        let _ = sock.send_to(&wire, peer).await;
+                    }
+                    continue;
+                }
+                let Ok(permit) = Arc::clone(&dns_sem).try_acquire_owned() else {
+                    continue;
+                };
                 let query_pkt = buf[..n].to_vec();
                 let dns_ref = Arc::clone(&dns);
                 let sock_ref = Arc::clone(&sock);
                 tokio::spawn(async move {
-                    if let Some(mut reply) = resolve_dns_wire(&dns_ref, &query_pkt).await {
-                        // RFC 1035 / EDNS0 safe truncation for oversized UDP responses -> client retries over TCP!
-                        if reply.len() > 1232 && reply.len() >= 12 {
-                            if let Some(q) = parse_dns_query(&query_pkt) {
-                                let mut trunc = Vec::with_capacity(q.question_end);
-                                trunc.extend_from_slice(&reply[..12]);
-                                trunc[2] |= 0x02; // TC=1
-                                trunc[6..12].fill(0);
-                                trunc.extend_from_slice(&query_pkt[12..q.question_end]);
-                                reply = trunc;
-                            }
-                        }
-                        let _ = sock_ref.send_to(&reply, peer).await;
+                    let _permit = permit;
+                    if let Some(reply) = resolve_dns_wire(&dns_ref, &query_pkt).await {
+                        let wire = maybe_truncate_udp_dns(&query_pkt, reply);
+                        let _ = sock_ref.send_to(&wire, peer).await;
                     }
                 });
             }
@@ -84,14 +102,21 @@ async fn serve_udp(sock: Arc<UdpSocket>, dns: Arc<DnsEngine>, mut shutdown: watc
 }
 
 async fn handle_tcp_dns_conn(mut stream: TcpStream, dns: Arc<DnsEngine>) {
+    const TCP_DNS_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
     let mut len_buf = [0u8; 2];
-    while stream.read_exact(&mut len_buf).await.is_ok() {
+    while matches!(
+        tokio::time::timeout(TCP_DNS_IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await,
+        Ok(Ok(_))
+    ) {
         let msg_len = u16::from_be_bytes(len_buf) as usize;
         if msg_len == 0 || msg_len > 4096 {
             break;
         }
         let mut query = vec![0u8; msg_len];
-        if stream.read_exact(&mut query).await.is_err() {
+        if !matches!(
+            tokio::time::timeout(TCP_DNS_IDLE_TIMEOUT, stream.read_exact(&mut query)).await,
+            Ok(Ok(_))
+        ) {
             break;
         }
         let Some(reply) = resolve_dns_wire(&dns, &query).await else {

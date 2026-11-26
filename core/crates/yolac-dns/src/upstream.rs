@@ -633,14 +633,19 @@ pub(crate) async fn exchange_on_tls_stream(
             Ok((resp, true))
         }
         UpstreamProtocol::DoH => {
-            let req = format!(
+            use std::io::Write;
+            let mut req = Vec::with_capacity(
+                160 + upstream.doh_path.len() + upstream.tls_server_name.len() + query_wire.len(),
+            );
+            let _ = write!(
+                req,
                 "POST {} HTTP/1.1\r\nHost: {}\r\nAccept: application/dns-message\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                 upstream.doh_path,
                 upstream.tls_server_name,
                 query_wire.len()
             );
-            tls.write_all(req.as_bytes()).await?;
-            tls.write_all(query_wire).await?;
+            req.extend_from_slice(query_wire);
+            tls.write_all(&req).await?;
             tls.flush().await?;
 
             let mut raw = Vec::with_capacity(2048);
@@ -670,29 +675,44 @@ pub(crate) async fn exchange_on_tls_stream(
             };
 
             let header_str = std::str::from_utf8(&raw[..hdr_end])
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 DoH headers"))?
-                .to_string();
-            let status_line = header_str.lines().next().unwrap_or("");
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 DoH headers"))?;
+            let mut lines = header_str.lines();
+            let status_line = lines.next().unwrap_or("");
             if status_line.split_whitespace().nth(1) != Some("200") {
                 return Err(io::Error::other(format!(
                     "DoH upstream returned HTTP status: {status_line}"
                 )));
             }
 
-            let server_wants_close = header_str.lines().any(|l| {
-                let lower = l.to_ascii_lowercase();
-                lower.starts_with("connection:") && lower.contains("close")
-            });
-            let is_chunked = header_str.lines().any(|l| {
-                let lower = l.to_ascii_lowercase();
-                lower.starts_with("transfer-encoding:") && lower.contains("chunked")
-            });
-            let content_len = header_str.lines().find_map(|l| {
-                let lower = l.to_ascii_lowercase();
-                lower
-                    .strip_prefix("content-length:")
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-            });
+            let mut server_wants_close = false;
+            let mut is_chunked = false;
+            let mut content_len: Option<usize> = None;
+            for line in lines {
+                let Some((name, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let name = name.trim();
+                let value = value.trim();
+                if name.eq_ignore_ascii_case("connection") {
+                    if value
+                        .as_bytes()
+                        .windows(5)
+                        .any(|w| w.eq_ignore_ascii_case(b"close"))
+                    {
+                        server_wants_close = true;
+                    }
+                } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                    if value
+                        .as_bytes()
+                        .windows(7)
+                        .any(|w| w.eq_ignore_ascii_case(b"chunked"))
+                    {
+                        is_chunked = true;
+                    }
+                } else if name.eq_ignore_ascii_case("content-length") {
+                    content_len = value.parse::<usize>().ok();
+                }
+            }
 
             const MAX_DNS_BODY: usize = 65_535;
             let body_start = hdr_end + 4;
@@ -763,7 +783,9 @@ pub(crate) async fn exchange_on_tls_stream(
                     Err(e) => return Err(e),
                 }
             }
-            let body = parse_http_dns_body(&header_str, &raw[body_start..])?;
+            let hdr_slice = std::str::from_utf8(&raw[..hdr_end])
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 DoH headers"))?;
+            let body = parse_http_dns_body(hdr_slice, &raw[body_start..])?;
             Ok((body, false))
         }
     }

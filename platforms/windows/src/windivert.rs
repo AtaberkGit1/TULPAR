@@ -787,12 +787,14 @@ impl WindowsPacketEngine {
             let dns_sem = Arc::new(tokio::sync::Semaphore::new(64));
             let mut batch_buf = vec![0u8; 65_536 * 8];
             let mut batch_addrs = vec![WinDivertAddress::default(); 16];
+            let mut batch_tx: Vec<OutgoingPacket> = Vec::with_capacity(32);
             let mut tx_bytes_buf: Vec<u8> = Vec::with_capacity(65_536);
             let mut tx_addrs_buf: Vec<WinDivertAddress> = Vec::with_capacity(16);
             let mut recv_len = 0u32;
             let mut unexpected_exit = false;
 
             while !stop_flag.load(Ordering::Relaxed) {
+                batch_tx.clear();
                 let mut rx_pairs: Vec<(&[u8], WinDivertAddress)> = Vec::new();
                 if let Some(recv_ex) = thread_api.recv_ex {
                     let mut addr_len_bytes =
@@ -842,8 +844,6 @@ impl WindowsPacketEngine {
                     }
                     rx_pairs.push((&batch_buf[..recv_len as usize], batch_addrs[0]));
                 }
-
-                let mut batch_tx: Vec<OutgoingPacket> = Vec::with_capacity(rx_pairs.len() * 2);
 
                 for (pkt, addr) in rx_pairs {
                     // Handle outbound UDP/53 DNS asynchronously with <50us local fast-path
@@ -1739,7 +1739,6 @@ fn desync_tls_hello(
     } else {
         (ch_payload.len() / 2).max(2)
     };
-    let decoy = build_benign_fake_client_hello("www.iana.org");
 
     let emit_desync = |desync: Vec<yolac_dpi::DesyncPacket>| -> Vec<OutgoingPacket> {
         desync
@@ -1764,18 +1763,25 @@ fn desync_tls_hello(
                           fakes: &[FakePacketMode],
                           reverse: bool|
      -> Option<Vec<yolac_dpi::DesyncPacket>> {
+        let decoy_buf;
+        let decoy: &[u8] = if fakes.is_empty() {
+            &[]
+        } else {
+            decoy_buf = build_benign_fake_client_hello("www.iana.org");
+            &decoy_buf
+        };
         if is_reassembled {
             build_reassembled_desync_packets(
                 base_pkt,
                 ch_payload,
                 split_points,
                 fakes,
-                &decoy,
+                decoy,
                 reverse,
                 1380,
             )
         } else {
-            build_turkey_desync_packets(base_pkt, split_points, fakes, &decoy, reverse)
+            build_turkey_desync_packets(base_pkt, split_points, fakes, decoy, reverse)
         }
     };
 

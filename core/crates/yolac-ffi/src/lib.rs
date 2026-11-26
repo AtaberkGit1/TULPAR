@@ -590,15 +590,16 @@ impl PacketDevice for UnixTunFdDevice {
     async fn recv_packet_batch(&self, out: &mut Vec<Vec<u8>>, max: usize) -> io::Result<()> {
         use std::os::fd::AsRawFd;
         let limit = max.max(1);
+        let mut scratch = [0u8; 4096];
         loop {
             let mut guard = self.async_fd.readable().await?;
             let start_len = out.len();
             let mut fatal_err: Option<io::Error> = None;
             while out.len().saturating_sub(start_len) < limit {
-                let mut buf = vec![0u8; 4096];
                 match guard.try_io(|inner| {
                     let fd = inner.as_raw_fd();
-                    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                    let n =
+                        unsafe { libc::read(fd, scratch.as_mut_ptr() as *mut c_void, scratch.len()) };
                     if n < 0 {
                         Err(io::Error::last_os_error())
                     } else {
@@ -615,8 +616,7 @@ impl PacketDevice for UnixTunFdDevice {
                         break;
                     }
                     Ok(Ok(n)) => {
-                        buf.truncate(n);
-                        out.push(buf);
+                        out.push(scratch[..n].to_vec());
                     }
                     Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Ok(Err(e)) => {
@@ -640,12 +640,12 @@ impl PacketDevice for UnixTunFdDevice {
 
     async fn recv_packet(&self) -> io::Result<Vec<u8>> {
         use std::os::fd::AsRawFd;
-        let mut buf = vec![0u8; 4096];
+        let mut scratch = [0u8; 4096];
         loop {
             let mut guard = self.async_fd.readable().await?;
             match guard.try_io(|inner| {
                 let fd = inner.as_raw_fd();
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, buf.len()) };
+                let n = unsafe { libc::read(fd, scratch.as_mut_ptr() as *mut c_void, scratch.len()) };
                 if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -656,8 +656,7 @@ impl PacketDevice for UnixTunFdDevice {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN fd closed"));
                 }
                 Ok(Ok(n)) => {
-                    buf.truncate(n);
-                    return Ok(buf);
+                    return Ok(scratch[..n].to_vec());
                 }
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(e)) => return Err(e),

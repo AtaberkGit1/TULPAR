@@ -91,7 +91,7 @@ type InflightKey = (String, QType);
 pub struct DnsEngine {
     config: DnsConfig,
     blocklist: StdRwLock<Arc<Blocklist>>,
-    upstreams: StdRwLock<Vec<UpstreamConfig>>,
+    upstreams: StdRwLock<Arc<[UpstreamConfig]>>,
     active_profile: StdRwLock<DnsProfile>,
     cache: StdMutex<DnsCache>,
     inflight: StdMutex<HashMap<InflightKey, Arc<Notify>>>,
@@ -119,7 +119,7 @@ impl DnsEngine {
     ) -> Self {
         let cache_cap = config.cache_max_entries;
         let suppress = config.suppress_aaaa;
-        let initial_upstreams = config.upstreams.clone();
+        let initial_upstreams: Arc<[UpstreamConfig]> = Arc::from(config.upstreams.clone());
         Self {
             config,
             blocklist: StdRwLock::new(blocklist),
@@ -151,11 +151,11 @@ impl DnsEngine {
         }
     }
 
-    fn upstreams_snapshot(&self) -> Vec<UpstreamConfig> {
+    fn upstreams_snapshot(&self) -> Arc<[UpstreamConfig]> {
         self.upstreams
             .read()
-            .map(|u| u.clone())
-            .unwrap_or_else(|_| self.config.upstreams.clone())
+            .map(|u| Arc::clone(&u))
+            .unwrap_or_else(|_| Arc::from(self.config.upstreams.clone()))
     }
 
     fn is_domain_blocked(&self, domain: &str) -> bool {
@@ -182,7 +182,7 @@ impl DnsEngine {
     }
 
     pub fn reconfigure_profile(&self, profile: DnsProfile) {
-        let next_upstreams = upstreams_for_profile(&profile);
+        let next_upstreams: Arc<[UpstreamConfig]> = Arc::from(upstreams_for_profile(&profile));
         if let Ok(mut u) = self.upstreams.write() {
             *u = next_upstreams;
         }
@@ -705,7 +705,7 @@ impl DnsEngine {
         let probe_query = parse_dns_query(&probe_wire)?;
 
         let mut set = tokio::task::JoinSet::new();
-        for (idx, upstream) in upstreams.into_iter().enumerate() {
+        for (idx, upstream) in upstreams.iter().cloned().enumerate() {
             let wire = probe_wire.clone();
             let dialer = Arc::clone(&self.dialer);
             let tls = Arc::clone(self.tls_for(&upstream));
@@ -759,7 +759,7 @@ impl DnsEngine {
         };
 
         let mut set = tokio::task::JoinSet::new();
-        for (idx, upstream) in upstreams.into_iter().enumerate() {
+        for (idx, upstream) in upstreams.iter().cloned().enumerate() {
             let wire = probe_wire.clone();
             let pq = probe_query.clone();
             let dialer = Arc::clone(&self.dialer);

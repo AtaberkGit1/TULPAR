@@ -58,11 +58,20 @@ fn nlmsg_align(len: usize) -> usize {
     (len + 3) & !3
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NfqPacket {
     pub packet_id: u32,
     pub hook: u8,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NfqPacketSpan {
+    pub packet_id: u32,
+    pub hook: u8,
+    pub start: usize,
+    pub end: usize,
 }
 
 pub struct NfqSocket {
@@ -193,6 +202,7 @@ impl NfqSocket {
         s
     }
 
+    #[allow(dead_code)]
     pub fn recv_packets(&self, buf: &mut [u8]) -> io::Result<Vec<NfqPacket>> {
         let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         if n < 0 {
@@ -201,8 +211,23 @@ impl NfqSocket {
         Ok(parse_nfq_messages(&buf[..n as usize]))
     }
 
+    pub fn recv_packets_into(
+        &self,
+        buf: &mut [u8],
+        out: &mut Vec<NfqPacketSpan>,
+    ) -> io::Result<usize> {
+        out.clear();
+        let n = unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = n as usize;
+        parse_nfq_messages_into(&buf[..n], out);
+        Ok(n)
+    }
+
     pub fn send_verdict(&self, packet_id: u32, verdict: u32) -> io::Result<()> {
-        let msg = build_verdict_msg(self.queue_num, packet_id, verdict);
+        let msg = encode_verdict_msg(self.queue_num, packet_id, verdict);
         self.send_netlink(&msg)
     }
 
@@ -281,19 +306,30 @@ pub fn build_config_params_msg(queue_num: u16, copy_range: u32, maxlen: u32, seq
     buf
 }
 
-pub fn build_verdict_msg(queue_num: u16, packet_id: u32, verdict: u32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(48);
-    push_nl_header(&mut buf, NFQNL_MSG_VERDICT, 0, libc::AF_UNSPEC as u8, queue_num, false);
-    let mut hdr = [0u8; 8];
-    hdr[0..4].copy_from_slice(&verdict.to_be_bytes());
-    hdr[4..8].copy_from_slice(&packet_id.to_be_bytes());
-    push_nla(&mut buf, NFQA_VERDICT_HDR, &hdr);
-    finalize_nlmsg(&mut buf);
-    buf
+#[inline]
+fn encode_verdict_msg(queue_num: u16, packet_id: u32, verdict: u32) -> [u8; 32] {
+    let mut msg = [0u8; 32];
+    let nlmsg_type: u16 = (NFNL_SUBSYS_QUEUE << 8) | (NFQNL_MSG_VERDICT as u16);
+    msg[0..4].copy_from_slice(&32u32.to_ne_bytes());
+    msg[4..6].copy_from_slice(&nlmsg_type.to_ne_bytes());
+    msg[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    // [8..16]: seq = 0, pid = 0
+    msg[16] = libc::AF_UNSPEC as u8;
+    msg[17] = NFNETLINK_V0;
+    msg[18..20].copy_from_slice(&queue_num.to_be_bytes());
+    msg[20..22].copy_from_slice(&12u16.to_ne_bytes());
+    msg[22..24].copy_from_slice(&NFQA_VERDICT_HDR.to_ne_bytes());
+    msg[24..28].copy_from_slice(&verdict.to_be_bytes());
+    msg[28..32].copy_from_slice(&packet_id.to_be_bytes());
+    msg
 }
 
-pub fn parse_nfq_messages(raw: &[u8]) -> Vec<NfqPacket> {
-    let mut out = Vec::new();
+#[allow(dead_code)]
+pub fn build_verdict_msg(queue_num: u16, packet_id: u32, verdict: u32) -> Vec<u8> {
+    encode_verdict_msg(queue_num, packet_id, verdict).to_vec()
+}
+
+pub fn parse_nfq_messages_into(raw: &[u8], out: &mut Vec<NfqPacketSpan>) {
     let mut offset = 0usize;
 
     while offset + 16 <= raw.len() {
@@ -311,10 +347,11 @@ pub fn parse_nfq_messages(raw: &[u8]) -> Vec<NfqPacket> {
         }
 
         if subsys == NFNL_SUBSYS_QUEUE && msg_op == NFQNL_MSG_PACKET && nlmsg_len >= 20 {
-            let attrs = &raw[offset + 20..offset + nlmsg_len];
+            let attrs_base = offset + 20;
+            let attrs = &raw[attrs_base..offset + nlmsg_len];
             let mut pkt_id = None;
             let mut hook = NF_INET_LOCAL_OUT;
-            let mut payload = None;
+            let mut payload_span: Option<(usize, usize)> = None;
 
             let mut aoff = 0usize;
             while aoff + 4 <= attrs.len() {
@@ -325,33 +362,48 @@ pub fn parse_nfq_messages(raw: &[u8]) -> Vec<NfqPacket> {
                 if nla_len < 4 || aoff + nla_len > attrs.len() {
                     break;
                 }
+                let val_len = nla_len - 4;
                 let val = &attrs[aoff + 4..aoff + nla_len];
                 match nla_type {
                     NFQA_PACKET_HDR if val.len() >= 7 => {
                         pkt_id = Some(u32::from_be_bytes(val[0..4].try_into().unwrap()));
                         hook = val[6];
                     }
-                    NFQA_PAYLOAD if !val.is_empty() => {
-                        payload = Some(val.to_vec());
+                    NFQA_PAYLOAD if val_len > 0 => {
+                        let start = attrs_base + aoff + 4;
+                        payload_span = Some((start, start + val_len));
                     }
                     _ => {}
                 }
                 aoff += nlmsg_align(nla_len);
             }
 
-            if let (Some(id), Some(bytes)) = (pkt_id, payload) {
-                out.push(NfqPacket {
+            if let (Some(id), Some((start, end))) = (pkt_id, payload_span) {
+                out.push(NfqPacketSpan {
                     packet_id: id,
                     hook,
-                    payload: bytes,
+                    start,
+                    end,
                 });
             }
         }
 
         offset += nlmsg_align(nlmsg_len);
     }
+}
 
-    out
+#[allow(dead_code)]
+pub fn parse_nfq_messages(raw: &[u8]) -> Vec<NfqPacket> {
+    let mut spans = Vec::new();
+    parse_nfq_messages_into(raw, &mut spans);
+    spans
+        .into_iter()
+        .map(|p| NfqPacket {
+            packet_id: p.packet_id,
+            hook: p.hook,
+            payload: raw[p.start..p.end].to_vec(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

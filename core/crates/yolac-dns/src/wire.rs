@@ -86,7 +86,7 @@ pub struct DnsResponse {
 pub fn decode_dns_name(packet: &[u8], offset: usize) -> Option<(String, usize)> {
     let mut pos = offset;
     let mut next_pos: Option<usize> = None;
-    let mut labels: Vec<String> = Vec::new();
+    let mut name = String::with_capacity(64);
     let mut jumps = 0usize;
     let mut total_len = 0usize;
 
@@ -129,17 +129,22 @@ pub fn decode_dns_name(packet: &[u8], offset: usize) -> Option<(String, usize)> 
             if total_len > 255 {
                 return None;
             }
-            let label = String::from_utf8_lossy(&packet[pos..pos + label_len]);
-            labels.push(label.to_ascii_lowercase());
+            if !name.is_empty() {
+                name.push('.');
+            }
+            let label_slice = &packet[pos..pos + label_len];
+            if label_slice.is_ascii() {
+                for &b in label_slice {
+                    name.push(b.to_ascii_lowercase() as char);
+                }
+            } else {
+                let label = String::from_utf8_lossy(label_slice);
+                name.push_str(&label.to_ascii_lowercase());
+            }
             pos += label_len;
         }
     }
 
-    let name = if labels.is_empty() {
-        String::new()
-    } else {
-        labels.join(".")
-    };
     Some((name, next_pos.unwrap_or(pos)))
 }
 
@@ -574,25 +579,28 @@ pub fn build_dns_query(id: u16, domain: &str, qtype: QType) -> Vec<u8> {
 /// `.internal`, `.arpa`, `.localdomain`, `.corp`). These should resolve via the local LAN DNS
 /// rather than public DoH/DoT so printers, NAS devices, routers, and intranets keep working.
 pub fn is_local_lan_hostname(qname: &str) -> bool {
-    let norm = qname.trim().trim_end_matches('.').to_ascii_lowercase();
+    let norm = qname.trim().trim_end_matches('.');
     if norm.is_empty() {
         return false;
     }
     if !norm.contains('.') {
         return true;
     }
-    const LOCAL_SUFFIXES: &[&str] = &[
-        ".local",
-        ".lan",
-        ".home",
-        ".internal",
-        ".arpa",
-        ".localdomain",
-        ".corp",
-        ".intranet",
-        ".localnet",
+    const LOCAL_SUFFIXES: &[&[u8]] = &[
+        b".local",
+        b".lan",
+        b".home",
+        b".internal",
+        b".arpa",
+        b".localdomain",
+        b".corp",
+        b".intranet",
+        b".localnet",
     ];
-    LOCAL_SUFFIXES.iter().any(|&s| norm.ends_with(s))
+    let bytes = norm.as_bytes();
+    LOCAL_SUFFIXES.iter().any(|&s| {
+        bytes.len() >= s.len() && bytes[bytes.len() - s.len()..].eq_ignore_ascii_case(s)
+    })
 }
 
 #[cfg(test)]
